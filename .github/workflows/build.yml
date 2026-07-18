@@ -1,0 +1,28 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  macos:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate scripts and plists
+        run: |
+          bash -n install.sh uninstall.sh scripts/build-app.sh
+          plutil -lint swift/Info.plist entitlements.plist
+      - name: Swift self-tests
+        run: swift run -c debug --package-path swift Parakey --self-test all
+      - name: Build app bundle
+        run: ./scripts/build-app.sh "$RUNNER_TEMP/SuperDictate.app"
+      - name: Verify app bundle
+        run: |
+          test -x "$RUNNER_TEMP/SuperDictate.app/Contents/MacOS/SuperDictate"
+          codesign --verify --deep --strict "$RUNNER_TEMP/SuperDictate.app"
+
