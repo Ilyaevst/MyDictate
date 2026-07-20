@@ -3475,15 +3475,52 @@ private func hotkeyRecordingDecision(for event: HotkeyEventSnapshot) -> HotkeyRe
     return .accept(choice)
 }
 
+private enum HotkeyRecorderCaptureResult: Equatable {
+    case waitingForChord(HotkeyChoice)
+    case complete(HotkeyChoice)
+    case reject(String)
+    case cancel
+    case ignore
+}
+
+private struct HotkeyRecorderCaptureState {
+    private var pendingModifier: HotkeyChoice?
+
+    mutating func consume(_ event: HotkeyEventSnapshot) -> HotkeyRecorderCaptureResult {
+        if event.typeRawValue == CGEventType.keyDown.rawValue,
+           event.keycode == ESCAPE_KEYCODE {
+            pendingModifier = nil
+            return .cancel
+        }
+
+        if event.typeRawValue == CGEventType.flagsChanged.rawValue,
+           let pendingModifier,
+           pendingModifier.keycode == event.keycode {
+            self.pendingModifier = nil
+            return .complete(pendingModifier)
+        }
+
+        switch hotkeyRecordingDecision(for: event) {
+        case .accept(let choice) where choice.isModifier:
+            pendingModifier = choice
+            return .waitingForChord(choice)
+        case .accept(let choice):
+            pendingModifier = nil
+            return .complete(choice)
+        case .reject(let message):
+            return .reject(message)
+        case .ignore:
+            return .ignore
+        }
+    }
+}
+
 @MainActor
 private func presentHotkeyRecorder() -> HotkeyChoice? {
     let alert = NSAlert()
     alert.messageText = "Record Dictation Shortcut"
-    alert.informativeText = "Press one keyboard key or a shortcut, then choose Use Shortcut. Escape stays reserved for canceling dictation."
-    alert.addButton(withTitle: "Use Shortcut")
+    alert.informativeText = "Press one keyboard key or a shortcut. It saves immediately; press Escape to cancel."
     alert.addButton(withTitle: "Cancel")
-    let useButton = alert.buttons[0]
-    useButton.isEnabled = false
 
     let status = NSTextField(labelWithString: "Waiting for a key or shortcut…")
     status.font = .systemFont(ofSize: 13, weight: .medium)
@@ -3494,12 +3531,8 @@ private func presentHotkeyRecorder() -> HotkeyChoice? {
     alert.accessoryView = status
 
     var selected: HotkeyChoice?
+    var captureState = HotkeyRecorderCaptureState()
     let monitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .flagsChanged]) { event in
-        if event.type == .keyDown, event.keyCode == UInt16(ESCAPE_KEYCODE) {
-            NSApp.stopModal(withCode: .alertSecondButtonReturn)
-            return nil
-        }
-
         let snapshot = HotkeyEventSnapshot(
             typeRawValue: event.type == .flagsChanged
                 ? CGEventType.flagsChanged.rawValue
@@ -3508,20 +3541,20 @@ private func presentHotkeyRecorder() -> HotkeyChoice? {
             flagsRawValue: event.cgEvent?.flags.rawValue ?? 0,
             isAutoRepeat: event.isARepeat
         )
-        switch hotkeyRecordingDecision(for: snapshot) {
-        case .accept(let choice):
+        switch captureState.consume(snapshot) {
+        case .waitingForChord(let choice):
+            status.stringValue = "Release to use \(choice.name), or press another key to record a shortcut."
+            return nil
+        case .complete(let choice):
             selected = choice
-            useButton.isEnabled = true
-            if !choice.isModifier && choice.requiredModifiers.isEmpty
-                && FUNCTION_KEY_NAMES_BY_KEYCODE[choice.keycode] == nil {
-                status.stringValue = "Selected: \(choice.name). This key will be reserved globally while dictation is running."
-            } else {
-                status.stringValue = "Selected: \(choice.name)"
-            }
+            NSApp.stopModal(withCode: .alertFirstButtonReturn)
             return nil
         case .reject(let message):
             status.stringValue = message
             NSSound.beep()
+            return nil
+        case .cancel:
+            NSApp.stopModal(withCode: .alertSecondButtonReturn)
             return nil
         case .ignore:
             return nil
@@ -15007,6 +15040,7 @@ private enum ParakeySelfTest {
     private static func testHotkey() throws {
         try testHotkeyPreferenceNormalization()
         try testHotkeyPreferenceUpdateResults()
+        try testHotkeyRecorderCaptureFlow()
         try testHotkeyRecorderRestartActions()
         try testHandledHotkeySuppression()
         try testCustomShortcutMatching()
@@ -15130,6 +15164,42 @@ private enum ParakeySelfTest {
                 message: "Parakey could not save that hotkey, so it kept F5."
             ),
             "hotkey preference update should roll back when persisted settings disagree"
+        )
+    }
+
+    private static func testHotkeyRecorderCaptureFlow() throws {
+        var singleModifier = HotkeyRecorderCaptureState()
+        let optionDown = event(.flagsChanged,
+                               keycode: 58,
+                               flags: CGEventFlags.maskAlternate.rawValue)
+        let leftOption = hotkeyChoice(forKeycode: 58)
+        try expect(
+            singleModifier.consume(optionDown),
+            equals: .waitingForChord(leftOption),
+            "recorder should wait for a possible chord after a modifier press"
+        )
+        try expect(
+            singleModifier.consume(event(.flagsChanged, keycode: 58)),
+            equals: .complete(leftOption),
+            "releasing a lone modifier should save it immediately"
+        )
+
+        var chord = HotkeyRecorderCaptureState()
+        _ = chord.consume(optionDown)
+        try expect(
+            chord.consume(event(.keyDown,
+                                keycode: 40,
+                                flags: CGEventFlags.maskAlternate.rawValue)),
+            equals: .complete(hotkeyChoice(forKeycode: 40,
+                                           modifiers: .maskAlternate)),
+            "pressing a regular key while a modifier is held should save the full chord"
+        )
+
+        var canceled = HotkeyRecorderCaptureState()
+        try expect(
+            canceled.consume(event(.keyDown, keycode: ESCAPE_KEYCODE)),
+            equals: .cancel,
+            "Escape should cancel shortcut recording"
         )
     }
 
