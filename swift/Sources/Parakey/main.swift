@@ -125,20 +125,45 @@ enum RecordingHUDMode {
     case transcribing
 }
 
-/// The hotkeys the user can pick from in Settings → Hotkey. Modifier
-/// keycodes (62/61/54) are tracked via `.flagsChanged` events; the
-/// F-keys are normal `.keyDown` / `.keyUp`.
+/// A global dictation shortcut: either one modifier key or a regular
+/// keyboard key with an optional Control/Option/Shift/Command chord.
 struct HotkeyChoice: Equatable {
     let name: String
     let keycode: CGKeyCode
     let isModifier: Bool
     /// Which CGEventFlags mask bit fires for this modifier (nil for non-modifiers).
     let modifierFlag: CGEventFlags?
+    /// Modifier keys required alongside a non-modifier key.
+    let requiredModifiers: CGEventFlags
+
+    init(name: String,
+         keycode: CGKeyCode,
+         isModifier: Bool,
+         modifierFlag: CGEventFlags?,
+         requiredModifiers: CGEventFlags = []) {
+        self.name = name
+        self.keycode = keycode
+        self.isModifier = isModifier
+        self.modifierFlag = modifierFlag
+        self.requiredModifiers = requiredModifiers.intersection(HOTKEY_SHORTCUT_MODIFIER_MASK)
+    }
 }
 
-let RIGHT_MODIFIER_HOTKEY_CHOICES: [HotkeyChoice] = [
+let HOTKEY_SHORTCUT_MODIFIER_MASK: CGEventFlags = [
+    .maskControl,
+    .maskAlternate,
+    .maskShift,
+    .maskCommand,
+]
+
+let MODIFIER_HOTKEY_CHOICES: [HotkeyChoice] = [
+    HotkeyChoice(name: "Left Control", keycode: 59, isModifier: true, modifierFlag: .maskControl),
     HotkeyChoice(name: "Right Control", keycode: 62, isModifier: true, modifierFlag: .maskControl),
+    HotkeyChoice(name: "Left Option", keycode: 58, isModifier: true, modifierFlag: .maskAlternate),
     HotkeyChoice(name: "Right Option", keycode: 61, isModifier: true, modifierFlag: .maskAlternate),
+    HotkeyChoice(name: "Left Shift", keycode: 56, isModifier: true, modifierFlag: .maskShift),
+    HotkeyChoice(name: "Right Shift", keycode: 60, isModifier: true, modifierFlag: .maskShift),
+    HotkeyChoice(name: "Left Command", keycode: 55, isModifier: true, modifierFlag: .maskCommand),
     HotkeyChoice(name: "Right Command", keycode: 54, isModifier: true, modifierFlag: .maskCommand),
 ]
 
@@ -166,9 +191,9 @@ let FUNCTION_KEY_NAMES_BY_KEYCODE: [CGKeyCode: String] = [
 ]
 
 let HOTKEY_CHOICES: [HotkeyChoice] = [
-    RIGHT_MODIFIER_HOTKEY_CHOICES[0],
-    RIGHT_MODIFIER_HOTKEY_CHOICES[1],
-    RIGHT_MODIFIER_HOTKEY_CHOICES[2],
+    MODIFIER_HOTKEY_CHOICES.first(where: { $0.keycode == 62 })!,
+    MODIFIER_HOTKEY_CHOICES.first(where: { $0.keycode == 61 })!,
+    MODIFIER_HOTKEY_CHOICES.first(where: { $0.keycode == 54 })!,
     HotkeyChoice(name: "F5",            keycode: 96,  isModifier: false, modifierFlag: nil),
     HotkeyChoice(name: "F6",            keycode: 97,  isModifier: false, modifierFlag: nil),
     HotkeyChoice(name: "F13",           keycode: 105, isModifier: false, modifierFlag: nil),
@@ -176,18 +201,55 @@ let HOTKEY_CHOICES: [HotkeyChoice] = [
     HotkeyChoice(name: "F19",           keycode: 80,  isModifier: false, modifierFlag: nil),
 ]
 
-func recordableHotkeyChoice(forKeycode keycode: CGKeyCode) -> HotkeyChoice? {
-    if let choice = RIGHT_MODIFIER_HOTKEY_CHOICES.first(where: { $0.keycode == keycode }) {
-        return choice
-    }
-    if let name = FUNCTION_KEY_NAMES_BY_KEYCODE[keycode] {
-        return HotkeyChoice(name: name, keycode: keycode, isModifier: false, modifierFlag: nil)
-    }
-    return nil
+private let HOTKEY_KEY_NAMES_BY_KEYCODE: [CGKeyCode: String] = [
+    0: "A", 1: "S", 2: "D", 3: "F", 4: "H", 5: "G", 6: "Z", 7: "X", 8: "C", 9: "V",
+    11: "B", 12: "Q", 13: "W", 14: "E", 15: "R", 16: "Y", 17: "T", 18: "1", 19: "2",
+    20: "3", 21: "4", 22: "6", 23: "5", 24: "=", 25: "9", 26: "7", 27: "-", 28: "8",
+    29: "0", 30: "]", 31: "O", 32: "U", 33: "[", 34: "I", 35: "P", 36: "Return",
+    37: "L", 38: "J", 39: "'", 40: "K", 41: ";", 42: "\\", 43: ",", 44: "/", 45: "N",
+    46: "M", 47: ".", 48: "Tab", 49: "Space", 50: "`", 51: "Delete", 53: "Escape",
+    65: "Keypad .", 67: "Keypad *", 69: "Keypad +", 71: "Clear", 75: "Keypad /",
+    76: "Enter", 78: "Keypad -", 81: "Keypad =", 82: "Keypad 0", 83: "Keypad 1",
+    84: "Keypad 2", 85: "Keypad 3", 86: "Keypad 4", 87: "Keypad 5", 88: "Keypad 6",
+    89: "Keypad 7", 91: "Keypad 8", 92: "Keypad 9", 114: "Help", 115: "Home",
+    116: "Page Up", 117: "Forward Delete", 119: "End", 121: "Page Down", 123: "Left Arrow",
+    124: "Right Arrow", 125: "Down Arrow", 126: "Up Arrow",
+]
+
+private func hotkeyKeyName(for keycode: CGKeyCode) -> String {
+    FUNCTION_KEY_NAMES_BY_KEYCODE[keycode]
+        ?? HOTKEY_KEY_NAMES_BY_KEYCODE[keycode]
+        ?? "Key \(keycode)"
 }
 
-func hotkeyChoice(forKeycode keycode: CGKeyCode) -> HotkeyChoice {
-    recordableHotkeyChoice(forKeycode: keycode)
+private func hotkeyModifierSymbols(_ flags: CGEventFlags) -> String {
+    var result = ""
+    if flags.contains(.maskControl) { result += "⌃" }
+    if flags.contains(.maskAlternate) { result += "⌥" }
+    if flags.contains(.maskShift) { result += "⇧" }
+    if flags.contains(.maskCommand) { result += "⌘" }
+    return result
+}
+
+func recordableHotkeyChoice(forKeycode keycode: CGKeyCode,
+                            modifiers: CGEventFlags = []) -> HotkeyChoice? {
+    let normalizedModifiers = modifiers.intersection(HOTKEY_SHORTCUT_MODIFIER_MASK)
+    if let choice = MODIFIER_HOTKEY_CHOICES.first(where: { $0.keycode == keycode }) {
+        guard normalizedModifiers.isEmpty else { return nil }
+        return choice
+    }
+    guard keycode <= 255, keycode != ESCAPE_KEYCODE else { return nil }
+    let name = hotkeyModifierSymbols(normalizedModifiers) + hotkeyKeyName(for: keycode)
+    return HotkeyChoice(name: name,
+                        keycode: keycode,
+                        isModifier: false,
+                        modifierFlag: nil,
+                        requiredModifiers: normalizedModifiers)
+}
+
+func hotkeyChoice(forKeycode keycode: CGKeyCode,
+                  modifiers: CGEventFlags = []) -> HotkeyChoice {
+    recordableHotkeyChoice(forKeycode: keycode, modifiers: modifiers)
         ?? HOTKEY_CHOICES.first(where: { $0.keycode == DEFAULT_HOTKEY_KEYCODE })!
 }
 
@@ -2188,7 +2250,7 @@ enum SuperDictateAgentService {
                               isTranscribing: false,
                               speechModelReady: false,
                               missingPermissions: [],
-                              hotkeyName: hotkeyChoice(forKeycode: Settings.shared.hotkeyKeycode).name,
+                              hotkeyName: Settings.shared.configuredHotkey.name,
                               triggerMode: Settings.shared.triggerMode.rawValue)
         )
     }
@@ -2312,6 +2374,7 @@ extension ISO8601DateFormatter {
 
 final class Settings: @unchecked Sendable {
     private static let keyHotkeyKeycode = "hotkey_keycode"
+    private static let keyHotkeyModifiers = "hotkey_modifiers"
     private static let keyTriggerMode = "trigger_mode"
     private static let keyPasteSuffix = "paste_suffix"
     private static let keyRecentTranscripts = "recent_transcripts"
@@ -2370,6 +2433,27 @@ final class Settings: @unchecked Sendable {
                 ?? DEFAULT_HOTKEY_KEYCODE
             defaults.set(Int(normalized), forKey: Self.keyHotkeyKeycode)
         }
+    }
+
+    var hotkeyModifiers: CGEventFlags {
+        get {
+            let raw = defaults.object(forKey: Self.keyHotkeyModifiers) as? NSNumber
+            return CGEventFlags(rawValue: raw?.uint64Value ?? 0)
+                .intersection(HOTKEY_SHORTCUT_MODIFIER_MASK)
+        }
+        set {
+            defaults.set(NSNumber(value: newValue.intersection(HOTKEY_SHORTCUT_MODIFIER_MASK).rawValue),
+                         forKey: Self.keyHotkeyModifiers)
+        }
+    }
+
+    var configuredHotkey: HotkeyChoice {
+        hotkeyChoice(forKeycode: hotkeyKeycode, modifiers: hotkeyModifiers)
+    }
+
+    func setConfiguredHotkey(_ choice: HotkeyChoice) {
+        hotkeyKeycode = choice.keycode
+        hotkeyModifiers = choice.requiredModifiers
     }
 
     var triggerMode: TriggerMode {
@@ -3336,13 +3420,14 @@ private enum HotkeyPreferenceUpdateResult: Equatable {
 private func hotkeyPreferenceUpdateResult(
     requested: HotkeyChoice,
     previous: HotkeyChoice,
-    persistedKeycode: CGKeyCode
+    persisted: HotkeyChoice
 ) -> HotkeyPreferenceUpdateResult {
-    guard let recordable = recordableHotkeyChoice(forKeycode: requested.keycode) else {
+    guard let recordable = recordableHotkeyChoice(forKeycode: requested.keycode,
+                                                  modifiers: requested.requiredModifiers) else {
         return .rejected("That key cannot be used for dictation.")
     }
 
-    guard persistedKeycode == recordable.keycode else {
+    guard persisted == recordable else {
         return .rolledBack(
             previous: previous,
             message: "Parakey could not save that hotkey, so it kept \(previous.name)."
@@ -3371,7 +3456,7 @@ private func hotkeyRecordingDecision(for event: HotkeyEventSnapshot) -> HotkeyRe
     if event.isAutoRepeat { return .ignore }
 
     if event.typeRawValue == CGEventType.flagsChanged.rawValue {
-        guard let choice = RIGHT_MODIFIER_HOTKEY_CHOICES.first(where: { $0.keycode == event.keycode }),
+        guard let choice = MODIFIER_HOTKEY_CHOICES.first(where: { $0.keycode == event.keycode }),
               let mask = choice.modifierFlag,
               event.flags.contains(mask) else {
             return .ignore
@@ -3380,11 +3465,76 @@ private func hotkeyRecordingDecision(for event: HotkeyEventSnapshot) -> HotkeyRe
     }
 
     guard event.typeRawValue == CGEventType.keyDown.rawValue else { return .ignore }
-    guard let choice = recordableHotkeyChoice(forKeycode: event.keycode),
+    guard let choice = recordableHotkeyChoice(
+        forKeycode: event.keycode,
+        modifiers: event.flags.intersection(HOTKEY_SHORTCUT_MODIFIER_MASK)
+    ),
           !choice.isModifier else {
-        return .reject("Choose a right-side modifier key or an F-key. Typing keys are not safe because Parakey suppresses its dictation key globally.")
+        return .reject("Escape is reserved for canceling dictation. Choose another key or shortcut.")
     }
     return .accept(choice)
+}
+
+@MainActor
+private func presentHotkeyRecorder() -> HotkeyChoice? {
+    let alert = NSAlert()
+    alert.messageText = "Record Dictation Shortcut"
+    alert.informativeText = "Press one keyboard key or a shortcut, then choose Use Shortcut. Escape stays reserved for canceling dictation."
+    alert.addButton(withTitle: "Use Shortcut")
+    alert.addButton(withTitle: "Cancel")
+    let useButton = alert.buttons[0]
+    useButton.isEnabled = false
+
+    let status = NSTextField(labelWithString: "Waiting for a key or shortcut…")
+    status.font = .systemFont(ofSize: 13, weight: .medium)
+    status.textColor = .secondaryLabelColor
+    status.lineBreakMode = .byWordWrapping
+    status.maximumNumberOfLines = 0
+    status.frame = NSRect(x: 0, y: 0, width: 400, height: 48)
+    alert.accessoryView = status
+
+    var selected: HotkeyChoice?
+    let monitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .flagsChanged]) { event in
+        if event.type == .keyDown, event.keyCode == UInt16(ESCAPE_KEYCODE) {
+            NSApp.stopModal(withCode: .alertSecondButtonReturn)
+            return nil
+        }
+
+        let snapshot = HotkeyEventSnapshot(
+            typeRawValue: event.type == .flagsChanged
+                ? CGEventType.flagsChanged.rawValue
+                : CGEventType.keyDown.rawValue,
+            keycode: CGKeyCode(event.keyCode),
+            flagsRawValue: event.cgEvent?.flags.rawValue ?? 0,
+            isAutoRepeat: event.isARepeat
+        )
+        switch hotkeyRecordingDecision(for: snapshot) {
+        case .accept(let choice):
+            selected = choice
+            useButton.isEnabled = true
+            if !choice.isModifier && choice.requiredModifiers.isEmpty
+                && FUNCTION_KEY_NAMES_BY_KEYCODE[choice.keycode] == nil {
+                status.stringValue = "Selected: \(choice.name). This key will be reserved globally while dictation is running."
+            } else {
+                status.stringValue = "Selected: \(choice.name)"
+            }
+            return nil
+        case .reject(let message):
+            status.stringValue = message
+            NSSound.beep()
+            return nil
+        case .ignore:
+            return nil
+        }
+    }
+    defer {
+        if let monitor {
+            NSEvent.removeMonitor(monitor)
+        }
+    }
+
+    guard alert.runModal() == .alertFirstButtonReturn else { return nil }
+    return selected
 }
 
 private enum HotkeyTransitionAction: Equatable, Sendable {
@@ -3405,6 +3555,7 @@ private struct HotkeyTransitionResult: Equatable, Sendable {
 
 private struct HotkeyTransitionState {
     private var hotkeyModifierDown = false
+    private var hotkeyKeyDown = false
     private var toggleActive = false
     private var suppressEscapeKeyUp = false
     private var historyChordRightCommandDown = false
@@ -3417,6 +3568,7 @@ private struct HotkeyTransitionState {
 
     mutating func resetAll() {
         hotkeyModifierDown = false
+        hotkeyKeyDown = false
         toggleActive = false
         suppressEscapeKeyUp = false
         historyChordRightCommandDown = false
@@ -3456,7 +3608,8 @@ private struct HotkeyTransitionState {
         }
 
         if let chord = transitionEnterChord(for: event,
-                                            isRecording: isRecording) {
+                                            isRecording: isRecording,
+                                            hotkey: hotkey) {
             return chord
         }
 
@@ -3481,12 +3634,19 @@ private struct HotkeyTransitionState {
                 hotkeyModifierDown = true
             }
         } else {
-            if event.typeRawValue == CGEventType.keyDown.rawValue, !event.isAutoRepeat {
+            if event.typeRawValue == CGEventType.keyDown.rawValue {
+                guard !event.isAutoRepeat else {
+                    return hotkeyKeyDown ? .suppressOnly : .pass
+                }
+                let modifiers = event.flags.intersection(HOTKEY_SHORTCUT_MODIFIER_MASK)
+                guard modifiers == hotkey.requiredModifiers else { return .pass }
                 isPress = true
-            } else if event.typeRawValue == CGEventType.keyUp.rawValue {
+                hotkeyKeyDown = true
+            } else if event.typeRawValue == CGEventType.keyUp.rawValue, hotkeyKeyDown {
                 isRelease = true
+                hotkeyKeyDown = false
             } else {
-                return .suppressOnly
+                return .pass
             }
         }
 
@@ -3568,8 +3728,15 @@ private struct HotkeyTransitionState {
 
     private mutating func transitionEnterChord(
         for event: HotkeyEventSnapshot,
-        isRecording: Bool
+        isRecording: Bool,
+        hotkey: HotkeyChoice
     ) -> HotkeyTransitionResult? {
+        if hotkey.keycode == RIGHT_OPTION_KEYCODE, hotkey.isModifier {
+            enterChordRightOptionDown = false
+            enterChordRightCommandDown = false
+            enterChordActive = false
+            return nil
+        }
         if !isRecording, !enterChordActive {
             enterChordRightOptionDown = false
             enterChordRightCommandDown = false
@@ -8605,7 +8772,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         // Configure hotkey listener up front so it picks up the user's
         // saved choice the moment the tap goes live.
-        hotkey.setHotkey(hotkeyChoice(forKeycode: settings.hotkeyKeycode))
+        hotkey.setHotkey(settings.configuredHotkey)
         hotkey.setTriggerMode(settings.triggerMode)
         startStartup(reason: "launch")
     }
@@ -11355,7 +11522,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let alert = NSAlert()
         alert.alertStyle = .warning
         alert.messageText = "Stop SuperDictate?"
-        alert.informativeText = "Right Command dictation will stop until you open SuperDictate again. Use Close to hide windows while keeping dictation running."
+        alert.informativeText = "The \(hotkey.hotkey.name) dictation shortcut will stop until you open SuperDictate again. Use Close to hide windows while keeping dictation running."
         alert.addButton(withTitle: "Keep Running")
         alert.addButton(withTitle: "Stop Dictation")
         return alert.runModal() == .alertSecondButtonReturn
@@ -12311,7 +12478,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                                             keyEquivalent: "")
         optionCommandEnter.target = self
         optionCommandEnter.state = settings.optionCommandEnterAfterDictation ? .on : .off
-        optionCommandEnter.toolTip = "Off: plain Right Command sends Enter; Option+Command finishes without Enter."
+        optionCommandEnter.toolTip = "Off: the dictation shortcut sends Enter; Right Option + Right Command finishes without Enter."
         sub.addItem(optionCommandEnter)
 
         let mute = NSMenuItem(title: "Mute system audio while recording",
@@ -12368,7 +12535,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         hkSub.autoenablesItems = false
         let current = hotkey.hotkey
 
-        if !HOTKEY_CHOICES.contains(where: { $0.keycode == current.keycode }) {
+        if !HOTKEY_CHOICES.contains(current) {
             let currentItem = NSMenuItem(title: current.name,
                                          action: nil,
                                          keyEquivalent: "")
@@ -12383,7 +12550,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                                   action: #selector(selectHotkey(_:)),
                                   keyEquivalent: "")
             item.target = self
-            item.state = (choice.keycode == current.keycode) ? .on : .off
+            item.state = (choice == current) ? .on : .off
             item.representedObject = Int(choice.keycode)
             hkSub.addItem(item)
         }
@@ -12401,11 +12568,11 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                                action: #selector(resetHotkeyClicked(_:)),
                                keyEquivalent: "")
         reset.target = self
-        reset.isEnabled = current.keycode != DEFAULT_HOTKEY_KEYCODE
+        reset.isEnabled = current != hotkeyChoice(forKeycode: DEFAULT_HOTKEY_KEYCODE)
             && !isRecording
             && !isBusy
             && !isTerminating
-        reset.toolTip = "Use Right Option for dictation."
+        reset.toolTip = "Use Right Command for dictation."
         hkSub.addItem(reset)
 
         hkParent.submenu = hkSub
@@ -13590,25 +13757,26 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private func applyHotkeyChoice(_ choice: HotkeyChoice) -> Bool {
         let previous = hotkey.hotkey
 
-        guard let recordable = recordableHotkeyChoice(forKeycode: choice.keycode) else {
+        guard let recordable = recordableHotkeyChoice(forKeycode: choice.keycode,
+                                                      modifiers: choice.requiredModifiers) else {
             if case .rejected(let message) = hotkeyPreferenceUpdateResult(
                 requested: choice,
                 previous: previous,
-                persistedKeycode: previous.keycode
+                persisted: previous
             ) {
                 showHotkeyRecordError(message)
             }
             return false
         }
 
-        settings.hotkeyKeycode = recordable.keycode
+        settings.setConfiguredHotkey(recordable)
         hotkey.setHotkey(recordable)
         hotkeyTestSucceeded = false
 
         switch hotkeyPreferenceUpdateResult(
             requested: recordable,
             previous: previous,
-            persistedKeycode: settings.hotkeyKeycode
+            persisted: settings.configuredHotkey
         ) {
         case .saved:
             rebuildMenu()
@@ -13618,7 +13786,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             showHotkeyRecordError(message)
             return false
         case .rolledBack(let previous, let message):
-            settings.hotkeyKeycode = previous.keycode
+            settings.setConfiguredHotkey(previous)
             hotkey.setHotkey(previous)
             showHotkeyRecordError(message)
             rebuildMenu()
@@ -13630,57 +13798,13 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         guard !isRecording, !isBusy, !isTerminating else { return }
         showAppForModal()
 
-        let alert = NSAlert()
-        alert.messageText = "Record Hotkey"
-        alert.informativeText = "Press a right-side modifier key or an F-key."
-        alert.addButton(withTitle: "Use Selected")
-        alert.addButton(withTitle: "Cancel")
-        let useButton = alert.buttons[0]
-        useButton.isEnabled = false
-
-        let status = NSTextField(labelWithString: "Waiting for key…")
-        status.font = .systemFont(ofSize: 13)
-        status.textColor = .secondaryLabelColor
-        status.lineBreakMode = .byWordWrapping
-        status.maximumNumberOfLines = 0
-        status.frame = NSRect(x: 0, y: 0, width: 380, height: 42)
-        alert.accessoryView = status
-
         let shouldRestoreHotkeyTap = isReady
         if shouldRestoreHotkeyTap {
             hotkey.stop()
         }
 
-        var selected: HotkeyChoice?
-        var monitor: Any?
-        monitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .flagsChanged]) { event in
-            let snapshot = HotkeyEventSnapshot(
-                typeRawValue: event.type == .flagsChanged
-                    ? CGEventType.flagsChanged.rawValue
-                    : CGEventType.keyDown.rawValue,
-                keycode: CGKeyCode(event.keyCode),
-                flagsRawValue: event.cgEvent?.flags.rawValue ?? 0,
-                isAutoRepeat: event.isARepeat
-            )
-            switch hotkeyRecordingDecision(for: snapshot) {
-            case .accept(let choice):
-                selected = choice
-                status.stringValue = "Selected: \(choice.name)"
-                useButton.isEnabled = true
-                NSApp.stopModal(withCode: .alertFirstButtonReturn)
-                return nil
-            case .reject(let message):
-                status.stringValue = message
-                NSSound.beep()
-                return nil
-            case .ignore:
-                return nil
-            }
-        }
+        let selected = presentHotkeyRecorder()
         defer {
-            if let monitor {
-                NSEvent.removeMonitor(monitor)
-            }
             let restartSucceeded: Bool
             if shouldRestoreHotkeyTap && !isTerminating {
                 restartSucceeded = hotkey.start()
@@ -13709,9 +13833,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             }
         }
 
-        let response = alert.runModal()
-        guard response == .alertFirstButtonReturn,
-              let selected else { return }
+        guard let selected else { return }
         if applyHotkeyChoice(selected) {
             log("HotkeyListener: recorded hotkey → \(selected.name)")
         }
@@ -14887,6 +15009,7 @@ private enum ParakeySelfTest {
         try testHotkeyPreferenceUpdateResults()
         try testHotkeyRecorderRestartActions()
         try testHandledHotkeySuppression()
+        try testCustomShortcutMatching()
         try testFKeyAutoRepeatSuppressesWithoutAction()
         try testRightModifierReleaseWithLeftFlagStillSet()
         try testHistoryChordShowsOverlay()
@@ -14942,8 +15065,19 @@ private enum ParakeySelfTest {
         )
         try expect(
             hotkeyRecordingDecision(for: event(.keyDown, keycode: 0)),
-            equals: .reject("Choose a right-side modifier key or an F-key. Typing keys are not safe because Parakey suppresses its dictation key globally."),
-            "hotkey recorder should reject typing keys"
+            equals: .accept(HotkeyChoice(name: "A", keycode: 0, isModifier: false, modifierFlag: nil)),
+            "hotkey recorder should accept a single typing key"
+        )
+        try expect(
+            hotkeyRecordingDecision(for: event(.keyDown,
+                                               keycode: 40,
+                                               flags: CGEventFlags.maskCommand.rawValue | CGEventFlags.maskShift.rawValue)),
+            equals: .accept(HotkeyChoice(name: "⇧⌘K",
+                                         keycode: 40,
+                                         isModifier: false,
+                                         modifierFlag: nil,
+                                         requiredModifiers: [.maskCommand, .maskShift])),
+            "hotkey recorder should accept multi-key shortcuts"
         )
         try expect(
             hotkeyRecordingDecision(for: event(.keyDown, keycode: 98, isAutoRepeat: true)),
@@ -14965,13 +15099,13 @@ private enum ParakeySelfTest {
     private static func testHotkeyPreferenceUpdateResults() throws {
         let f5 = hotkeyChoice(forKeycode: 96)
         let f7 = hotkeyChoice(forKeycode: 98)
-        let invalid = HotkeyChoice(name: "A", keycode: 0, isModifier: false, modifierFlag: nil)
+        let invalid = HotkeyChoice(name: "Escape", keycode: ESCAPE_KEYCODE, isModifier: false, modifierFlag: nil)
 
         try expect(
             hotkeyPreferenceUpdateResult(
                 requested: f7,
                 previous: f5,
-                persistedKeycode: f7.keycode
+                persisted: f7
             ),
             equals: .saved(f7),
             "hotkey preference update should save supported keys after persistence confirms them"
@@ -14980,7 +15114,7 @@ private enum ParakeySelfTest {
             hotkeyPreferenceUpdateResult(
                 requested: invalid,
                 previous: f5,
-                persistedKeycode: f5.keycode
+                persisted: f5
             ),
             equals: .rejected("That key cannot be used for dictation."),
             "hotkey preference update should reject unsupported keys before mutating settings"
@@ -14989,7 +15123,7 @@ private enum ParakeySelfTest {
             hotkeyPreferenceUpdateResult(
                 requested: f7,
                 previous: f5,
-                persistedKeycode: f5.keycode
+                persisted: f5
             ),
             equals: .rolledBack(
                 previous: f5,
@@ -17840,6 +17974,40 @@ private enum ParakeySelfTest {
         )
     }
 
+    private static func testCustomShortcutMatching() throws {
+        var state = HotkeyTransitionState()
+        let shortcut = hotkeyChoice(forKeycode: 40,
+                                    modifiers: [.maskCommand, .maskShift])
+        let commandShift = CGEventFlags.maskCommand.rawValue | CGEventFlags.maskShift.rawValue
+
+        try expect(
+            state.transition(for: event(.keyDown, keycode: 40, flags: commandShift),
+                             hotkey: shortcut,
+                             triggerMode: .hold,
+                             isRecording: false),
+            equals: HotkeyTransitionResult(suppress: true, actions: [.press]),
+            "custom shortcut should trigger when its exact modifiers are held"
+        )
+        try expect(
+            state.transition(for: event(.keyUp, keycode: 40),
+                             hotkey: shortcut,
+                             triggerMode: .hold,
+                             isRecording: true),
+            equals: HotkeyTransitionResult(suppress: true, actions: [.release]),
+            "custom shortcut release should not depend on modifier release order"
+        )
+        try expect(
+            state.transition(for: event(.keyDown,
+                                        keycode: 40,
+                                        flags: CGEventFlags.maskCommand.rawValue),
+                             hotkey: shortcut,
+                             triggerMode: .hold,
+                             isRecording: false),
+            equals: .pass,
+            "custom shortcut should ignore incomplete modifier combinations"
+        )
+    }
+
     private static func testFKeyAutoRepeatSuppressesWithoutAction() throws {
         var state = HotkeyTransitionState()
         let f5 = hotkeyChoice(forKeycode: 96)
@@ -17870,6 +18038,33 @@ private enum ParakeySelfTest {
             state.transition(for: event(.flagsChanged, keycode: rightOption.keycode, flags: alternate), hotkey: rightOption, triggerMode: .hold, isRecording: false),
             equals: HotkeyTransitionResult(suppress: true, actions: [.release]),
             "right modifier release should be recognized while left-side flag remains set"
+        )
+
+        var toggleState = HotkeyTransitionState()
+        try expect(
+            toggleState.transition(for: event(.flagsChanged,
+                                              keycode: rightOption.keycode,
+                                              flags: alternate),
+                                   hotkey: rightOption,
+                                   triggerMode: .toggle,
+                                   isRecording: false),
+            equals: HotkeyTransitionResult(suppress: true, actions: [.press]),
+            "right Option should start when it is the configured toggle hotkey"
+        )
+        _ = toggleState.transition(for: event(.flagsChanged,
+                                              keycode: rightOption.keycode),
+                                   hotkey: rightOption,
+                                   triggerMode: .toggle,
+                                   isRecording: true)
+        try expect(
+            toggleState.transition(for: event(.flagsChanged,
+                                              keycode: rightOption.keycode,
+                                              flags: alternate),
+                                   hotkey: rightOption,
+                                   triggerMode: .toggle,
+                                   isRecording: true),
+            equals: HotkeyTransitionResult(suppress: true, actions: [.release]),
+            "right Option should stop instead of being swallowed by the Enter chord"
         )
     }
 
@@ -18293,10 +18488,16 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
 
         root.addArrangedSubview(separator())
         root.addArrangedSubview(sectionLabel("Settings"))
-        root.addArrangedSubview(infoRow(title: "Dictation key",
-                                        detail: "\(hotkeyChoice(forKeycode: settings.hotkeyKeycode).name), \(TRIGGER_DISPLAY[settings.triggerMode] ?? settings.triggerMode.rawValue.lowercased())"))
+        root.addArrangedSubview(statusRow(
+            title: "Dictation shortcut",
+            detail: "\(settings.configuredHotkey.name), \(TRIGGER_DISPLAY[settings.triggerMode] ?? settings.triggerMode.rawValue.lowercased())",
+            status: "",
+            statusColor: .secondaryLabelColor,
+            buttonTitle: "Change…",
+            action: #selector(recordDictationShortcutClicked(_:))
+        ))
         root.addArrangedSubview(checkboxRow(title: "Option + Command sends Enter",
-                                            detail: "Off: plain Right Command sends Enter, and Option + Command finishes without Enter.",
+                                            detail: "Off: the dictation shortcut sends Enter, and Right Option + Right Command finishes without Enter.",
                                             isOn: settings.optionCommandEnterAfterDictation,
                                             action: #selector(toggleOptionCommandEnterClicked(_:))))
         root.addArrangedSubview(popupRow(title: "Recording color",
@@ -18351,7 +18552,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         } else {
             statusText = settings.agentEnabled ? "Stopped" : "Off"
             detailText = settings.agentEnabled
-                ? "Right Command dictation is off until the service is started."
+                ? "The \(settings.configuredHotkey.name) dictation shortcut is off until the service is started."
                 : "Dictation service is off. Press Start to turn it back on."
             color = settings.agentEnabled ? .systemRed : .secondaryLabelColor
         }
@@ -18422,13 +18623,6 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             row.addArrangedSubview(button)
         }
         return row
-    }
-
-    private func infoRow(title: String, detail: String) -> NSView {
-        statusRow(title: title,
-                  detail: detail,
-                  status: "",
-                  statusColor: .secondaryLabelColor)
     }
 
     private func checkboxRow(title: String,
@@ -18554,7 +18748,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         case .accessibility:
             return "Lets the service paste the transcript at your cursor."
         case .inputMonitoring:
-            return "Lets the service hear the Right Command shortcut globally."
+            return "Lets the service hear your dictation shortcut globally."
         }
     }
 
@@ -18582,7 +18776,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         let alert = NSAlert()
         alert.alertStyle = .warning
         alert.messageText = "Stop Dictation Service?"
-        alert.informativeText = "Right Command dictation will stop until you start the service again."
+        alert.informativeText = "The \(settings.configuredHotkey.name) dictation shortcut will stop until you start the service again."
         alert.addButton(withTitle: "Keep Running")
         alert.addButton(withTitle: "Stop Service")
         guard alert.runModal() == .alertSecondButtonReturn else { return }
@@ -18593,6 +18787,20 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
 
     @objc private func closePanelClicked(_ sender: NSButton) {
         NSApp.terminate(nil)
+    }
+
+    @objc private func recordDictationShortcutClicked(_ sender: NSButton) {
+        guard let selected = presentHotkeyRecorder() else { return }
+        settings.setConfiguredHotkey(selected)
+        settings.agentEnabled = true
+        _ = settings.refreshFromDisk()
+        do {
+            try SuperDictateAgentService.restart()
+        } catch {
+            showError(title: "Shortcut Saved, but Service Restart Failed",
+                      detail: "Open SuperDictate and press Restart. \(error.localizedDescription)")
+        }
+        refresh()
     }
 
     @objc private func toggleOptionCommandEnterClicked(_ sender: NSButton) {
