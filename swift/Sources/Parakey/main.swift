@@ -19205,6 +19205,7 @@ private enum ControlPanelUpdateState: Equatable, Sendable {
 @MainActor
 private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var window: NSWindow?
+    private var settingsWindow: NSWindow?
     private var refreshTimer: Timer?
     private var serviceOperation: ControlPanelServiceOperation?
     private var updateTask: Task<Void, Never>?
@@ -19246,7 +19247,16 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
     }
 
     func windowWillClose(_ notification: Notification) {
-        NSApp.terminate(nil)
+        guard let closingWindow = notification.object as? NSWindow else { return }
+        if closingWindow === settingsWindow {
+            settingsWindow = nil
+            return
+        }
+        if closingWindow === window {
+            settingsWindow?.orderOut(nil)
+            settingsWindow = nil
+            NSApp.terminate(nil)
+        }
     }
 
     private func t(_ russian: String, _ english: String) -> String {
@@ -19261,12 +19271,13 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             return
         }
 
-        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 720, height: 760),
-                              styleMask: [.titled, .closable, .miniaturizable, .resizable],
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 520, height: 310),
+                              styleMask: [.titled, .closable, .miniaturizable],
                               backing: .buffered,
                               defer: false)
         window.title = "SuperDictate"
-        window.minSize = NSSize(width: 660, height: 620)
+        window.contentMinSize = NSSize(width: 520, height: 310)
+        window.contentMaxSize = NSSize(width: 520, height: 310)
         window.isReleasedWhenClosed = false
         window.delegate = self
         self.window = window
@@ -19295,8 +19306,26 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         let fingerprint = renderFingerprint()
         guard force || fingerprint != lastRenderFingerprint else { return }
         lastRenderFingerprint = fingerprint
+        resizeCompactPanel(window)
         window.title = t("SuperDictate — панель управления", "SuperDictate — Control Panel")
         window.contentView = makeContentView()
+        if let settingsWindow, settingsWindow.isVisible {
+            settingsWindow.title = t("Настройки SuperDictate", "SuperDictate Settings")
+            settingsWindow.contentView = makeSettingsContentView()
+        }
+    }
+
+    private func resizeCompactPanel(_ window: NSWindow) {
+        let missingCount = Permission.allCases.filter { !Permissions.isGranted($0) }.count
+        let height = CGFloat(310 + max(0, missingCount - 1) * 28)
+        let oldTop = window.frame.maxY
+        let size = NSSize(width: 520, height: height)
+        window.contentMinSize = size
+        window.contentMaxSize = size
+        window.setContentSize(size)
+        var frame = window.frame
+        frame.origin.y = oldTop - frame.height
+        window.setFrame(frame, display: false)
     }
 
     private func renderFingerprint() -> String {
@@ -19345,97 +19374,27 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         let root = NSStackView()
         root.orientation = .vertical
         root.alignment = .leading
-        root.spacing = 14
-        root.edgeInsets = NSEdgeInsets(top: 24, left: 26, bottom: 24, right: 26)
+        root.spacing = 10
+        root.edgeInsets = NSEdgeInsets(top: 18, left: 20, bottom: 16, right: 20)
         root.translatesAutoresizingMaskIntoConstraints = false
 
-        root.addArrangedSubview(headerView())
-        if let serviceOperation {
-            root.addArrangedSubview(operationBanner(serviceOperation))
-        }
+        root.addArrangedSubview(compactHeaderView())
+        root.addArrangedSubview(compactServiceCard())
+        root.addArrangedSubview(compactPermissionsCard())
+        root.addArrangedSubview(compactUpdateCard())
+        root.addArrangedSubview(compactPrivacyFooter())
 
-        root.addArrangedSubview(sectionLabel(t("Состояние", "Overview")))
-        root.addArrangedSubview(overviewCardsView())
-        root.addArrangedSubview(separator())
-
-        root.addArrangedSubview(sectionLabel(t("Фоновая служба", "Background Service")))
-        root.addArrangedSubview(serviceStatusView())
-        root.addArrangedSubview(serviceButtonsView())
-        root.addArrangedSubview(separator())
-
-        root.addArrangedSubview(sectionLabel(t("Обновления", "Updates")))
-        root.addArrangedSubview(updateStatusView())
-        root.addArrangedSubview(separator())
-
-        root.addArrangedSubview(sectionLabel(t("Разрешения macOS", "macOS Permissions")))
-        for permission in Permission.allCases {
-            root.addArrangedSubview(permissionRow(permission))
-        }
-        root.addArrangedSubview(separator())
-
-        root.addArrangedSubview(sectionLabel(t("Настройки", "Settings")))
-        root.addArrangedSubview(statusRow(
-            title: t("Сочетание для диктовки", "Dictation shortcut"),
-            detail: "\(localizedHotkeyName(settings.configuredHotkey, language: language)) · \(triggerModeText())",
-            status: "",
-            statusColor: .secondaryLabelColor,
-            buttonTitle: t("Изменить…", "Change…"),
-            action: #selector(recordDictationShortcutClicked(_:)),
-            buttonEnabled: serviceOperation == nil
-        ))
-        root.addArrangedSubview(checkboxRow(
-            title: t("Правый Option + правый Command отправляет Enter",
-                     "Right Option + Right Command sends Enter"),
-            detail: t("Если выключено, Enter отправляет обычное сочетание диктовки.",
-                      "When off, the regular dictation shortcut sends Enter."),
-            isOn: settings.optionCommandEnterAfterDictation,
-            action: #selector(toggleOptionCommandEnterClicked(_:))
-        ))
-        root.addArrangedSubview(popupRow(
-            title: t("Цвет записи", "Recording color"),
-            detail: t("Цвет аудиоволн, пока микрофон слушает.",
-                      "Color used while the microphone is listening."),
-            selectedValue: settings.recordingHUDRecordingColor.rawValue,
-            options: RecordingHUDAccentColor.allCases.map { (localizedColorName($0), $0.rawValue) },
-            action: #selector(selectRecordingHUDRecordingColor(_:))
-        ))
-        root.addArrangedSubview(popupRow(
-            title: t("Цвет транскрибации", "Transcribing color"),
-            detail: t("Цвет анимации во время распознавания речи.",
-                      "Color used while speech is being converted to text."),
-            selectedValue: settings.recordingHUDTranscribingColor.rawValue,
-            options: RecordingHUDAccentColor.allCases.map { (localizedColorName($0), $0.rawValue) },
-            action: #selector(selectRecordingHUDTranscribingColor(_:))
-        ))
-        root.addArrangedSubview(popupRow(
-            title: t("Фон капсулы", "HUD background"),
-            detail: t("Системная тема или постоянный светлый/тёмный фон.",
-                      "Follow the system appearance or use a fixed background."),
-            selectedValue: settings.recordingHUDBackgroundStyle.rawValue,
-            options: RecordingHUDBackgroundStyle.allCases.map { (localizedBackgroundName($0), $0.rawValue) },
-            action: #selector(selectRecordingHUDBackgroundStyle(_:))
-        ))
-        root.addArrangedSubview(privacyInfoView())
-
-        let document = NSView()
-        document.translatesAutoresizingMaskIntoConstraints = false
-        document.addSubview(root)
-
-        let scroll = NSScrollView()
-        scroll.drawsBackground = false
-        scroll.hasVerticalScroller = true
-        scroll.autohidesScrollers = true
-        scroll.documentView = document
+        let background = NSVisualEffectView()
+        background.material = .underWindowBackground
+        background.blendingMode = .behindWindow
+        background.state = .active
+        background.addSubview(root)
 
         NSLayoutConstraint.activate([
-            document.leadingAnchor.constraint(equalTo: scroll.contentView.leadingAnchor),
-            document.trailingAnchor.constraint(equalTo: scroll.contentView.trailingAnchor),
-            document.topAnchor.constraint(equalTo: scroll.contentView.topAnchor),
-            document.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor),
-            root.leadingAnchor.constraint(equalTo: document.leadingAnchor),
-            root.trailingAnchor.constraint(equalTo: document.trailingAnchor),
-            root.topAnchor.constraint(equalTo: document.topAnchor),
-            root.bottomAnchor.constraint(equalTo: document.bottomAnchor),
+            root.leadingAnchor.constraint(equalTo: background.leadingAnchor),
+            root.trailingAnchor.constraint(equalTo: background.trailingAnchor),
+            root.topAnchor.constraint(equalTo: background.topAnchor),
+            root.bottomAnchor.constraint(equalTo: background.bottomAnchor),
         ])
 
         let innerWidthInset = -(root.edgeInsets.left + root.edgeInsets.right)
@@ -19443,10 +19402,94 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             view.widthAnchor.constraint(equalTo: root.widthAnchor,
                                         constant: innerWidthInset).isActive = true
         }
-        return scroll
+        return background
     }
 
-    private func headerView() -> NSView {
+    private func makeSettingsContentView() -> NSView {
+        let root = NSStackView()
+        root.orientation = .vertical
+        root.alignment = .leading
+        root.spacing = 14
+        root.edgeInsets = NSEdgeInsets(top: 22, left: 24, bottom: 22, right: 24)
+        root.translatesAutoresizingMaskIntoConstraints = false
+
+        root.addArrangedSubview(settingsHeaderView())
+        root.addArrangedSubview(separator())
+        root.addArrangedSubview(statusRow(
+            title: t("Сочетание для диктовки", "Dictation shortcut"),
+            detail: "\(localizedHotkeyName(settings.configuredHotkey, language: language)) · \(triggerModeText())",
+            status: "",
+            statusColor: .secondaryLabelColor,
+            buttonTitle: t("Изменить…", "Change…"),
+            action: #selector(recordDictationShortcutClicked(_:)),
+            buttonEnabled: serviceOperation == nil,
+            toolTip: t("Записать любую клавишу или сочетание для запуска диктовки.",
+                       "Record any key or key combination used to start dictation.")
+        ))
+        root.addArrangedSubview(checkboxRow(
+            title: t("Правый Option + правый Command отправляет Enter",
+                     "Right Option + Right Command sends Enter"),
+            detail: t("Если выключено, Enter отправляет обычное сочетание диктовки.",
+                      "When off, the regular dictation shortcut sends Enter."),
+            isOn: settings.optionCommandEnterAfterDictation,
+            action: #selector(toggleOptionCommandEnterClicked(_:)),
+            toolTip: t("Меняет, какое завершение диктовки автоматически нажимает Enter.",
+                       "Choose which dictation finish action automatically presses Enter.")
+        ))
+        root.addArrangedSubview(separator())
+        root.addArrangedSubview(popupRow(
+            title: t("Цвет записи", "Recording color"),
+            detail: t("Цвет аудиоволн, пока микрофон слушает.",
+                      "Color used while the microphone is listening."),
+            selectedValue: settings.recordingHUDRecordingColor.rawValue,
+            options: RecordingHUDAccentColor.allCases.map { (localizedColorName($0), $0.rawValue) },
+            action: #selector(selectRecordingHUDRecordingColor(_:)),
+            toolTip: t("Цвет индикатора во время записи.", "Indicator color while recording.")
+        ))
+        root.addArrangedSubview(popupRow(
+            title: t("Цвет транскрибации", "Transcribing color"),
+            detail: t("Цвет анимации во время распознавания речи.",
+                      "Color used while speech is being converted to text."),
+            selectedValue: settings.recordingHUDTranscribingColor.rawValue,
+            options: RecordingHUDAccentColor.allCases.map { (localizedColorName($0), $0.rawValue) },
+            action: #selector(selectRecordingHUDTranscribingColor(_:)),
+            toolTip: t("Цвет индикатора во время распознавания речи.",
+                       "Indicator color while speech is being transcribed.")
+        ))
+        root.addArrangedSubview(popupRow(
+            title: t("Фон капсулы", "HUD background"),
+            detail: t("Системная тема или постоянный светлый/тёмный фон.",
+                      "Follow the system appearance or use a fixed background."),
+            selectedValue: settings.recordingHUDBackgroundStyle.rawValue,
+            options: RecordingHUDBackgroundStyle.allCases.map { (localizedBackgroundName($0), $0.rawValue) },
+            action: #selector(selectRecordingHUDBackgroundStyle(_:)),
+            toolTip: t("Выбрать фон плавающего индикатора диктовки.",
+                       "Choose the floating dictation indicator background.")
+        ))
+        root.addArrangedSubview(privacyInfoView())
+
+        let background = NSVisualEffectView()
+        background.material = .underWindowBackground
+        background.blendingMode = .behindWindow
+        background.state = .active
+        background.addSubview(root)
+
+        NSLayoutConstraint.activate([
+            root.leadingAnchor.constraint(equalTo: background.leadingAnchor),
+            root.trailingAnchor.constraint(equalTo: background.trailingAnchor),
+            root.topAnchor.constraint(equalTo: background.topAnchor),
+            root.bottomAnchor.constraint(lessThanOrEqualTo: background.bottomAnchor),
+        ])
+
+        let innerWidthInset = -(root.edgeInsets.left + root.edgeInsets.right)
+        for view in root.arrangedSubviews {
+            view.widthAnchor.constraint(equalTo: root.widthAnchor,
+                                        constant: innerWidthInset).isActive = true
+        }
+        return background
+    }
+
+    private func compactHeaderView() -> NSView {
         let row = NSStackView()
         row.orientation = .horizontal
         row.alignment = .centerY
@@ -19455,161 +19498,310 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         let text = NSStackView()
         text.orientation = .vertical
         text.alignment = .leading
-        text.spacing = 3
-        text.addArrangedSubview(panelLabel("SuperDictate", size: 25, weight: .semibold))
+        text.spacing = 1
+        text.addArrangedSubview(panelLabel("SuperDictate", size: 20, weight: .semibold))
         text.addArrangedSubview(panelLabel(
-            t("Панель можно закрыть — диктовка продолжит работать в фоне.",
-              "You can close this panel; dictation keeps running in the background."),
-            size: 13,
+            t("Локальная диктовка · работает в фоне", "Local dictation · runs in the background"),
+            size: 11.5,
             color: .secondaryLabelColor
         ))
 
-        let version = panelLabel("v\(currentBundleVersion())", size: 12, color: .tertiaryLabelColor)
+        let version = panelLabel("v\(currentBundleVersion())", size: 11, color: .tertiaryLabelColor)
         version.setContentHuggingPriority(.required, for: .horizontal)
+        version.toolTip = t("Установленная версия SuperDictate", "Installed SuperDictate version")
 
         let languageControl = NSSegmentedControl(labels: ["RU", "EN"],
                                                  trackingMode: .selectOne,
                                                  target: self,
                                                  action: #selector(selectInterfaceLanguage(_:)))
         languageControl.selectedSegment = language == .russian ? 0 : 1
+        languageControl.controlSize = .small
+        languageControl.toolTip = t("Язык панели и настроек", "Panel and settings language")
         languageControl.setContentHuggingPriority(.required, for: .horizontal)
+
+        let settingsButton = compactIconButton(
+            symbol: "gearshape.fill",
+            accessibilityTitle: t("Открыть настройки", "Open Settings"),
+            toolTip: t("Открыть настройки диктовки и внешний вид индикатора",
+                       "Open dictation and indicator appearance settings"),
+            action: #selector(openSettingsClicked(_:))
+        )
 
         row.addArrangedSubview(text)
         row.addArrangedSubview(NSView())
         row.addArrangedSubview(version)
         row.addArrangedSubview(languageControl)
+        row.addArrangedSubview(settingsButton)
         return row
     }
 
-    private func overviewCardsView() -> NSView {
-        let state = AgentRuntimeStateStore.read()
-        let running = SuperDictateAgentService.isAgentRunning()
-        let permissionCount = Permission.allCases.filter(Permissions.isGranted).count
-        let service = servicePresentation(running: running, state: state)
-
+    private func settingsHeaderView() -> NSView {
         let row = NSStackView()
         row.orientation = .horizontal
-        row.alignment = .top
-        row.distribution = .fillEqually
-        row.spacing = 10
-        let modelReady = running && state?.speechModelReady == true
-        let cards = [
-            infoCard(symbol: "bolt.horizontal.circle.fill",
-                     title: t("Служба", "Service"),
-                     value: service.status,
-                     detail: running ? t("Фоновый процесс активен", "Background process active")
-                                     : t("Фоновый процесс выключен", "Background process is off"),
-                     color: service.color),
-            infoCard(symbol: "waveform.badge.mic",
-                     title: t("Модель", "Model"),
-                     value: modelReady ? t("Готова", "Ready") : t("Загрузка", "Loading"),
-                     detail: "Parakeet TDT v3 · \(t("локально", "local"))",
-                     color: modelReady ? .systemGreen : .systemOrange),
-            infoCard(symbol: "keyboard",
-                     title: t("Хоткей", "Shortcut"),
-                     value: localizedHotkeyName(settings.configuredHotkey, language: language),
-                     detail: triggerModeText(),
-                     color: settings.recordingHUDRecordingColor.nsColor),
-            infoCard(symbol: permissionCount == Permission.allCases.count
-                        ? "checkmark.shield.fill" : "exclamationmark.shield.fill",
-                     title: t("Доступы", "Permissions"),
-                     value: t("\(permissionCount) из \(Permission.allCases.count)",
-                              "\(permissionCount) of \(Permission.allCases.count)"),
-                     detail: permissionCount == Permission.allCases.count
-                        ? t("Все разрешения выданы", "All permissions granted")
-                        : t("Нужна настройка", "Setup required"),
-                     color: permissionCount == Permission.allCases.count ? .systemGreen : .systemOrange),
-        ]
-        for card in cards { row.addArrangedSubview(card) }
-        for card in cards.dropFirst() {
-            card.widthAnchor.constraint(equalTo: cards[0].widthAnchor).isActive = true
-        }
-        return row
-    }
-
-    private func infoCard(symbol: String,
-                          title: String,
-                          value: String,
-                          detail: String,
-                          color: NSColor) -> NSView {
-        let card = NSView()
-        card.wantsLayer = true
-        card.layer?.cornerRadius = 8
-        card.layer?.backgroundColor = NSColor.controlBackgroundColor.withAlphaComponent(0.72).cgColor
-        card.layer?.borderColor = NSColor.separatorColor.withAlphaComponent(0.5).cgColor
-        card.layer?.borderWidth = 1
-
-        let content = NSStackView()
-        content.orientation = .vertical
-        content.alignment = .leading
-        content.spacing = 5
-        content.translatesAutoresizingMaskIntoConstraints = false
-
-        let top = NSStackView()
-        top.orientation = .horizontal
-        top.alignment = .centerY
-        top.spacing = 6
-        let icon = NSImageView(image: NSImage(systemSymbolName: symbol,
-                                              accessibilityDescription: title) ?? NSImage())
-        icon.contentTintColor = color
-        icon.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 14, weight: .medium)
-        top.addArrangedSubview(icon)
-        top.addArrangedSubview(panelLabel(title, size: 11, weight: .medium, color: .secondaryLabelColor))
-
-        let valueLabel = panelLabel(value, size: 15, weight: .semibold)
-        valueLabel.lineBreakMode = .byTruncatingTail
-        valueLabel.maximumNumberOfLines = 1
-        let detailLabel = panelLabel(detail, size: 10.5, color: .secondaryLabelColor)
-        detailLabel.maximumNumberOfLines = 2
-
-        content.addArrangedSubview(top)
-        content.addArrangedSubview(valueLabel)
-        content.addArrangedSubview(detailLabel)
-        card.addSubview(content)
-        NSLayoutConstraint.activate([
-            card.heightAnchor.constraint(equalToConstant: 108),
-            content.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 12),
-            content.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -10),
-            content.topAnchor.constraint(equalTo: card.topAnchor, constant: 11),
-            content.bottomAnchor.constraint(lessThanOrEqualTo: card.bottomAnchor, constant: -10),
-        ])
-        return card
-    }
-
-    private func operationBanner(_ operation: ControlPanelServiceOperation) -> NSView {
-        let box = NSView()
-        box.wantsLayer = true
-        box.layer?.cornerRadius = 8
-        box.layer?.backgroundColor = NSColor.systemBlue.withAlphaComponent(0.10).cgColor
-        box.layer?.borderColor = NSColor.systemBlue.withAlphaComponent(0.28).cgColor
-        box.layer?.borderWidth = 1
-
-        let spinner = NSProgressIndicator()
-        spinner.style = .spinning
-        spinner.controlSize = .small
-        spinner.startAnimation(nil)
-        spinner.setContentHuggingPriority(.required, for: .horizontal)
+        row.alignment = .centerY
+        row.spacing = 12
 
         let text = NSStackView()
         text.orientation = .vertical
         text.alignment = .leading
         text.spacing = 2
-        text.addArrangedSubview(panelLabel(operationTitle(operation), size: 13, weight: .semibold))
-        text.addArrangedSubview(panelLabel(operationDetail(operation), size: 12, color: .secondaryLabelColor))
+        text.addArrangedSubview(panelLabel(t("Настройки", "Settings"), size: 20, weight: .semibold))
+        text.addArrangedSubview(panelLabel(
+            t("Изменения сохраняются сразу и применяются к фоновой службе.",
+              "Changes are saved immediately and applied to the background service."),
+            size: 11.5,
+            color: .secondaryLabelColor
+        ))
+        row.addArrangedSubview(text)
+        row.addArrangedSubview(NSView())
+        row.addArrangedSubview(panelLabel("v\(currentBundleVersion())", size: 11, color: .tertiaryLabelColor))
+        return row
+    }
 
-        let row = NSStackView(views: [spinner, text])
+    private func compactServiceCard() -> NSView {
+        let running = SuperDictateAgentService.isAgentRunning()
+        let state = AgentRuntimeStateStore.read()
+        let presentation = servicePresentation(running: running, state: state)
+        let card = compactCard()
+        let row = NSStackView()
         row.orientation = .horizontal
         row.alignment = .centerY
         row.spacing = 12
         row.translatesAutoresizingMaskIntoConstraints = false
-        box.addSubview(row)
-        NSLayoutConstraint.activate([
-            row.leadingAnchor.constraint(equalTo: box.leadingAnchor, constant: 14),
-            row.trailingAnchor.constraint(equalTo: box.trailingAnchor, constant: -14),
-            row.topAnchor.constraint(equalTo: box.topAnchor, constant: 11),
-            row.bottomAnchor.constraint(equalTo: box.bottomAnchor, constant: -11),
-        ])
-        return box
+
+        let icon = panelSymbol(running ? "waveform.circle.fill" : "waveform.circle",
+                               color: presentation.color,
+                               description: t("Состояние службы", "Service status"),
+                               pointSize: 25)
+        let text = NSStackView()
+        text.orientation = .vertical
+        text.alignment = .leading
+        text.spacing = 2
+        text.addArrangedSubview(panelLabel(presentation.status, size: 14, weight: .semibold))
+        let detail = panelLabel(
+            "\(presentation.detail)\n\(t("Хоткей", "Shortcut")): \(localizedHotkeyName(settings.configuredHotkey, language: language))",
+            size: 11.5,
+            color: .secondaryLabelColor
+        )
+        detail.maximumNumberOfLines = 2
+        detail.lineBreakMode = .byTruncatingTail
+        detail.toolTip = "\(presentation.detail)\n\(triggerModeText())"
+        text.addArrangedSubview(detail)
+
+        let actions = NSStackView()
+        actions.orientation = .horizontal
+        actions.alignment = .centerY
+        actions.spacing = 5
+        let enabled = serviceOperation == nil
+        if running {
+            actions.addArrangedSubview(compactIconButton(
+                symbol: "arrow.clockwise",
+                accessibilityTitle: t("Перезапустить службу", "Restart Service"),
+                toolTip: t("Перезапустить фоновую службу, не закрывая панель",
+                           "Restart the background service without closing the panel"),
+                action: #selector(restartAgentClicked(_:)),
+                enabled: enabled
+            ))
+            actions.addArrangedSubview(compactIconButton(
+                symbol: "stop.fill",
+                accessibilityTitle: t("Остановить службу", "Stop Service"),
+                toolTip: t("Остановить диктовку до следующего ручного запуска",
+                           "Stop dictation until it is started manually"),
+                action: #selector(stopAgentClicked(_:)),
+                enabled: enabled
+            ))
+        } else {
+            actions.addArrangedSubview(compactIconButton(
+                symbol: "play.fill",
+                accessibilityTitle: t("Запустить службу", "Start Service"),
+                toolTip: t("Запустить фоновую службу диктовки",
+                           "Start the background dictation service"),
+                action: #selector(startAgentClicked(_:)),
+                enabled: enabled
+            ))
+        }
+
+        row.addArrangedSubview(icon)
+        row.addArrangedSubview(text)
+        row.addArrangedSubview(NSView())
+        row.addArrangedSubview(actions)
+        pin(row, inside: card, horizontal: 14, vertical: 11)
+        card.toolTip = presentation.detail
+        return card
+    }
+
+    private func compactPermissionsCard() -> NSView {
+        let missing = Permission.allCases.filter { !Permissions.isGranted($0) }
+        let card = compactCard()
+        let content = NSStackView()
+        content.orientation = .vertical
+        content.alignment = .leading
+        content.spacing = 7
+        content.translatesAutoresizingMaskIntoConstraints = false
+
+        let header = NSStackView()
+        header.orientation = .horizontal
+        header.alignment = .centerY
+        header.spacing = 8
+        let color: NSColor = missing.isEmpty ? .systemGreen : .systemOrange
+        header.addArrangedSubview(panelSymbol(missing.isEmpty ? "checkmark.shield.fill" : "exclamationmark.shield.fill",
+                                              color: color,
+                                              description: t("Разрешения macOS", "macOS permissions"),
+                                              pointSize: 15))
+        header.addArrangedSubview(panelLabel(t("Разрешения macOS", "macOS permissions"),
+                                             size: 12.5,
+                                             weight: .semibold))
+        header.addArrangedSubview(NSView())
+        header.addArrangedSubview(panelLabel(
+            missing.isEmpty ? t("Все выданы", "All granted")
+                            : t("Нужно: \(missing.count)", "Missing: \(missing.count)"),
+            size: 11.5,
+            weight: .medium,
+            color: color
+        ))
+        content.addArrangedSubview(header)
+
+        if missing.isEmpty {
+            let ready = panelLabel(
+                t("Микрофон, вставка текста и глобальный хоткей доступны.",
+                  "Microphone, text insertion, and the global shortcut are available."),
+                size: 11,
+                color: .secondaryLabelColor
+            )
+            ready.toolTip = t("SuperDictate получил все три необходимых разрешения macOS.",
+                              "SuperDictate has all three required macOS permissions.")
+            content.addArrangedSubview(ready)
+        } else {
+            for permission in missing {
+                content.addArrangedSubview(compactPermissionRow(permission))
+            }
+        }
+        pin(content, inside: card, horizontal: 13, vertical: 10)
+        return card
+    }
+
+    private func compactPermissionRow(_ permission: Permission) -> NSView {
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 8
+        let title = panelLabel(permissionTitle(permission), size: 11.5, weight: .medium)
+        title.toolTip = permissionDetail(permission)
+        let buttonTitle = (permissionClickCount[permission] ?? 0) >= 1
+            ? t("Повторить", "Try Again") : t("Разрешить", "Grant")
+        let button = panelButton(buttonTitle,
+                                 action: #selector(grantPermissionClicked(_:)),
+                                 enabled: serviceOperation == nil,
+                                 toolTip: t("Открыть системное разрешение: \(permissionTitle(permission))",
+                                            "Open the system permission: \(permissionTitle(permission))"))
+        button.controlSize = .small
+        button.tag = Permission.allCases.firstIndex(of: permission) ?? -1
+        row.addArrangedSubview(title)
+        row.addArrangedSubview(NSView())
+        row.addArrangedSubview(button)
+        return row
+    }
+
+    private func compactUpdateCard() -> NSView {
+        let card = compactCard()
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 11
+        row.translatesAutoresizingMaskIntoConstraints = false
+
+        let presentation = compactUpdatePresentation()
+        row.addArrangedSubview(panelSymbol(presentation.symbol,
+                                           color: presentation.color,
+                                           description: t("Обновления", "Updates"),
+                                           pointSize: 17))
+        let text = NSStackView()
+        text.orientation = .vertical
+        text.alignment = .leading
+        text.spacing = 1
+        text.addArrangedSubview(panelLabel(presentation.title, size: 12.5, weight: .semibold))
+        let detail = panelLabel(presentation.detail, size: 11, color: .secondaryLabelColor)
+        detail.maximumNumberOfLines = 1
+        detail.lineBreakMode = .byTruncatingTail
+        detail.toolTip = presentation.detail
+        text.addArrangedSubview(detail)
+        row.addArrangedSubview(text)
+        row.addArrangedSubview(NSView())
+        if let buttonTitle = presentation.buttonTitle,
+           let action = presentation.action {
+            let button = panelButton(buttonTitle,
+                                     action: action,
+                                     enabled: presentation.buttonEnabled,
+                                     toolTip: presentation.buttonToolTip)
+            button.controlSize = .small
+            row.addArrangedSubview(button)
+        }
+        pin(row, inside: card, horizontal: 13, vertical: 9)
+        return card
+    }
+
+    private func compactUpdatePresentation() -> (symbol: String,
+                                                   color: NSColor,
+                                                   title: String,
+                                                   detail: String,
+                                                   buttonTitle: String?,
+                                                   action: Selector?,
+                                                   buttonEnabled: Bool,
+                                                   buttonToolTip: String?) {
+        switch updateState {
+        case .checking:
+            return ("arrow.triangle.2.circlepath", .systemBlue,
+                    t("Проверяю обновления", "Checking for updates"),
+                    t("Установлена v\(currentBundleVersion())", "Installed v\(currentBundleVersion())"),
+                    nil, nil, false, nil)
+        case .upToDate:
+            return ("checkmark.circle.fill", .systemGreen,
+                    t("SuperDictate актуален", "SuperDictate is up to date"),
+                    t("Установлена последняя версия v\(currentBundleVersion())",
+                      "Latest version v\(currentBundleVersion()) is installed"),
+                    t("Проверить", "Check"), #selector(updateButtonClicked(_:)), true,
+                    t("Проверить GitHub Releases ещё раз", "Check GitHub Releases again"))
+        case .available(let release):
+            return ("arrow.down.circle.fill", .systemBlue,
+                    t("Доступна версия v\(release.version)", "Version v\(release.version) is available"),
+                    t("Скачается, проверится и установится автоматически",
+                      "Downloads, verifies, and installs automatically"),
+                    t("Обновить", "Update"), #selector(updateButtonClicked(_:)), serviceOperation == nil,
+                    t("Обновить SuperDictate до v\(release.version) одной кнопкой",
+                      "Update SuperDictate to v\(release.version) with one click"))
+        case .preparing(let version, let phase):
+            return ("arrow.down.circle", .systemBlue,
+                    t("Обновляю до v\(version)", "Updating to v\(version)"),
+                    phase, nil, nil, false, nil)
+        case .failed(let message):
+            return ("exclamationmark.triangle.fill", .systemRed,
+                    t("Обновление не проверено", "Update check failed"),
+                    message,
+                    t("Повторить", "Retry"), #selector(updateButtonClicked(_:)), true,
+                    t("Повторить проверку обновлений", "Retry the update check"))
+        }
+    }
+
+    private func compactPrivacyFooter() -> NSView {
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 7
+        row.addArrangedSubview(panelSymbol("lock.fill",
+                                           color: .tertiaryLabelColor,
+                                           description: nil,
+                                           pointSize: 10))
+        let label = panelLabel(
+            t("Аудио и распознавание остаются на этом Mac.",
+              "Audio and transcription stay on this Mac."),
+            size: 10.5,
+            color: .tertiaryLabelColor
+        )
+        label.toolTip = t("Интернет используется только для первой загрузки модели и обновлений.",
+                          "Internet is only used for the first model download and updates.")
+        row.addArrangedSubview(label)
+        row.addArrangedSubview(NSView())
+        return row
     }
 
     private func operationTitle(_ operation: ControlPanelServiceOperation) -> String {
@@ -19653,108 +19845,6 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                 t("Хоткей не работает, пока служба не запущена.",
                   "The shortcut is unavailable until the service starts."),
                 settings.agentEnabled ? .systemRed : .secondaryLabelColor)
-    }
-
-    private func serviceStatusView() -> NSView {
-        let running = SuperDictateAgentService.isAgentRunning()
-        let state = AgentRuntimeStateStore.read()
-        let presentation = servicePresentation(running: running, state: state)
-        let metadata = serviceMetadata(running: running, state: state)
-        return statusRow(title: t("Служба диктовки", "Dictation service"),
-                         detail: "\(presentation.detail)\n\(metadata)",
-                         status: presentation.status,
-                         statusColor: presentation.color)
-    }
-
-    private func serviceMetadata(running: Bool, state: AgentRuntimeState?) -> String {
-        var parts = ["SuperDictate v\(currentBundleVersion())"]
-        if running, let state, state.pid > 0 { parts.append("PID \(state.pid)") }
-        if let state, state.updatedAt > 0 {
-            let formatter = DateFormatter()
-            formatter.timeStyle = .medium
-            formatter.dateStyle = .none
-            parts.append("\(t("обновлено", "updated")) \(formatter.string(from: Date(timeIntervalSince1970: state.updatedAt)))")
-        }
-        return parts.joined(separator: "  ·  ")
-    }
-
-    private func serviceButtonsView() -> NSView {
-        let running = SuperDictateAgentService.isAgentRunning()
-        let enabled = serviceOperation == nil
-        let row = NSStackView()
-        row.orientation = .horizontal
-        row.alignment = .centerY
-        row.spacing = 8
-        row.addArrangedSubview(panelButton(t("Запустить", "Start"),
-                                           symbol: "play.fill",
-                                           action: #selector(startAgentClicked(_:)),
-                                           enabled: enabled && !running))
-        row.addArrangedSubview(panelButton(t("Перезапустить", "Restart"),
-                                           symbol: "arrow.clockwise",
-                                           action: #selector(restartAgentClicked(_:)),
-                                           enabled: enabled && running))
-        row.addArrangedSubview(panelButton(t("Остановить", "Stop"),
-                                           symbol: "stop.fill",
-                                           action: #selector(stopAgentClicked(_:)),
-                                           enabled: enabled && running))
-        row.addArrangedSubview(NSView())
-        row.addArrangedSubview(panelButton(t("Закрыть панель", "Close Panel"),
-                                           symbol: "xmark",
-                                           action: #selector(closePanelClicked(_:))))
-        return row
-    }
-
-    private func updateStatusView() -> NSView {
-        let currentVersion = currentBundleVersion()
-        switch updateState {
-        case .checking:
-            return statusRow(
-                title: t("Версия SuperDictate", "SuperDictate version"),
-                detail: t("Проверяю GitHub Releases в фоне. Диктовка продолжает работать.",
-                          "Checking GitHub Releases in the background. Dictation keeps working."),
-                status: t("Проверка…", "Checking…"),
-                statusColor: .systemBlue
-            )
-        case .upToDate:
-            return statusRow(
-                title: t("Версия SuperDictate", "SuperDictate version"),
-                detail: t("Установлена v\(currentVersion). Это последняя доступная версия.",
-                          "Version \(currentVersion) is installed. This is the latest release."),
-                status: t("Актуально", "Up to date"),
-                statusColor: .systemGreen,
-                buttonTitle: t("Проверить", "Check"),
-                action: #selector(updateButtonClicked(_:))
-            )
-        case .available(let release):
-            return statusRow(
-                title: t("Доступна SuperDictate v\(release.version)",
-                         "SuperDictate v\(release.version) is available"),
-                detail: t("Сейчас установлена v\(currentVersion). Обновление скачивается, проверяется и устанавливается автоматически.",
-                          "Version \(currentVersion) is installed. The update is downloaded, verified, and installed automatically."),
-                status: t("Есть обновление", "Update available"),
-                statusColor: .systemBlue,
-                buttonTitle: t("Обновить до v\(release.version)", "Update to v\(release.version)"),
-                action: #selector(updateButtonClicked(_:)),
-                buttonEnabled: serviceOperation == nil
-            )
-        case .preparing(let version, let phase):
-            return statusRow(
-                title: t("Обновление до v\(version)", "Updating to v\(version)"),
-                detail: phase,
-                status: t("В процессе", "In progress"),
-                statusColor: .systemBlue
-            )
-        case .failed(let message):
-            return statusRow(
-                title: t("Не удалось проверить или установить обновление",
-                         "Update check or installation failed"),
-                detail: message,
-                status: t("Ошибка", "Failed"),
-                statusColor: .systemRed,
-                buttonTitle: t("Повторить", "Try Again"),
-                action: #selector(updateButtonClicked(_:))
-            )
-        }
     }
 
     private func checkForUpdates() {
@@ -19938,19 +20028,6 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         }
     }
 
-    private func permissionRow(_ permission: Permission) -> NSView {
-        let granted = Permissions.isGranted(permission)
-        let buttonTitle = granted ? nil : ((permissionClickCount[permission] ?? 0) >= 1
-            ? t("Повторить", "Try Again") : t("Разрешить", "Grant"))
-        return statusRow(title: permissionTitle(permission),
-                         detail: permissionDetail(permission),
-                         status: granted ? t("Разрешено", "Granted") : t("Нет доступа", "Missing"),
-                         statusColor: granted ? .systemGreen : .systemOrange,
-                         buttonTitle: buttonTitle,
-                         action: granted ? nil : #selector(grantPermissionClicked(_:)),
-                         tag: Permission.allCases.firstIndex(of: permission) ?? -1)
-    }
-
     private func statusRow(title: String,
                            detail: String,
                            status: String,
@@ -19958,7 +20035,8 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                            buttonTitle: String? = nil,
                            action: Selector? = nil,
                            tag: Int = 0,
-                           buttonEnabled: Bool = true) -> NSView {
+                           buttonEnabled: Bool = true,
+                           toolTip: String? = nil) -> NSView {
         let row = NSStackView()
         row.orientation = .horizontal
         row.alignment = .centerY
@@ -19981,7 +20059,10 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         row.addArrangedSubview(NSView())
         row.addArrangedSubview(statusLabel)
         if let buttonTitle, let action {
-            let button = panelButton(buttonTitle, action: action, enabled: buttonEnabled)
+            let button = panelButton(buttonTitle,
+                                     action: action,
+                                     enabled: buttonEnabled,
+                                     toolTip: toolTip)
             button.tag = tag
             row.addArrangedSubview(button)
         }
@@ -19991,7 +20072,8 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
     private func checkboxRow(title: String,
                              detail: String,
                              isOn: Bool,
-                             action: Selector) -> NSView {
+                             action: Selector,
+                             toolTip: String? = nil) -> NSView {
         let row = NSStackView()
         row.orientation = .horizontal
         row.alignment = .centerY
@@ -19999,6 +20081,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
 
         let checkbox = NSButton(checkboxWithTitle: "", target: self, action: action)
         checkbox.state = isOn ? .on : .off
+        checkbox.toolTip = toolTip
         checkbox.setContentHuggingPriority(.required, for: .horizontal)
 
         let text = NSStackView()
@@ -20006,7 +20089,9 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         text.alignment = .leading
         text.spacing = 3
         text.addArrangedSubview(panelLabel(title, size: 13, weight: .semibold))
-        text.addArrangedSubview(panelLabel(detail, size: 12, color: .secondaryLabelColor))
+        let detailLabel = panelLabel(detail, size: 12, color: .secondaryLabelColor)
+        detailLabel.toolTip = toolTip
+        text.addArrangedSubview(detailLabel)
         row.addArrangedSubview(checkbox)
         row.addArrangedSubview(text)
         return row
@@ -20016,7 +20101,8 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                           detail: String,
                           selectedValue: String,
                           options: [(title: String, value: String)],
-                          action: Selector) -> NSView {
+                          action: Selector,
+                          toolTip: String? = nil) -> NSView {
         let row = NSStackView()
         row.orientation = .horizontal
         row.alignment = .centerY
@@ -20032,6 +20118,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         let popup = NSPopUpButton()
         popup.target = self
         popup.action = action
+        popup.toolTip = toolTip
         for option in options {
             popup.addItem(withTitle: option.title)
             popup.lastItem?.representedObject = option.value
@@ -20064,10 +20151,6 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         return row
     }
 
-    private func sectionLabel(_ text: String) -> NSTextField {
-        panelLabel(text, size: 14, weight: .semibold)
-    }
-
     private func panelLabel(_ text: String,
                             size: CGFloat,
                             weight: NSFont.Weight = .regular,
@@ -20081,19 +20164,75 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
     }
 
     private func panelButton(_ title: String,
-                             symbol: String? = nil,
                              action: Selector,
-                             enabled: Bool = true) -> NSButton {
+                             enabled: Bool = true,
+                             toolTip: String? = nil) -> NSButton {
         let button = NSButton(title: title, target: self, action: action)
         button.bezelStyle = .rounded
         button.controlSize = .regular
         button.isEnabled = enabled
-        if let symbol, let image = NSImage(systemSymbolName: symbol, accessibilityDescription: title) {
-            button.image = image
-            button.imagePosition = .imageLeading
-        }
+        button.toolTip = toolTip
         button.setContentHuggingPriority(.required, for: .horizontal)
         return button
+    }
+
+    private func compactIconButton(symbol: String,
+                                   accessibilityTitle: String,
+                                   toolTip: String,
+                                   action: Selector,
+                                   enabled: Bool = true) -> NSButton {
+        let button = NSButton(image: NSImage(systemSymbolName: symbol,
+                                             accessibilityDescription: accessibilityTitle) ?? NSImage(),
+                              target: self,
+                              action: action)
+        button.bezelStyle = .texturedRounded
+        button.controlSize = .small
+        button.isEnabled = enabled
+        button.toolTip = toolTip
+        button.setAccessibilityLabel(accessibilityTitle)
+        button.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            button.widthAnchor.constraint(equalToConstant: 30),
+            button.heightAnchor.constraint(equalToConstant: 26),
+        ])
+        return button
+    }
+
+    private func compactCard() -> NSView {
+        let card = NSView()
+        card.wantsLayer = true
+        card.layer?.cornerRadius = 8
+        card.layer?.backgroundColor = NSColor.controlBackgroundColor.withAlphaComponent(0.70).cgColor
+        card.layer?.borderColor = NSColor.separatorColor.withAlphaComponent(0.42).cgColor
+        card.layer?.borderWidth = 1
+        card.setContentHuggingPriority(.required, for: .vertical)
+        card.setContentCompressionResistancePriority(.required, for: .vertical)
+        return card
+    }
+
+    private func panelSymbol(_ name: String,
+                             color: NSColor,
+                             description: String?,
+                             pointSize: CGFloat) -> NSImageView {
+        let image = NSImage(systemSymbolName: name, accessibilityDescription: description) ?? NSImage()
+        let view = NSImageView(image: image)
+        view.contentTintColor = color
+        view.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: pointSize, weight: .medium)
+        view.setContentHuggingPriority(.required, for: .horizontal)
+        return view
+    }
+
+    private func pin(_ view: NSView,
+                     inside container: NSView,
+                     horizontal: CGFloat,
+                     vertical: CGFloat) {
+        container.addSubview(view)
+        NSLayoutConstraint.activate([
+            view.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: horizontal),
+            view.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -horizontal),
+            view.topAnchor.constraint(equalTo: container.topAnchor, constant: vertical),
+            view.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -vertical),
+        ])
     }
 
     private func separator() -> NSBox {
@@ -20126,8 +20265,8 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
     private func localizedServiceDetail(_ state: AgentRuntimeState) -> String {
         switch state.status {
         case "ready":
-            return t("Готово. Хоткей: \(localizedHotkeyName(settings.configuredHotkey, language: language)).",
-                     "Ready. Shortcut: \(settings.configuredHotkey.name).")
+            return t("Фоновая служба готова к диктовке.",
+                     "The background service is ready for dictation.")
         case "recording": return t("Микрофон записывает текущую диктовку.", "The microphone is recording dictation.")
         case "transcribing": return t("Локальная модель преобразует речь в текст.", "The local model is converting speech to text.")
         case "starting": return t("Загружаю модель и подключаю глобальный хоткей.", "Loading the model and enabling the global shortcut.")
@@ -20284,8 +20423,43 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         beginServiceOperation(.stopping)
     }
 
-    @objc private func closePanelClicked(_ sender: NSButton) {
-        NSApp.terminate(nil)
+    @objc private func openSettingsClicked(_ sender: NSButton) {
+        if let settingsWindow {
+            settingsWindow.contentView = makeSettingsContentView()
+            settingsWindow.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            return
+        }
+
+        let settingsWindow = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 560, height: 405),
+            styleMask: [.titled, .closable, .miniaturizable],
+            backing: .buffered,
+            defer: false
+        )
+        settingsWindow.title = t("Настройки SuperDictate", "SuperDictate Settings")
+        settingsWindow.contentMinSize = NSSize(width: 560, height: 405)
+        settingsWindow.contentMaxSize = NSSize(width: 560, height: 405)
+        settingsWindow.isReleasedWhenClosed = false
+        settingsWindow.delegate = self
+        settingsWindow.contentView = makeSettingsContentView()
+        if let mainWindow = window, let visibleFrame = mainWindow.screen?.visibleFrame {
+            let mainFrame = mainWindow.frame
+            let preferredRight = mainFrame.maxX + 14
+            let preferredLeft = mainFrame.minX - settingsWindow.frame.width - 14
+            let x = preferredRight + settingsWindow.frame.width <= visibleFrame.maxX
+                ? preferredRight
+                : max(visibleFrame.minX, preferredLeft)
+            let y = min(max(visibleFrame.minY,
+                            mainFrame.maxY - settingsWindow.frame.height),
+                        visibleFrame.maxY - settingsWindow.frame.height)
+            settingsWindow.setFrameOrigin(NSPoint(x: x, y: y))
+        } else {
+            settingsWindow.center()
+        }
+        self.settingsWindow = settingsWindow
+        settingsWindow.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
     }
 
     @objc private func recordDictationShortcutClicked(_ sender: NSButton) {
