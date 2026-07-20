@@ -3538,7 +3538,7 @@ private func hotkeyRecordingDecision(for event: HotkeyEventSnapshot) -> HotkeyRe
 
 private enum HotkeyRecorderCaptureResult: Equatable {
     case waitingForChord(HotkeyChoice)
-    case complete(HotkeyChoice)
+    case candidate(HotkeyChoice)
     case reject(String)
     case cancel
     case ignore
@@ -3558,7 +3558,7 @@ private struct HotkeyRecorderCaptureState {
            let pendingModifier,
            pendingModifier.keycode == event.keycode {
             self.pendingModifier = nil
-            return .complete(pendingModifier)
+            return .candidate(pendingModifier)
         }
 
         switch hotkeyRecordingDecision(for: event) {
@@ -3567,7 +3567,7 @@ private struct HotkeyRecorderCaptureState {
             return .waitingForChord(choice)
         case .accept(let choice):
             pendingModifier = nil
-            return .complete(choice)
+            return .candidate(choice)
         case .reject(let message):
             return .reject(message)
         case .ignore:
@@ -3577,27 +3577,117 @@ private struct HotkeyRecorderCaptureState {
 }
 
 @MainActor
-private func presentHotkeyRecorder(language: InterfaceLanguage) -> HotkeyChoice? {
-    let alert = NSAlert()
-    alert.messageText = localizedText("Новое сочетание для диктовки",
-                                      "Record Dictation Shortcut",
-                                      language: language)
-    alert.informativeText = localizedText(
-        "Нажмите одну клавишу или сочетание. Оно сохранится сразу; Escape отменяет запись.",
-        "Press one keyboard key or a shortcut. It saves immediately; press Escape to cancel.",
-        language: language
-    )
-    alert.addButton(withTitle: localizedText("Отмена", "Cancel", language: language))
+private final class HotkeyRecorderWindowDelegate: NSObject, NSWindowDelegate {
+    private(set) var didSave = false
 
-    let status = NSTextField(labelWithString: localizedText("Жду клавишу или сочетание…",
-                                                            "Waiting for a key or shortcut…",
-                                                            language: language))
-    status.font = .systemFont(ofSize: 13, weight: .medium)
-    status.textColor = .secondaryLabelColor
-    status.lineBreakMode = .byWordWrapping
-    status.maximumNumberOfLines = 0
-    status.frame = NSRect(x: 0, y: 0, width: 400, height: 48)
-    alert.accessoryView = status
+    @objc func save(_ sender: NSButton) {
+        didSave = true
+        NSApp.abortModal()
+    }
+
+    @objc func cancel(_ sender: Any?) {
+        didSave = false
+        NSApp.abortModal()
+    }
+
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        cancel(nil)
+        return false
+    }
+}
+
+@MainActor
+private func presentHotkeyRecorder(language: InterfaceLanguage) -> HotkeyChoice? {
+    let panel = NSPanel(
+        contentRect: NSRect(x: 0, y: 0, width: 520, height: 230),
+        styleMask: [.titled, .closable],
+        backing: .buffered,
+        defer: false
+    )
+    panel.title = "SuperDictate"
+    panel.isReleasedWhenClosed = false
+    panel.level = .floating
+    panel.center()
+
+    let actionTarget = HotkeyRecorderWindowDelegate()
+    panel.delegate = actionTarget
+
+    let title = NSTextField(labelWithString: localizedText(
+        "Новое сочетание для диктовки",
+        "Record Dictation Shortcut",
+        language: language
+    ))
+    title.font = .systemFont(ofSize: 19, weight: .semibold)
+
+    let instruction = NSTextField(wrappingLabelWithString: localizedText(
+        "Нажмите клавишу или удерживайте модификаторы и нажмите основную клавишу. Ничего не применится, пока вы не нажмёте «Сохранить».",
+        "Press a key, or hold modifiers and press the main key. Nothing changes until you click Save.",
+        language: language
+    ))
+    instruction.font = .systemFont(ofSize: 13)
+    instruction.textColor = .secondaryLabelColor
+
+    let status = NSTextField(labelWithString: localizedText(
+        "Ничего не выбрано",
+        "Nothing selected",
+        language: language
+    ))
+    status.font = .monospacedSystemFont(ofSize: 14, weight: .semibold)
+    status.textColor = .labelColor
+    status.lineBreakMode = .byTruncatingMiddle
+
+    let statusContainer = NSBox()
+    statusContainer.boxType = .custom
+    statusContainer.cornerRadius = 7
+    statusContainer.borderWidth = 1
+    statusContainer.borderColor = .separatorColor
+    statusContainer.fillColor = .controlBackgroundColor
+    statusContainer.contentViewMargins = NSSize(width: 14, height: 10)
+    statusContainer.contentView = status
+    statusContainer.heightAnchor.constraint(equalToConstant: 42).isActive = true
+
+    let saveButton = NSButton(
+        title: localizedText("Сохранить", "Save", language: language),
+        target: actionTarget,
+        action: #selector(HotkeyRecorderWindowDelegate.save(_:))
+    )
+    saveButton.bezelStyle = .rounded
+    saveButton.isEnabled = false
+    saveButton.keyEquivalent = ""
+
+    let cancelButton = NSButton(
+        title: localizedText("Отмена", "Cancel", language: language),
+        target: actionTarget,
+        action: #selector(HotkeyRecorderWindowDelegate.cancel(_:))
+    )
+    cancelButton.bezelStyle = .rounded
+    cancelButton.keyEquivalent = ""
+
+    let buttonSpacer = NSView()
+    buttonSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+    let buttonRow = NSStackView(views: [buttonSpacer, cancelButton, saveButton])
+    buttonRow.orientation = .horizontal
+    buttonRow.alignment = .centerY
+    buttonRow.spacing = 10
+
+    let stack = NSStackView(views: [title, instruction, statusContainer, buttonRow])
+    stack.orientation = .vertical
+    stack.alignment = .leading
+    stack.spacing = 14
+    stack.translatesAutoresizingMaskIntoConstraints = false
+    instruction.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+    statusContainer.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+    buttonRow.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+
+    let contentView = NSView()
+    contentView.addSubview(stack)
+    NSLayoutConstraint.activate([
+        stack.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 22),
+        stack.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 24),
+        stack.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -24),
+        stack.bottomAnchor.constraint(lessThanOrEqualTo: contentView.bottomAnchor, constant: -18)
+    ])
+    panel.contentView = contentView
 
     var selected: HotkeyChoice?
     var captureState = HotkeyRecorderCaptureState()
@@ -3612,23 +3702,37 @@ private func presentHotkeyRecorder(language: InterfaceLanguage) -> HotkeyChoice?
         )
         switch captureState.consume(snapshot) {
         case .waitingForChord(let choice):
+            selected = nil
+            saveButton.isEnabled = false
             let name = localizedHotkeyName(choice, language: language)
             status.stringValue = localizedText(
-                "Отпустите, чтобы выбрать «\(name)», или нажмите ещё одну клавишу.",
-                "Release to use \(name), or press another key to record a shortcut.",
+                "Удерживайте \(name) и нажмите ещё одну клавишу или отпустите для выбора одной кнопки",
+                "Hold \(name) and press another key, or release it to select that key alone",
                 language: language
             )
             return nil
-        case .complete(let choice):
+        case .candidate(let choice):
             selected = choice
-            NSApp.stopModal(withCode: .alertFirstButtonReturn)
+            saveButton.isEnabled = true
+            let name = localizedHotkeyName(choice, language: language)
+            status.stringValue = localizedText(
+                "Выбрано: \(name)",
+                "Selected: \(name)",
+                language: language
+            )
             return nil
         case .reject(let message):
-            status.stringValue = message
+            selected = nil
+            saveButton.isEnabled = false
+            status.stringValue = localizedText(
+                "Эту клавишу нельзя использовать. Выберите другую.",
+                message,
+                language: language
+            )
             NSSound.beep()
             return nil
         case .cancel:
-            NSApp.stopModal(withCode: .alertSecondButtonReturn)
+            actionTarget.cancel(nil)
             return nil
         case .ignore:
             return nil
@@ -3638,10 +3742,13 @@ private func presentHotkeyRecorder(language: InterfaceLanguage) -> HotkeyChoice?
         if let monitor {
             NSEvent.removeMonitor(monitor)
         }
+        panel.orderOut(nil)
     }
 
-    guard alert.runModal() == .alertFirstButtonReturn else { return nil }
-    return selected
+    panel.makeKeyAndOrderFront(nil)
+    NSApp.activate(ignoringOtherApps: true)
+    _ = NSApp.runModal(for: panel)
+    return actionTarget.didSave ? selected : nil
 }
 
 private enum HotkeyTransitionAction: Equatable, Sendable {
@@ -15266,8 +15373,8 @@ private enum ParakeySelfTest {
         )
         try expect(
             singleModifier.consume(event(.flagsChanged, keycode: 58)),
-            equals: .complete(leftOption),
-            "releasing a lone modifier should save it immediately"
+            equals: .candidate(leftOption),
+            "releasing a lone modifier should select it for confirmation"
         )
 
         var chord = HotkeyRecorderCaptureState()
@@ -15276,9 +15383,16 @@ private enum ParakeySelfTest {
             chord.consume(event(.keyDown,
                                 keycode: 40,
                                 flags: CGEventFlags.maskAlternate.rawValue)),
-            equals: .complete(hotkeyChoice(forKeycode: 40,
-                                           modifiers: .maskAlternate)),
-            "pressing a regular key while a modifier is held should save the full chord"
+            equals: .candidate(hotkeyChoice(forKeycode: 40,
+                                            modifiers: .maskAlternate)),
+            "pressing a regular key while a modifier is held should select the full chord"
+        )
+
+        var singleKey = HotkeyRecorderCaptureState()
+        try expect(
+            singleKey.consume(event(.keyDown, keycode: 96)),
+            equals: .candidate(hotkeyChoice(forKeycode: 96)),
+            "pressing one regular key should select it for confirmation"
         )
 
         var canceled = HotkeyRecorderCaptureState()
