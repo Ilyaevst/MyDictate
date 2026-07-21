@@ -3,15 +3,15 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-OUTPUT_APP="${1:-$ROOT_DIR/dist/SuperDictate.app}"
+OUTPUT_APP="${1:-$ROOT_DIR/dist/MyDictate.app}"
 SIGN_IDENTITY="${SIGN_IDENTITY:--}"
 
 say() {
-    printf 'SuperDictate: %s\n' "$*"
+    printf 'MyDictate: %s\n' "$*"
 }
 
 fail() {
-    printf 'SuperDictate: %s\n' "$*" >&2
+    printf 'MyDictate: %s\n' "$*" >&2
     exit 1
 }
 
@@ -19,6 +19,8 @@ fail() {
 [[ "$(uname -m)" == "arm64" ]] || fail "An Apple Silicon Mac (M1 or newer) is required."
 command -v swift >/dev/null 2>&1 || fail "Swift is missing. Run: xcode-select --install"
 command -v codesign >/dev/null 2>&1 || fail "codesign is missing. Run: xcode-select --install"
+
+"$ROOT_DIR/scripts/prepare-whisper.sh"
 
 say "Building the release app..."
 swift build -c release --package-path "$ROOT_DIR/swift"
@@ -28,15 +30,17 @@ BIN="$BIN_DIR/Parakey"
 
 STAGE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/superdictate-build.XXXXXX")"
 trap 'rm -rf "$STAGE_DIR"' EXIT
-STAGE_APP="$STAGE_DIR/SuperDictate.app"
+STAGE_APP="$STAGE_DIR/MyDictate.app"
 
-mkdir -p "$STAGE_APP/Contents/MacOS" "$STAGE_APP/Contents/Resources"
-cp "$BIN" "$STAGE_APP/Contents/MacOS/SuperDictate"
+mkdir -p "$STAGE_APP/Contents/MacOS" "$STAGE_APP/Contents/Resources" "$STAGE_APP/Contents/Frameworks"
+cp "$BIN" "$STAGE_APP/Contents/MacOS/MyDictate"
+cp -R "$ROOT_DIR/vendor/whisper/build-apple/whisper.xcframework/macos-arm64_x86_64/whisper.framework" \
+    "$STAGE_APP/Contents/Frameworks/"
 cp "$ROOT_DIR/swift/Info.plist" "$STAGE_APP/Contents/Info.plist"
 cp "$ROOT_DIR/swift/Resources/parakey-menubar.png" "$STAGE_APP/Contents/Resources/"
 cp "$ROOT_DIR/swift/Resources/parakey-menubar@2x.png" "$STAGE_APP/Contents/Resources/"
 cp "$ROOT_DIR/icon/Parakey.icns" "$STAGE_APP/Contents/Resources/Parakey.icns"
-chmod 755 "$STAGE_APP/Contents/MacOS/SuperDictate"
+chmod 755 "$STAGE_APP/Contents/MacOS/MyDictate"
 
 SIGN_ARGS=(--force --deep --sign "$SIGN_IDENTITY" --options runtime
            --entitlements "$ROOT_DIR/entitlements.plist")
@@ -47,6 +51,13 @@ else
 fi
 
 say "Signing the app..."
+FRAMEWORK_SIGN_ARGS=(--force --sign "$SIGN_IDENTITY" --options runtime)
+if [[ "$SIGN_IDENTITY" == "-" ]]; then
+    FRAMEWORK_SIGN_ARGS+=(--timestamp=none)
+else
+    FRAMEWORK_SIGN_ARGS+=(--timestamp)
+fi
+codesign "${FRAMEWORK_SIGN_ARGS[@]}" "$STAGE_APP/Contents/Frameworks/whisper.framework"
 codesign "${SIGN_ARGS[@]}" "$STAGE_APP"
 codesign --verify --deep --strict "$STAGE_APP"
 
@@ -57,4 +68,3 @@ trap - EXIT
 rm -rf "$STAGE_DIR"
 
 say "Built $OUTPUT_APP"
-

@@ -36,6 +36,7 @@ import IOKit
 import QuartzCore
 import ServiceManagement
 import UniformTypeIdentifiers
+import whisper
 
 // MARK: - Constants
 
@@ -54,27 +55,31 @@ let ESCAPE_KEYCODE: CGKeyCode = 53
 let RETURN_KEYCODE: CGKeyCode = 36
 let ENTER_AFTER_INSERT_DELAY_NANOSECONDS: UInt64 = 120_000_000
 let MIN_CLIP_SECONDS: Double = 0.25
+/// MyDictate checks only its own GitHub releases.  It never queries the
+/// upstream SuperDictate project.
+let UPDATE_FEATURE_ENABLED = true
 let UPDATE_CHECK_FIRST_DELAY_SECONDS: TimeInterval = 30
 let UPDATE_CHECK_INTERVAL_SECONDS: TimeInterval = 6 * 3600  // 6h
 let UPDATE_REMIND_LATER_SECONDS: TimeInterval = 24 * 3600  // 24h
-let GITHUB_LATEST_RELEASE_URL = URL(string: "https://api.github.com/repos/shlgd/SuperDictate/releases/latest")!
-let GITHUB_REPOSITORY_PAGE = URL(string: "https://github.com/shlgd/SuperDictate")!
-let GITHUB_RELEASES_PAGE = URL(string: "https://github.com/shlgd/SuperDictate/releases/latest")!
-let GITHUB_UPDATE_MANIFEST_URL = URL(string: "https://raw.githubusercontent.com/shlgd/SuperDictate/main/update.json")!
+let MYDICTATE_GITHUB_REPOSITORY = "Ilyaevst/MyDictate"
+let GITHUB_LATEST_RELEASE_URL = URL(string: "https://api.github.com/repos/\(MYDICTATE_GITHUB_REPOSITORY)/releases/latest")!
+let GITHUB_REPOSITORY_PAGE = URL(string: "https://github.com/\(MYDICTATE_GITHUB_REPOSITORY)")!
+let GITHUB_RELEASES_PAGE = URL(string: "https://github.com/\(MYDICTATE_GITHUB_REPOSITORY)/releases/latest")!
+let GITHUB_UPDATE_MANIFEST_URL = URL(string: "https://raw.githubusercontent.com/\(MYDICTATE_GITHUB_REPOSITORY)/main/update.json")!
 let UPDATE_ARCHIVE_MAX_BYTES = 64 * 1024 * 1024
 let HOMEBREW_CASK_TAP = "shlgd/superdictate"
 let HOMEBREW_CASK_TOKEN = "shlgd/superdictate/superdictate"
 let HOMEBREW_CASK_INSTALLED_TOKEN = "parakey"
-let INSTALLED_APP_BUNDLE_PATH = "/Applications/SuperDictate.app"
+let INSTALLED_APP_BUNDLE_PATH = "/Applications/MyDictate.app"
 let AGENT_ARGUMENT = "--agent"
-let AGENT_LABEL = "com.local.superdictate.agent"
-let APP_SUPPORT_DIR_NAME = "SuperDictate"
+let AGENT_LABEL = "com.local.mydictate.agent"
+let APP_SUPPORT_DIR_NAME = "MyDictate"
 let AGENT_STATUS_FILE_NAME = "AgentStatus.json"
 let CONTROL_PANEL_PID_FILE_NAME = "ControlPanel.pid"
 let UPDATE_HELPER_LOG_PATH = (NSHomeDirectory() as NSString)
-    .appendingPathComponent("Library/Logs/SuperDictate-update.log")
+    .appendingPathComponent("Library/Logs/MyDictate-update.log")
 let UPDATE_PROGRESS_ARGUMENT = "--update-progress"
-let UPDATE_PROGRESS_APP_PREFIX = "SuperDictate-update-progress-"
+let UPDATE_PROGRESS_APP_PREFIX = "MyDictate-update-progress-"
 let MAX_SKIPPED_UPDATE_VERSIONS = 20
 let MAX_CORRECTION_SYNC_PATH_BYTES = 4096
 let MAX_INPUT_DEVICE_PREFERENCE_BYTES = 512
@@ -95,19 +100,20 @@ let RECORDING_HUD_DISPLAY_LINK_MAX_FPS: Float = 120
 let RECORDING_HUD_RECORDING_BASE_PHASE_SPEED: CGFloat = 16.96
 let RECORDING_HUD_RECORDING_LEVEL_PHASE_SPEED: CGFloat = 10.08
 let RECORDING_HUD_TRANSCRIBING_PHASE_SPEED: CGFloat = 10.2
-let HOTKEY_CAPTURE_BEGIN_NOTIFICATION = Notification.Name("com.local.superdictate.hotkey-capture-begin")
-let HOTKEY_CAPTURE_END_NOTIFICATION = Notification.Name("com.local.superdictate.hotkey-capture-end")
+let HOTKEY_CAPTURE_BEGIN_NOTIFICATION = Notification.Name("com.local.mydictate.hotkey-capture-begin")
+let HOTKEY_CAPTURE_END_NOTIFICATION = Notification.Name("com.local.mydictate.hotkey-capture-end")
 let HOTKEY_CAPTURE_FAILSAFE_SECONDS: TimeInterval = 45
 let DICTATION_ERROR_FLASH_SECONDS: TimeInterval = 1.5  // how long the menu-bar icon flags a dropped dictation before returning to idle
 let AUDIO_START_RETRY_DELAYS_SECONDS: [UInt64] = [1, 3, 8]
 let AUDIO_IDLE_STOP_DELAY_SECONDS: TimeInterval = 5
 let AUDIO_CONFIGURATION_CHANGE_SUPPRESSION_SECONDS: TimeInterval = 1
 let MODEL_DOWNLOAD_HEADROOM_BYTES: Int64 = 500 * 1024 * 1024
+let WHISPER_TECHNICAL_PROMPT = "GitHub, Codex, ChatGPT, Claude, MyDictate, Whisper, Swift, SwiftUI, Xcode, macOS, main, Command, Option, Shift, Control, API, JSON, TypeScript, JavaScript, Python, Docker, PostgreSQL."
 
-let SETTINGS_SUITE = "com.local.superdictate"
-let CORRECTIONS_FILE_UTI = "com.local.superdictate.corrections"
-let CORRECTIONS_FILE_EXTENSION = "superdictate-corrections"
-let CORRECTIONS_FILE_NAME = "SuperDictate Corrections.\(CORRECTIONS_FILE_EXTENSION)"
+let SETTINGS_SUITE = "com.local.mydictate"
+let CORRECTIONS_FILE_UTI = "com.local.mydictate.corrections"
+let CORRECTIONS_FILE_EXTENSION = "mydictate-corrections"
+let CORRECTIONS_FILE_NAME = "MyDictate Corrections.\(CORRECTIONS_FILE_EXTENSION)"
 let MAX_TRANSCRIPT_CORRECTIONS = 512
 let MAX_TRANSCRIPT_CORRECTION_SOURCE_BYTES = 512
 let MAX_TRANSCRIPT_CORRECTION_REPLACEMENT_BYTES = 4096
@@ -424,6 +430,12 @@ enum DictationLanguage: String, CaseIterable {
         case .serbian:     return .serbian
         }
     }
+
+    /// whisper.cpp accepts the same short language codes. `auto` asks
+    /// Whisper to detect the language, including mixed Russian/English speech.
+    var whisperLanguageCode: String {
+        self == .auto ? "auto" : rawValue
+    }
 }
 
 let DICTATION_LANGUAGE_DISPLAY: [DictationLanguage: String] = [
@@ -449,15 +461,19 @@ let DICTATION_LANGUAGE_DISPLAY: [DictationLanguage: String] = [
 ]
 
 enum SpeechModelProfile: String, CaseIterable {
+    case whisperLargeV3Turbo = "whisper_large_v3_turbo"
+    case whisperLargeV3TurboQ5 = "whisper_large_v3_turbo_q5"
     case multilingualV3 = "multilingual_v3"
     // Deprecated production option. Kept only so old saved preferences
     // can be read and migrated back to the supported v3 model.
     case englishUnified = "english_unified"
 
-    static let productionDefault: SpeechModelProfile = .multilingualV3
+    static let productionDefault: SpeechModelProfile = .whisperLargeV3Turbo
 
     var isProductionSupported: Bool {
-        self == .multilingualV3
+        self == .whisperLargeV3Turbo
+            || self == .whisperLargeV3TurboQ5
+            || self == .multilingualV3
     }
 
     var productionProfile: SpeechModelProfile {
@@ -466,8 +482,12 @@ enum SpeechModelProfile: String, CaseIterable {
 
     var displayName: String {
         switch self {
+        case .whisperLargeV3Turbo:
+            return "Whisper Turbo Full — best quality"
+        case .whisperLargeV3TurboQ5:
+            return "Whisper Turbo Q5 — smaller and faster"
         case .multilingualV3:
-            return "Multilingual (Parakeet TDT v3)"
+            return "Parakeet TDT v3 — fastest"
         case .englishUnified:
             return "English optimized (Parakeet Unified, deprecated)"
         }
@@ -475,6 +495,10 @@ enum SpeechModelProfile: String, CaseIterable {
 
     var shortName: String {
         switch self {
+        case .whisperLargeV3Turbo:
+            return "Whisper Turbo Full"
+        case .whisperLargeV3TurboQ5:
+            return "Whisper Turbo Q5"
         case .multilingualV3:
             return "Parakeet TDT v3"
         case .englishUnified:
@@ -484,6 +508,10 @@ enum SpeechModelProfile: String, CaseIterable {
 
     var aboutModelText: String {
         switch self {
+        case .whisperLargeV3Turbo:
+            return "whisper.cpp · large-v3-turbo full (Metal · local · 1.62 GB)"
+        case .whisperLargeV3TurboQ5:
+            return "whisper.cpp · large-v3-turbo Q5 (Metal · local · 574 MB)"
         case .multilingualV3:
             return "FluidAudio · Parakeet TDT v3 multilingual (CoreML / ANE)"
         case .englishUnified:
@@ -497,6 +525,8 @@ enum SpeechModelProfile: String, CaseIterable {
 
     var cacheResetDetail: String {
         switch self {
+        case .whisperLargeV3Turbo, .whisperLargeV3TurboQ5:
+            return "MyDictate will delete the selected local Whisper model, unload it, and download a fresh verified copy before dictation is available again."
         case .multilingualV3:
             return "Parakey will delete the local Parakeet TDT v3 model cache, unload the current speech model, and download a fresh verified copy before dictation is available again."
         case .englishUnified:
@@ -505,11 +535,53 @@ enum SpeechModelProfile: String, CaseIterable {
     }
 
     var estimatedDownloadBytes: Int64 {
-        700 * 1024 * 1024
+        switch self {
+        case .whisperLargeV3Turbo:
+            return 1_624_555_275
+        case .whisperLargeV3TurboQ5:
+            return 574_041_195
+        case .multilingualV3, .englishUnified:
+            return 700 * 1024 * 1024
+        }
     }
 
     var downloadSizeText: String {
-        "about 500-700 MB"
+        switch self {
+        case .whisperLargeV3Turbo:
+            return "about 1.6 GB"
+        case .whisperLargeV3TurboQ5:
+            return "about 574 MB"
+        case .multilingualV3, .englishUnified:
+            return "about 500-700 MB"
+        }
+    }
+
+    var whisperModelFileName: String? {
+        switch self {
+        case .whisperLargeV3Turbo:
+            return "ggml-large-v3-turbo.bin"
+        case .whisperLargeV3TurboQ5:
+            return "ggml-large-v3-turbo-q5_0.bin"
+        case .multilingualV3, .englishUnified:
+            return nil
+        }
+    }
+
+    var whisperModelDownloadURL: URL? {
+        whisperModelFileName.flatMap {
+            URL(string: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/\($0)")
+        }
+    }
+
+    var whisperModelSHA256: String? {
+        switch self {
+        case .whisperLargeV3Turbo:
+            return "1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69"
+        case .whisperLargeV3TurboQ5:
+            return "394221709cd5ad1f40c46e6031ca61bce88931e6e088c188294c6d5a55ffa7e2"
+        case .multilingualV3, .englishUnified:
+            return nil
+        }
     }
 }
 
@@ -1671,8 +1743,17 @@ func speechModelCacheBaseDirectory() -> URL {
     MLModelConfigurationUtils.defaultModelsDirectory()
 }
 
-func speechModelCacheDirectory(for _: SpeechModelProfile) -> URL {
-    AsrModels.defaultCacheDirectory(for: .v3)
+func speechModelCacheDirectory(for profile: SpeechModelProfile) -> URL {
+    switch profile.productionProfile {
+    case .whisperLargeV3Turbo:
+        return speechModelCacheBaseDirectory()
+            .appendingPathComponent("whisper-large-v3-turbo", isDirectory: true)
+    case .whisperLargeV3TurboQ5:
+        return speechModelCacheBaseDirectory()
+            .appendingPathComponent("whisper-large-v3-turbo-q5", isDirectory: true)
+    case .multilingualV3, .englishUnified:
+        return AsrModels.defaultCacheDirectory(for: .v3)
+    }
 }
 
 func speechModelDownloadRequiredBytes(for profile: SpeechModelProfile,
@@ -1710,7 +1791,13 @@ func availableImportantDiskSpaceBytes(containing url: URL) -> Int64? {
 }
 
 func speechModelCacheExists(for profile: SpeechModelProfile) -> Bool {
-    FileManager.default.fileExists(atPath: speechModelCacheDirectory(for: profile).path)
+    let cacheDirectory = speechModelCacheDirectory(for: profile)
+    if let fileName = profile.productionProfile.whisperModelFileName {
+        return FileManager.default.fileExists(
+            atPath: cacheDirectory.appendingPathComponent(fileName).path
+        )
+    }
+    return FileManager.default.fileExists(atPath: cacheDirectory.path)
 }
 
 func assertSufficientDiskSpaceForSpeechModelDownload(profile: SpeechModelProfile) throws {
@@ -2111,7 +2198,7 @@ func audioInputDevice(matching preference: String,
 // MARK: - Logger
 //
 // All output goes to stderr (line-buffered, so we don't lose lines
-// across an abrupt exit) and to ~/Library/Logs/SuperDictate.log.
+// across an abrupt exit) and to ~/Library/Logs/MyDictate.log.
 
 final class Logger: @unchecked Sendable {
     static let shared = Logger()
@@ -2123,7 +2210,7 @@ final class Logger: @unchecked Sendable {
     init() {
         let logs = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("Logs", isDirectory: true)
-        url = logs.appendingPathComponent("SuperDictate.log")
+        url = logs.appendingPathComponent("MyDictate.log")
     }
 
     func log(_ msg: String) {
@@ -2270,7 +2357,7 @@ enum SuperDictateAgentService {
 
     static func agentExecutablePath() -> String {
         Bundle.main.executablePath ??
-        "\(INSTALLED_APP_BUNDLE_PATH)/Contents/MacOS/SuperDictate"
+        "\(INSTALLED_APP_BUNDLE_PATH)/Contents/MacOS/MyDictate"
     }
 
     static func installAndStart() throws {
@@ -2325,7 +2412,7 @@ enum SuperDictateAgentService {
                                                 attributes: [.posixPermissions: 0o700])
 
         let logPath = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("Logs/SuperDictate-agent.launchd.log").path
+            .appendingPathComponent("Logs/MyDictate-agent.launchd.log").path
         let plist: [String: Any] = [
             "Label": AGENT_LABEL,
             "ProgramArguments": [agentExecutablePath(), AGENT_ARGUMENT],
@@ -2402,7 +2489,7 @@ func privacySafeLogPath(_ url: URL) -> String {
 
 func privacySafeBundlePath(_ path: String) -> String {
     switch path {
-    case "/Applications/SuperDictate.app", "/tmp/SuperDictate-dev.app":
+    case "/Applications/MyDictate.app", "/tmp/MyDictate-dev.app":
         return path
     default:
         return privacySafeLogPath(path)
@@ -2479,7 +2566,7 @@ extension ISO8601DateFormatter {
 // MARK: - Settings
 //
 // Thin wrapper around the app's standard NSUserDefaults domain, so
-// settings persist at `~/Library/Preferences/com.local.superdictate.plist`.
+// settings persist at `~/Library/Preferences/com.local.mydictate.plist`.
 // One property per user-visible setting; defaults are returned inline
 // by each getter when the key is missing, rather than via a central
 // `register()` call.
@@ -2508,6 +2595,7 @@ final class Settings: @unchecked Sendable {
     private static let keyShowInDock = "show_in_dock"
     private static let keyInputDevice = "input_device"
     private static let keyCheckForUpdates = "check_for_updates"
+    private static let keyDidEnableMyDictateUpdates = "did_enable_mydictate_updates_v1"
     private static let keyLastUpdateCheckAt = "last_update_check_at"
     private static let keyLastUpdateCheckSource = "last_update_check_source"
     private static let keyLastUpdateCheckResult = "last_update_check_result"
@@ -2861,6 +2949,14 @@ final class Settings: @unchecked Sendable {
             return defaults.bool(forKey: Self.keyCheckForUpdates)
         }
         set { defaults.set(newValue, forKey: Self.keyCheckForUpdates) }
+    }
+
+    /// One-time migration from the fork that deliberately disabled the
+    /// upstream updater. Subsequent user choices are respected.
+    func enableMyDictateUpdatesIfNeeded() {
+        guard !defaults.bool(forKey: Self.keyDidEnableMyDictateUpdates) else { return }
+        checkForUpdates = true
+        defaults.set(true, forKey: Self.keyDidEnableMyDictateUpdates)
     }
 
     var lastUpdateCheckAt: Date? {
@@ -3717,7 +3813,7 @@ private func presentHotkeyRecorder(language: InterfaceLanguage,
         backing: .buffered,
         defer: false
     )
-    panel.title = "SuperDictate"
+    panel.title = "MyDictate"
     panel.isReleasedWhenClosed = false
     panel.level = .floating
     panel.center()
@@ -4366,20 +4462,233 @@ private struct CapturedRecording {
     let flattenSeconds: TimeInterval
 }
 
-private enum PendingDictationRecovery {
-    private static let directoryName = "PendingDictations"
-    private static let fileExtension = "sdaudio"
-    private static let magic = Data("SDAR".utf8)
+// Every completed transcript is written here before MyDictate attempts to
+// paste it. Text files are intentionally kept without an automatic limit:
+// they are tiny, user-readable, and serve as the durable source of truth when
+// a target app rejects a paste. Audio is journaled separately while recording;
+// only failed recognitions are additionally exported as ordinary WAV files.
+private enum DictationArchive {
+    private static let rootDirectoryName = "Saved Dictations"
+    private static let transcriptsDirectoryName = "Transcripts"
+    private static let failedAudioDirectoryName = "Failed Audio"
+    private static let pendingAudioDirectoryName = "Pending Audio"
 
-    static func directoryURL() throws -> URL {
+    static func rootDirectoryURL() throws -> URL {
         let url = try superDictateApplicationSupportDirectory()
-            .appendingPathComponent(directoryName, isDirectory: true)
+            .appendingPathComponent(rootDirectoryName, isDirectory: true)
+        try createPrivateDirectory(url)
+        return url
+    }
+
+    static func transcriptsDirectoryURL() throws -> URL {
+        let url = try rootDirectoryURL()
+            .appendingPathComponent(transcriptsDirectoryName, isDirectory: true)
+        try createPrivateDirectory(url)
+        return url
+    }
+
+    static func failedAudioDirectoryURL() throws -> URL {
+        let url = try rootDirectoryURL()
+            .appendingPathComponent(failedAudioDirectoryName, isDirectory: true)
+        try createPrivateDirectory(url)
+        return url
+    }
+
+    static func pendingAudioDirectoryURL() throws -> URL {
+        let url = try rootDirectoryURL()
+            .appendingPathComponent(pendingAudioDirectoryName, isDirectory: true)
+        try createPrivateDirectory(url)
+        return url
+    }
+
+    @discardableResult
+    static func saveTranscript(_ text: String,
+                               sourceAudioURL: URL?,
+                               at date: Date = Date(),
+                               directoryOverride: URL? = nil) -> URL? {
+        guard !text.isEmpty else { return nil }
+        do {
+            let directory = try directoryOverride ?? transcriptsDirectoryURL()
+            let url = directory
+                .appendingPathComponent(archiveBaseName(sourceAudioURL: sourceAudioURL,
+                                                        fallbackDate: date))
+                .appendingPathExtension("txt")
+            try writePrivateFile(Data((text + "\n").utf8), to: url)
+            log("dictation transcript archived: \(privacySafeLogPath(url))")
+            return url
+        } catch {
+            log("dictation transcript archive failed: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    static func preserveFailedAudio(_ samples: [Float],
+                                    sourceAudioURL: URL?,
+                                    errorDescription: String,
+                                    at date: Date = Date(),
+                                    directoryOverride: URL? = nil) {
+        guard !samples.isEmpty else { return }
+        do {
+            let baseName = archiveBaseName(sourceAudioURL: sourceAudioURL,
+                                           fallbackDate: date)
+            let directory = try directoryOverride ?? failedAudioDirectoryURL()
+            let wavURL = directory.appendingPathComponent(baseName)
+                .appendingPathExtension("wav")
+            try writePCM16WAV(samples, to: wavURL)
+
+            let errorURL = directory.appendingPathComponent(baseName + " — error")
+                .appendingPathExtension("txt")
+            let message = """
+                MyDictate не смог распознать эту запись.
+                Исходное аудио сохранено для повторной попытки.
+                Ошибка: \(errorDescription)
+
+                MyDictate could not recognize this recording.
+                The original pending recording is retained for Retry.
+                """
+            try writePrivateFile(Data((message + "\n").utf8), to: errorURL)
+            log("failed dictation audio archived: \(privacySafeLogPath(wavURL))")
+        } catch {
+            log("failed dictation audio archive failed: \(error.localizedDescription)")
+        }
+    }
+
+    private static func createPrivateDirectory(_ url: URL) throws {
         try FileManager.default.createDirectory(at: url,
                                                 withIntermediateDirectories: true,
                                                 attributes: [.posixPermissions: 0o700])
         try FileManager.default.setAttributes([.posixPermissions: 0o700],
                                               ofItemAtPath: url.path)
-        return url
+    }
+
+    private static func archiveBaseName(sourceAudioURL: URL?, fallbackDate: Date) -> String {
+        let sourceDate = sourceAudioURL.flatMap {
+            try? $0.resourceValues(forKeys: [.creationDateKey]).creationDate
+        } ?? fallbackDate
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = .current
+        formatter.dateFormat = "yyyy-MM-dd_HH-mm-ss"
+
+        let sourceStem = sourceAudioURL?
+            .deletingPathExtension()
+            .lastPathComponent
+            .replacingOccurrences(of: "pending-", with: "")
+        let identifier = sourceStem.flatMap { $0.isEmpty ? nil : $0 } ?? UUID().uuidString
+        return "\(formatter.string(from: sourceDate))__\(identifier)"
+    }
+
+    private static func writePrivateFile(_ data: Data, to url: URL) throws {
+        let directory = url.deletingLastPathComponent()
+        try createPrivateDirectory(directory)
+        let temporaryURL = directory
+            .appendingPathComponent(".\(url.lastPathComponent).\(UUID().uuidString).tmp")
+        let flags = O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW
+        let fd = Darwin.open(temporaryURL.path, flags, PRIVATE_LOG_FILE_MODE)
+        guard fd >= 0 else { throw currentPOSIXError() }
+        var shouldRemoveTemporary = true
+        defer {
+            _ = Darwin.close(fd)
+            if shouldRemoveTemporary {
+                _ = Darwin.unlink(temporaryURL.path)
+            }
+        }
+
+        try validateSingleLinkRegularFileDescriptor(fd)
+        guard Darwin.fchmod(fd, PRIVATE_LOG_FILE_MODE) == 0 else {
+            throw currentPOSIXError()
+        }
+        try writeAllData(data, to: fd)
+        guard Darwin.fsync(fd) == 0 else { throw currentPOSIXError() }
+        guard Darwin.rename(temporaryURL.path, url.path) == 0 else {
+            throw currentPOSIXError()
+        }
+        shouldRemoveTemporary = false
+    }
+
+    private static func writePCM16WAV(_ samples: [Float], to url: URL) throws {
+        guard samples.count <= Int(UInt32.max) / MemoryLayout<Int16>.size else {
+            throw posixError(EFBIG)
+        }
+        let directory = url.deletingLastPathComponent()
+        try createPrivateDirectory(directory)
+        let temporaryURL = directory
+            .appendingPathComponent(".\(url.lastPathComponent).\(UUID().uuidString).tmp")
+        let flags = O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW
+        let fd = Darwin.open(temporaryURL.path, flags, PRIVATE_LOG_FILE_MODE)
+        guard fd >= 0 else { throw currentPOSIXError() }
+        var shouldRemoveTemporary = true
+        defer {
+            _ = Darwin.close(fd)
+            if shouldRemoveTemporary {
+                _ = Darwin.unlink(temporaryURL.path)
+            }
+        }
+
+        try validateSingleLinkRegularFileDescriptor(fd)
+        guard Darwin.fchmod(fd, PRIVATE_LOG_FILE_MODE) == 0 else {
+            throw currentPOSIXError()
+        }
+
+        let dataByteCount = UInt32(samples.count * MemoryLayout<Int16>.size)
+        var header = Data()
+        header.append(contentsOf: Data("RIFF".utf8))
+        appendUInt32LE(36 + dataByteCount, to: &header)
+        header.append(contentsOf: Data("WAVEfmt ".utf8))
+        appendUInt32LE(16, to: &header)
+        appendUInt16LE(1, to: &header) // PCM
+        appendUInt16LE(1, to: &header) // mono
+        appendUInt32LE(UInt32(SAMPLE_RATE), to: &header)
+        appendUInt32LE(UInt32(SAMPLE_RATE) * 2, to: &header)
+        appendUInt16LE(2, to: &header)
+        appendUInt16LE(16, to: &header)
+        header.append(contentsOf: Data("data".utf8))
+        appendUInt32LE(dataByteCount, to: &header)
+        try writeAllData(header, to: fd)
+
+        let chunkSize = 16_384
+        var offset = 0
+        while offset < samples.count {
+            let end = min(offset + chunkSize, samples.count)
+            var pcm = [Int16]()
+            pcm.reserveCapacity(end - offset)
+            for sample in samples[offset..<end] {
+                let clamped = min(1, max(-1, sample))
+                let scaled = clamped < 0
+                    ? clamped * 32_768
+                    : clamped * Float(Int16.max)
+                pcm.append(Int16(scaled.rounded()))
+            }
+            let data = pcm.withUnsafeBytes { Data($0) }
+            try writeAllData(data, to: fd)
+            offset = end
+        }
+
+        guard Darwin.fsync(fd) == 0 else { throw currentPOSIXError() }
+        guard Darwin.rename(temporaryURL.path, url.path) == 0 else {
+            throw currentPOSIXError()
+        }
+        shouldRemoveTemporary = false
+    }
+
+    private static func appendUInt16LE(_ value: UInt16, to data: inout Data) {
+        var value = value.littleEndian
+        withUnsafeBytes(of: &value) { data.append(contentsOf: $0) }
+    }
+
+    private static func appendUInt32LE(_ value: UInt32, to data: inout Data) {
+        var value = value.littleEndian
+        withUnsafeBytes(of: &value) { data.append(contentsOf: $0) }
+    }
+}
+
+private enum PendingDictationRecovery {
+    private static let legacyDirectoryName = "PendingDictations"
+    private static let fileExtension = "sdaudio"
+    private static let magic = Data("SDAR".utf8)
+
+    static func directoryURL() throws -> URL {
+        try DictationArchive.pendingAudioDirectoryURL()
     }
 
     static func createJournal() throws -> PendingDictationJournal {
@@ -4389,13 +4698,24 @@ private enum PendingDictationRecovery {
     }
 
     static func pendingURLs() -> [URL] {
-        guard let directory = try? directoryURL(),
-              let urls = try? FileManager.default.contentsOfDirectory(
+        var directories: [URL] = []
+        if let current = try? directoryURL() {
+            directories.append(current)
+        }
+        if let support = try? superDictateApplicationSupportDirectory() {
+            let legacy = support.appendingPathComponent(legacyDirectoryName, isDirectory: true)
+            if FileManager.default.fileExists(atPath: legacy.path) {
+                directories.append(legacy)
+            }
+        }
+
+        let urls = directories.flatMap { directory in
+            (try? FileManager.default.contentsOfDirectory(
                 at: directory,
                 includingPropertiesForKeys: [.creationDateKey, .isRegularFileKey],
                 options: [.skipsHiddenFiles]
-              ) else { return [] }
-
+            )) ?? []
+        }
         return urls
             .filter { $0.pathExtension == fileExtension && $0.lastPathComponent.hasPrefix("pending-") }
             .sorted { lhs, rhs in
@@ -5000,6 +5320,89 @@ private final class AudioConverterInputProvider: @unchecked Sendable {
 
 private enum LoadedSpeechEngine {
     case parakeetV3(AsrManager)
+    case whisperLargeV3Turbo(WhisperSpeechEngine)
+}
+
+private final class WhisperSpeechEngine: @unchecked Sendable {
+    private let context: OpaquePointer
+
+    init(modelURL: URL) throws {
+        var params = whisper_context_default_params()
+        params.use_gpu = true
+        params.flash_attn = true
+
+        let loadedContext = modelURL.path.withCString {
+            whisper_init_from_file_with_params($0, params)
+        }
+        guard let loadedContext else {
+            throw NSError(
+                domain: "SuperDictate.Whisper",
+                code: -1,
+                userInfo: [NSLocalizedDescriptionKey: "Whisper could not load the local large-v3-turbo model."]
+            )
+        }
+        context = loadedContext
+    }
+
+    deinit {
+        whisper_free(context)
+    }
+
+    func transcribe(samples: [Float], language: DictationLanguage) throws -> String {
+        guard samples.count <= Int(Int32.max) else {
+            throw NSError(
+                domain: "SuperDictate.Whisper",
+                code: -2,
+                userInfo: [NSLocalizedDescriptionKey: "The recording is too long for Whisper."]
+            )
+        }
+
+        var params = whisper_full_default_params(WHISPER_SAMPLING_GREEDY)
+        params.n_threads = Int32(max(4, min(8, ProcessInfo.processInfo.activeProcessorCount - 2)))
+        params.translate = false
+        params.no_context = false
+        params.no_timestamps = true
+        params.single_segment = false
+        params.print_special = false
+        params.print_progress = false
+        params.print_realtime = false
+        params.print_timestamps = false
+        params.token_timestamps = false
+        params.suppress_blank = true
+        params.suppress_nst = true
+        params.temperature = 0
+        params.carry_initial_prompt = true
+
+        let resultCode = WHISPER_TECHNICAL_PROMPT.withCString { promptPointer in
+            language.whisperLanguageCode.withCString { languagePointer in
+                params.initial_prompt = promptPointer
+                params.language = languagePointer
+                // `language = "auto"` enables automatic language selection.
+                // `detect_language = true` is a detection-only mode that exits
+                // successfully without decoding any text segments.
+                params.detect_language = false
+                return samples.withUnsafeBufferPointer { sampleBuffer in
+                    whisper_full(context, params, sampleBuffer.baseAddress, Int32(samples.count))
+                }
+            }
+        }
+        guard resultCode == 0 else {
+            throw NSError(
+                domain: "SuperDictate.Whisper",
+                code: Int(resultCode),
+                userInfo: [NSLocalizedDescriptionKey: "Whisper failed to transcribe the recording (code (resultCode))."]
+            )
+        }
+
+        let segmentCount = whisper_full_n_segments(context)
+        var text = ""
+        for index in 0..<segmentCount {
+            if let segment = whisper_full_get_segment_text(context, index) {
+                text += String(cString: segment)
+            }
+        }
+        return text.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
 }
 
 private struct TranscriptionWorkerResult: Sendable {
@@ -5049,12 +5452,19 @@ actor TranscriptionWorker {
         }
 
         if speechModelCacheExists(for: profile) {
-            log("ASR: verifying + loading cached \(profile.shortName) CoreML weights…")
+            log("ASR: verifying + loading cached \(profile.shortName) weights…")
         } else {
-            log("ASR: downloading + verifying + loading \(profile.shortName) CoreML weights…")
+            log("ASR: downloading + verifying + loading \(profile.shortName) weights…")
         }
         let t0 = Date()
-        engine = .parakeetV3(try await loadParakeetV3(progressHandler: progressHandler))
+        switch profile {
+        case .whisperLargeV3Turbo, .whisperLargeV3TurboQ5:
+            engine = .whisperLargeV3Turbo(
+                try await loadWhisper(profile: profile, progressHandler: progressHandler)
+            )
+        case .multilingualV3, .englishUnified:
+            engine = .parakeetV3(try await loadParakeetV3(progressHandler: progressHandler))
+        }
         loadedProfile = profile
         ready = true
         log("ASR: \(profile.shortName) ready in \(String(format: "%.2f", Date().timeIntervalSince(t0))) s")
@@ -5082,8 +5492,103 @@ actor TranscriptionWorker {
         return AsrManager(config: .default, models: models)
     }
 
+    private func loadWhisper(
+        profile: SpeechModelProfile,
+        progressHandler: DownloadUtils.ProgressHandler?
+    ) async throws -> WhisperSpeechEngine {
+        let modelURL = try await ensureWhisperModel(profile: profile,
+                                                    progressHandler: progressHandler)
+        progressHandler?(.init(fractionCompleted: 0.98,
+                               phase: .compiling(modelName: profile.shortName)))
+        return try WhisperSpeechEngine(modelURL: modelURL)
+    }
+
+    private func ensureWhisperModel(
+        profile: SpeechModelProfile,
+        progressHandler: DownloadUtils.ProgressHandler?
+    ) async throws -> URL {
+        guard let fileName = profile.whisperModelFileName,
+              let downloadURL = profile.whisperModelDownloadURL else {
+            throw NSError(domain: "MyDictate.Whisper",
+                          code: -6,
+                          userInfo: [NSLocalizedDescriptionKey: "The selected Whisper model is not configured."])
+        }
+        let cacheDirectory = speechModelCacheDirectory(for: profile)
+        let modelURL = cacheDirectory.appendingPathComponent(fileName)
+
+        if FileManager.default.fileExists(atPath: modelURL.path) {
+            do {
+                try verifyWhisperModel(at: modelURL, profile: profile)
+                return modelURL
+            } catch {
+                log("ASR: cached Whisper model failed integrity check; redownloading: \(error.localizedDescription)")
+                try FileManager.default.removeItem(at: modelURL)
+            }
+        }
+
+        try assertSufficientDiskSpaceForSpeechModelDownload(profile: profile)
+        try FileManager.default.createDirectory(at: cacheDirectory,
+                                                withIntermediateDirectories: true,
+                                                attributes: [.posixPermissions: 0o700])
+        progressHandler?(.init(fractionCompleted: 0.02,
+                               phase: .downloading(completedFiles: 0, totalFiles: 1)))
+
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = 120
+        configuration.timeoutIntervalForResource = 2 * 60 * 60
+        let session = URLSession(configuration: configuration)
+        let (temporaryURL, response) = try await session.download(from: downloadURL)
+        guard let httpResponse = response as? HTTPURLResponse,
+              (200..<300).contains(httpResponse.statusCode) else {
+            throw NSError(
+                domain: "SuperDictate.Whisper",
+                code: -3,
+                userInfo: [NSLocalizedDescriptionKey: "The Whisper model server returned an invalid response."]
+            )
+        }
+
+        let stagedURL = cacheDirectory.appendingPathComponent(".\(fileName).\(UUID().uuidString).download")
+        defer { try? FileManager.default.removeItem(at: stagedURL) }
+        try FileManager.default.moveItem(at: temporaryURL, to: stagedURL)
+        progressHandler?(.init(fractionCompleted: 0.92,
+                               phase: .downloading(completedFiles: 1, totalFiles: 1)))
+        try verifyWhisperModel(at: stagedURL, profile: profile)
+        try FileManager.default.moveItem(at: stagedURL, to: modelURL)
+        return modelURL
+    }
+
+    private func verifyWhisperModel(at modelURL: URL,
+                                    profile: SpeechModelProfile) throws {
+        guard let fileName = profile.whisperModelFileName,
+              let expectedSHA256 = profile.whisperModelSHA256 else {
+            throw NSError(domain: "MyDictate.Whisper",
+                          code: -6,
+                          userInfo: [NSLocalizedDescriptionKey: "The selected Whisper model is not configured."])
+        }
+        let attributes = try FileManager.default.attributesOfItem(atPath: modelURL.path)
+        guard let fileType = attributes[.type] as? FileAttributeType,
+              fileType == .typeRegular,
+              let size = attributes[.size] as? NSNumber,
+              size.int64Value == profile.estimatedDownloadBytes else {
+            throw NSError(
+                domain: "SuperDictate.Whisper",
+                code: -4,
+                userInfo: [NSLocalizedDescriptionKey: "The local Whisper model has an unexpected size."]
+            )
+        }
+        let digest = try ModelIntegrity.sha256Hex(of: modelURL,
+                                                  relativePath: fileName)
+        guard digest == expectedSHA256 else {
+            throw NSError(
+                domain: "SuperDictate.Whisper",
+                code: -5,
+                userInfo: [NSLocalizedDescriptionKey: "The local Whisper model checksum does not match the official file."]
+            )
+        }
+    }
+
     fileprivate func transcribe(samples: [Float],
-                               language: Language? = nil,
+                               language: DictationLanguage = .auto,
                                requestedAt: TimeInterval) async throws -> TranscriptionWorkerResult {
         let workerEnteredAt = ProcessInfo.processInfo.systemUptime
         guard let engine else { throw NSError(domain: "Parakey", code: -2) }
@@ -5099,7 +5604,9 @@ actor TranscriptionWorker {
             let decoderPreparationStartedAt = ProcessInfo.processInfo.systemUptime
             var state = try TdtDecoderState()
             let fluidCallStartedAt = ProcessInfo.processInfo.systemUptime
-            let result = try await asr.transcribe(samples, decoderState: &state, language: language)
+            let result = try await asr.transcribe(samples,
+                                                  decoderState: &state,
+                                                  language: language.fluidLanguage)
             let fluidCallCompletedAt = ProcessInfo.processInfo.systemUptime
             return TranscriptionWorkerResult(
                 text: result.text,
@@ -5107,6 +5614,18 @@ actor TranscriptionWorker {
                 decoderPreparationSeconds: fluidCallStartedAt - decoderPreparationStartedAt,
                 fluidCallSeconds: fluidCallCompletedAt - fluidCallStartedAt,
                 fluidProcessingSeconds: result.processingTime
+            )
+        case .whisperLargeV3Turbo(let whisperEngine):
+            let whisperStartedAt = ProcessInfo.processInfo.systemUptime
+            let text = try whisperEngine.transcribe(samples: samples, language: language)
+            let whisperCompletedAt = ProcessInfo.processInfo.systemUptime
+            let elapsed = whisperCompletedAt - whisperStartedAt
+            return TranscriptionWorkerResult(
+                text: text,
+                workerQueueSeconds: workerEnteredAt - requestedAt,
+                decoderPreparationSeconds: 0,
+                fluidCallSeconds: elapsed,
+                fluidProcessingSeconds: elapsed
             )
         }
     }
@@ -5116,7 +5635,7 @@ actor TranscriptionWorker {
         let requestedAt = ProcessInfo.processInfo.systemUptime
         let transcription = try await transcribe(
             samples: samples,
-            language: nil,
+            language: .auto,
             requestedAt: requestedAt
         )
         let completedAt = ProcessInfo.processInfo.systemUptime
@@ -6130,6 +6649,155 @@ private enum FocusedInsertionTargetLocator {
     }
 }
 
+/// The accessibility object for the text field that was focused when a
+/// dictation began.  Keeping this separately from the HUD tracker is
+/// intentional: the HUD can observe the user's current window while they
+/// work, but the completed transcript must return to the original field.
+@MainActor
+private final class CapturedInsertionTarget {
+    private static let maximumScanCount = 1_000
+    private static let messagingTimeout: Float = 0.18
+
+    let applicationPID: pid_t
+    let applicationName: String
+    let targetFrame: NSRect
+    private let element: AXUIElement?
+    private let window: AXUIElement?
+
+    private init(applicationPID: pid_t,
+                 applicationName: String,
+                 targetFrame: NSRect,
+                 element: AXUIElement?,
+                 window: AXUIElement?) {
+        self.applicationPID = applicationPID
+        self.applicationName = applicationName
+        self.targetFrame = targetFrame
+        self.element = element
+        self.window = window
+    }
+
+    static func capture(target: FocusedInsertionTargetFrame,
+                        applicationName: String) -> CapturedInsertionTarget? {
+        guard AXIsProcessTrusted() else { return nil }
+        let app = AXUIElementCreateApplication(target.identity.applicationPID)
+        AXUIElementSetMessagingTimeout(app, messagingTimeout)
+        let element = findElement(in: app, matchingToken: target.identity.elementToken)
+        let window = element.flatMap(windowElement(for:))
+            ?? findElement(in: app, matchingToken: target.identity.windowToken)
+        guard element != nil else { return nil }
+        return CapturedInsertionTarget(
+            applicationPID: target.identity.applicationPID,
+            applicationName: applicationName,
+            targetFrame: target.frame,
+            element: element,
+            window: window
+        )
+    }
+
+    /// Restores the original application and focused accessibility element.
+    /// If a web view refuses the AX focus request, a final click inside the
+    /// captured text field gives Chromium/Electron inputs the same result.
+    func restore() async -> Bool {
+        guard let application = NSRunningApplication(processIdentifier: applicationPID),
+              !application.isTerminated else {
+            return false
+        }
+        guard application.activate(options: [.activateIgnoringOtherApps]) else {
+            return false
+        }
+        try? await Task.sleep(nanoseconds: 120_000_000)
+
+        guard let element else { return false }
+        let app = AXUIElementCreateApplication(applicationPID)
+        AXUIElementSetMessagingTimeout(app, Self.messagingTimeout)
+        if let window {
+            _ = AXUIElementSetAttributeValue(app, kAXFocusedWindowAttribute as CFString, window)
+        }
+        if AXUIElementSetAttributeValue(app,
+                                        kAXFocusedUIElementAttribute as CFString,
+                                        element) == .success {
+            try? await Task.sleep(nanoseconds: 35_000_000)
+            return true
+        }
+        if AXUIElementPerformAction(element, kAXPressAction as CFString) == .success {
+            try? await Task.sleep(nanoseconds: 35_000_000)
+            return true
+        }
+        return clickCapturedField()
+    }
+
+    private func clickCapturedField() -> Bool {
+        let point = CGPoint(x: targetFrame.midX, y: targetFrame.midY)
+        guard point.x.isFinite,
+              point.y.isFinite,
+              let source = CGEventSource(stateID: .hidSystemState),
+              let down = CGEvent(mouseEventSource: source,
+                                 mouseType: .leftMouseDown,
+                                 mouseCursorPosition: point,
+                                 mouseButton: .left),
+              let up = CGEvent(mouseEventSource: source,
+                               mouseType: .leftMouseUp,
+                               mouseCursorPosition: point,
+                               mouseButton: .left) else {
+            return false
+        }
+        down.post(tap: .cghidEventTap)
+        up.post(tap: .cghidEventTap)
+        return true
+    }
+
+    private static func findElement(in root: AXUIElement,
+                                    matchingToken: UInt) -> AXUIElement? {
+        guard matchingToken != 0 else { return nil }
+        var queue = [root]
+        var index = 0
+        var visited: Set<UInt> = []
+        while index < queue.count, visited.count < maximumScanCount {
+            let current = queue[index]
+            index += 1
+            let token = CFHash(current)
+            guard visited.insert(token).inserted else { continue }
+            if token == matchingToken { return current }
+            AXUIElementSetMessagingTimeout(current, messagingTimeout)
+            if let focused = elementAttribute(current, kAXFocusedUIElementAttribute as CFString),
+               !CFEqual(focused, current) {
+                queue.append(focused)
+            }
+            queue.append(contentsOf: elementArrayAttribute(current, kAXSelectedChildrenAttribute as CFString))
+            queue.append(contentsOf: elementArrayAttribute(current, kAXChildrenAttribute as CFString))
+        }
+        return nil
+    }
+
+    private static func copyAttribute(_ element: AXUIElement,
+                                      _ attribute: CFString) -> CFTypeRef? {
+        var raw: CFTypeRef?
+        return AXUIElementCopyAttributeValue(element, attribute, &raw) == .success ? raw : nil
+    }
+
+    private static func axElement(_ raw: CFTypeRef?) -> AXUIElement? {
+        guard let raw, CFGetTypeID(raw) == AXUIElementGetTypeID() else { return nil }
+        return unsafeDowncast(raw, to: AXUIElement.self)
+    }
+
+    private static func elementAttribute(_ element: AXUIElement,
+                                         _ attribute: CFString) -> AXUIElement? {
+        axElement(copyAttribute(element, attribute))
+    }
+
+    private static func elementArrayAttribute(_ element: AXUIElement,
+                                              _ attribute: CFString) -> [AXUIElement] {
+        guard let raw = copyAttribute(element, attribute) else { return [] }
+        if let single = axElement(raw) { return [single] }
+        return raw as? [AXUIElement] ?? []
+    }
+
+    private static func windowElement(for element: AXUIElement) -> AXUIElement? {
+        elementAttribute(element, kAXWindowAttribute as CFString)
+            ?? elementAttribute(element, kAXTopLevelUIElementAttribute as CFString)
+    }
+}
+
 func textInsertionStrategyChain(primary: TextInsertionStrategy) -> [TextInsertionStrategy] {
     switch primary {
     case .clipboardPaste:
@@ -6884,7 +7552,7 @@ func isNewer(_ candidate: String, than current: String) -> Bool {
 // previous denial is still cached). On a fresh launch after an
 // upgrade (CFBundleShortVersionString differs from
 // settings.lastSeenVersion), we proactively `tccutil reset` any
-// DENIED entry for `com.local.superdictate`. GRANTED entries stay
+// DENIED entry for `com.local.mydictate`. GRANTED entries stay
 // intact — we never reset away permissions the user gave us.
 //
 // The companion to this is the click-twice-to-reset retry in the
@@ -6987,18 +7655,18 @@ enum UpdateCheckFailure: Error, Equatable, Sendable {
 func manualUpdateCheckFailureText(_ failure: UpdateCheckFailure) -> String {
     switch failure {
     case .network:
-        return "SuperDictate couldn't reach GitHub. Check your internet connection and try again."
+        return "MyDictate couldn't reach GitHub. Check your internet connection and try again."
     case .httpStatus(403):
         return "GitHub declined the update check (HTTP 403). This is usually temporary rate limiting — try again in a few minutes."
     case .httpStatus(let code):
         return "GitHub returned an error (HTTP \(code)). Try again later."
     case .unexpectedResponse:
-        return "GitHub returned a response SuperDictate couldn't read. Try again later, or check the releases page on GitHub directly."
+        return "GitHub returned a response MyDictate couldn't read. Try again later, or check the releases page on GitHub directly."
     }
 }
 
 enum UpdateCheck {
-    private static let githubReleaseURLPathPrefix = "/shlgd/SuperDictate/releases/tag/"
+    private static let githubReleaseURLPathPrefix = "/\(MYDICTATE_GITHUB_REPOSITORY)/releases/tag/"
     static let maxReleaseResponseBytes = 512 * 1024
 
     static func fetchLatest() async -> Result<GitHubRelease, UpdateCheckFailure> {
@@ -7007,7 +7675,7 @@ enum UpdateCheck {
         // The privacy docs promise exactly this fixed token — no
         // version, device, or user identifiers. Must stay in sync with
         // docs/privacy/network-calls.json.
-        req.setValue("superdictate-update-check", forHTTPHeaderField: "User-Agent")
+        req.setValue("mydictate-update-check", forHTTPHeaderField: "User-Agent")
         req.timeoutInterval = 10
         let config = URLSessionConfiguration.ephemeral
         config.requestCachePolicy = .reloadIgnoringLocalCacheData
@@ -7130,7 +7798,7 @@ enum SuperDictateUpdateInstallerError: LocalizedError, Equatable, Sendable {
             case .invalidBundle(let detail):
                 return "The new application failed verification: \(detail)"
             case .appNotWritable:
-                return "SuperDictate cannot replace the application in Applications. Run the regular installer once."
+                return "MyDictate cannot replace the application in Applications. Run the regular installer once."
             }
         }
         switch self {
@@ -7151,7 +7819,7 @@ enum SuperDictateUpdateInstallerError: LocalizedError, Equatable, Sendable {
         case .invalidBundle(let detail):
             return "Проверка нового приложения не пройдена: \(detail)"
         case .appNotWritable:
-            return "SuperDictate не может заменить приложение в папке Applications. Запустите обычный установщик один раз."
+            return "MyDictate не может заменить приложение в папке Applications. Запустите обычный установщик один раз."
         }
     }
 }
@@ -7161,7 +7829,7 @@ enum SuperDictateUpdateInstaller {
 
     static func fetchManifest(expectedVersion: String) async throws -> SuperDictateUpdateManifest {
         var request = URLRequest(url: GITHUB_UPDATE_MANIFEST_URL)
-        request.setValue("superdictate-in-app-update", forHTTPHeaderField: "User-Agent")
+        request.setValue("mydictate-in-app-update", forHTTPHeaderField: "User-Agent")
         request.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
         request.timeoutInterval = 15
         let (data, response) = try await fetch(request: request, maxBytes: manifestMaxBytes)
@@ -7193,9 +7861,9 @@ enum SuperDictateUpdateInstaller {
             throw SuperDictateUpdateInstallerError.appNotWritable
         }
 
-        let archiveURL = URL(string: "https://github.com/shlgd/SuperDictate/releases/download/v\(manifest.version)/SuperDictate.zip")!
+        let archiveURL = URL(string: "https://github.com/\(MYDICTATE_GITHUB_REPOSITORY)/releases/download/v\(manifest.version)/MyDictate-\(manifest.version).zip")!
         var request = URLRequest(url: archiveURL)
-        request.setValue("superdictate-in-app-update", forHTTPHeaderField: "User-Agent")
+        request.setValue("mydictate-in-app-update", forHTTPHeaderField: "User-Agent")
         request.timeoutInterval = 60
         let (archiveData, response) = try await fetch(request: request,
                                                       maxBytes: UPDATE_ARCHIVE_MAX_BYTES)
@@ -7211,8 +7879,8 @@ enum SuperDictateUpdateInstaller {
         }
 
         let workDirectory = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
-            .appendingPathComponent("SuperDictate-update-\(UUID().uuidString)", isDirectory: true)
-        let archiveFile = workDirectory.appendingPathComponent("SuperDictate.zip")
+            .appendingPathComponent("MyDictate-update-\(UUID().uuidString)", isDirectory: true)
+        let archiveFile = workDirectory.appendingPathComponent("MyDictate-\(manifest.version).zip")
         let extractedDirectory = workDirectory.appendingPathComponent("release", isDirectory: true)
         do {
             try FileManager.default.createDirectory(at: extractedDirectory,
@@ -7233,7 +7901,7 @@ enum SuperDictateUpdateInstaller {
             throw SuperDictateUpdateInstallerError.extractionFailed(extraction.output)
         }
 
-        let stagedAppURL = extractedDirectory.appendingPathComponent("SuperDictate.app",
+        let stagedAppURL = extractedDirectory.appendingPathComponent("MyDictate.app",
                                                                       isDirectory: true)
         do {
             try validateApp(at: stagedAppURL, expectedVersion: manifest.version)
@@ -7260,14 +7928,14 @@ enum SuperDictateUpdateInstaller {
     static func validateApp(at appURL: URL, expectedVersion: String) throws {
         let fileManager = FileManager.default
         let infoURL = appURL.appendingPathComponent("Contents/Info.plist")
-        let executableURL = appURL.appendingPathComponent("Contents/MacOS/SuperDictate")
-        guard appURL.lastPathComponent == "SuperDictate.app",
+        let executableURL = appURL.appendingPathComponent("Contents/MacOS/MyDictate")
+        guard appURL.lastPathComponent == "MyDictate.app",
               fileManager.fileExists(atPath: infoURL.path),
               fileManager.isExecutableFile(atPath: executableURL.path),
               let infoData = try? Data(contentsOf: infoURL),
               let info = try? PropertyListSerialization.propertyList(from: infoData,
                                                                      format: nil) as? [String: Any],
-              info["CFBundleIdentifier"] as? String == "com.local.superdictate",
+              info["CFBundleIdentifier"] as? String == "com.local.mydictate",
               info["CFBundleShortVersionString"] as? String == expectedVersion else {
             throw SuperDictateUpdateInstallerError.invalidBundle("неверный идентификатор или версия")
         }
@@ -7545,17 +8213,17 @@ func superDictateDirectUpdateHelperScript(pid: pid_t,
     let preparing = localizedText("Подготавливаю замену приложения…",
                                   "Preparing to replace the application…",
                                   language: language)
-    let installing = localizedText("Устанавливаю SuperDictate v\(targetVersion)…",
-                                    "Installing SuperDictate v\(targetVersion)…",
+    let installing = localizedText("Устанавливаю MyDictate v\(targetVersion)…",
+                                    "Installing MyDictate v\(targetVersion)…",
                                     language: language)
     let verifying = localizedText("Проверяю установленную версию…",
                                    "Verifying the installed version…",
                                    language: language)
-    let relaunching = localizedText("Обновление готово. Запускаю SuperDictate…",
-                                    "Update complete. Reopening SuperDictate…",
+    let relaunching = localizedText("Обновление готово. Запускаю MyDictate…",
+                                    "Update complete. Reopening MyDictate…",
                                     language: language)
-    let complete = localizedText("SuperDictate v\(targetVersion) установлена.",
-                                  "SuperDictate v\(targetVersion) is installed.",
+    let complete = localizedText("MyDictate v\(targetVersion) установлена.",
+                                  "MyDictate v\(targetVersion) is installed.",
                                   language: language)
     let failed = localizedText("Обновление не установлено. Предыдущая версия восстановлена.",
                                 "The update was not installed. The previous version was restored.",
@@ -7619,8 +8287,8 @@ func superDictateDirectUpdateHelperScript(pid: pid_t,
     }
 
     verify_app() {
-        [ -x "$APP_PATH/Contents/MacOS/SuperDictate" ] || return 1
-        [ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$INFO_PLIST" 2>/dev/null)" = "com.local.superdictate" ] || return 1
+        [ -x "$APP_PATH/Contents/MacOS/MyDictate" ] || return 1
+        [ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$INFO_PLIST" 2>/dev/null)" = "com.local.mydictate" ] || return 1
         [ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$INFO_PLIST" 2>/dev/null)" = "$TARGET_VERSION" ] || return 1
         /usr/bin/codesign --verify --deep --strict "$APP_PATH"
     }
@@ -7646,7 +8314,7 @@ func superDictateDirectUpdateHelperScript(pid: pid_t,
     wait_for_panel_exit || rollback
 
     /bin/launchctl bootout "$SERVICE" >/dev/null 2>&1 || true
-    /usr/bin/pkill -f "$APP_PATH/Contents/MacOS/SuperDictate --agent" >/dev/null 2>&1 || true
+    /usr/bin/pkill -f "$APP_PATH/Contents/MacOS/MyDictate --agent" >/dev/null 2>&1 || true
 
     state "installing" \#(shellSingleQuoted(installing))
     /bin/mv "$APP_PATH" "$BACKUP_APP" || rollback
@@ -7849,6 +8517,12 @@ final class CorrectionShareCleanupDelegate: NSObject, @preconcurrency NSSharingS
 }
 
 private final class RecordingHUDView: NSView {
+    override var mouseDownCanMoveWindow: Bool { true }
+
+    override func mouseDown(with event: NSEvent) {
+        window?.performDrag(with: event)
+    }
+
     var visualScale: CGFloat = RecordingHUDSize.standard.visualScale {
         didSet {
             if oldValue != visualScale { needsDisplay = true }
@@ -8365,7 +9039,7 @@ private final class UpdateProgressAppDelegate: NSObject, NSApplicationDelegate, 
                               styleMask: [.titled, .closable],
                               backing: .buffered,
                               defer: false)
-        window.title = t("Обновление SuperDictate", "Updating SuperDictate")
+        window.title = t("Обновление MyDictate", "Updating MyDictate")
         window.isReleasedWhenClosed = false
         window.delegate = self
         self.window = window
@@ -8377,13 +9051,13 @@ private final class UpdateProgressAppDelegate: NSObject, NSApplicationDelegate, 
         root.edgeInsets = NSEdgeInsets(top: 18, left: 20, bottom: 16, right: 20)
         root.translatesAutoresizingMaskIntoConstraints = false
 
-        let title = updateProgressLabel(t("Обновление SuperDictate до v\(launch.targetVersion)",
-                                          "Updating SuperDictate to v\(launch.targetVersion)"),
+        let title = updateProgressLabel(t("Обновление MyDictate до v\(launch.targetVersion)",
+                                          "Updating MyDictate to v\(launch.targetVersion)"),
                                         font: .systemFont(ofSize: 18, weight: .semibold))
         messageLabel = updateProgressLabel(t("Запускаю обновление…", "Starting update…"),
                                            font: .systemFont(ofSize: 13, weight: .medium))
-        detailLabel = updateProgressLabel(t("SuperDictate автоматически откроется после установки.",
-                                             "SuperDictate will reopen automatically when the update finishes."),
+        detailLabel = updateProgressLabel(t("MyDictate автоматически откроется после установки.",
+                                             "MyDictate will reopen automatically when the update finishes."),
                                           font: .systemFont(ofSize: 12),
                                           color: .secondaryLabelColor)
         detailLabel.preferredMaxLayoutWidth = 390
@@ -8496,12 +9170,12 @@ private final class UpdateProgressAppDelegate: NSObject, NSApplicationDelegate, 
             detailLabel.stringValue = t("Старая версия закрыта, новая устанавливается. Приложение откроется автоматически.",
                                         "The old version has closed while the new one is installed. It will reopen automatically.")
         case "relaunching":
-            detailLabel.stringValue = t("Запускаю новую версию SuperDictate.",
-                                        "Opening the new version of SuperDictate.")
+            detailLabel.stringValue = t("Запускаю новую версию MyDictate.",
+                                        "Opening the new version of MyDictate.")
             scheduleClose(after: 0.5)
         default:
-            detailLabel.stringValue = t("SuperDictate автоматически откроется после установки.",
-                                        "SuperDictate will reopen automatically when the update finishes.")
+            detailLabel.stringValue = t("MyDictate автоматически откроется после установки.",
+                                        "MyDictate will reopen automatically when the update finishes.")
         }
     }
 
@@ -9328,6 +10002,9 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var recordingHUDTargetQueryInFlight = false
     private var recordingHUDTargetSessionToken = 0
     private var recordingHUDWaitingForInitialTarget = false
+    /// The destination selected when the hotkey started this recording.
+    /// It must never be replaced by later HUD/window observations.
+    private var recordingInsertionTarget: CapturedInsertionTarget?
     private var insertionTargetCache: [pid_t: CachedInsertionTarget] = [:]
     private var globalMouseDownMonitor: Any?
     private var lastExternalClick: LastExternalClick?
@@ -9361,6 +10038,8 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     /// or user has skipped it.
     private var pendingUpdate: GitHubRelease?
     private var isCheckingForUpdates = false
+    private var isWaitingForSpeechEngineTermination = false
+    private var didUnloadSpeechEngineForTermination = false
     /// True while the async brew-install preflight for "Update now"
     /// is running; guards against a second click spawning a second
     /// update helper.
@@ -9483,6 +10162,8 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        settings.enableMyDictateUpdatesIfNeeded()
+        pendingUpdate = nil
         if settings.normalizeSpeechModelProfileForCurrentBuild() {
             log("ASR: reset unsupported saved speech model selection to \(settings.speechModelProfile.shortName)")
         }
@@ -9554,6 +10235,29 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     func applicationDidBecomeActive(_ notification: Notification) {
         guard !isTerminating else { return }
+    }
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        if didUnloadSpeechEngineForTermination {
+            return .terminateNow
+        }
+        if isWaitingForSpeechEngineTermination {
+            return .terminateLater
+        }
+
+        isWaitingForSpeechEngineTermination = true
+        startupTask?.cancel()
+        Task { @MainActor [weak self, weak sender] in
+            guard let self else {
+                sender?.reply(toApplicationShouldTerminate: true)
+                return
+            }
+            await asr.unload()
+            didUnloadSpeechEngineForTermination = true
+            isWaitingForSpeechEngineTermination = false
+            sender?.reply(toApplicationShouldTerminate: true)
+        }
+        return .terminateLater
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -9681,6 +10385,12 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 guard let self,
                       !self.isTerminating,
                       let app = NSWorkspace.shared.frontmostApplication else {
+                    return
+                }
+                // Dragging the HUD is presentation-only and must not change
+                // the field that will receive the finished transcription.
+                if self.recordingHUDPanel?.isVisible == true,
+                   self.recordingHUDPanel?.frame.contains(point) == true {
                     return
                 }
                 self.lastExternalClick = LastExternalClick(
@@ -9812,8 +10522,10 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         for url in pendingURLs {
             guard !Task.isCancelled, !isTerminating else { return }
+            var recoverySamples: [Float] = []
             do {
                 let samples = try PendingDictationRecovery.loadSamples(from: url)
+                recoverySamples = samples
                 guard !samples.isEmpty else {
                     PendingDictationRecovery.remove(url)
                     continue
@@ -9822,7 +10534,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 let requestedAt = ProcessInfo.processInfo.systemUptime
                 let transcription = try await asr.transcribe(
                     samples: samples,
-                    language: settings.dictationLanguage.fluidLanguage,
+                    language: settings.dictationLanguage,
                     requestedAt: requestedAt
                 )
                 let completedAt = ProcessInfo.processInfo.systemUptime
@@ -9830,19 +10542,38 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 let processed = processedDictationText(rawTranscript: transcription.text,
                                                        corrections: settings.transcriptCorrections,
                                                        removeFillerWords: settings.removeFillerWords)
-                if !processed.text.isEmpty {
-                    addToHistory(
-                        processed.text,
-                        transcriptionDurationSeconds: timing.totalSeconds,
-                        asrTiming: timing
+                guard !processed.text.isEmpty else {
+                    DictationArchive.preserveFailedAudio(
+                        samples,
+                        sourceAudioURL: url,
+                        errorDescription: "The speech model returned an empty transcript."
                     )
-                    recordDictationUsage(text: processed.text,
-                                         audioSeconds: duration,
-                                         asrSeconds: timing.totalSeconds)
+                    log("pending dictation recovery returned empty text; audio retained")
+                    continue
                 }
-                PendingDictationRecovery.remove(url)
-                log("pending dictation recovered: \(String(format: "%.2f", duration)) s audio → \(String(format: "%.2f", timing.totalSeconds)) s → \(processed.text.count) chars in history")
+
+                let archivedURL = DictationArchive.saveTranscript(processed.text,
+                                                                  sourceAudioURL: url)
+                addToHistory(
+                    processed.text,
+                    transcriptionDurationSeconds: timing.totalSeconds,
+                    asrTiming: timing
+                )
+                recordDictationUsage(text: processed.text,
+                                     audioSeconds: duration,
+                                     asrSeconds: timing.totalSeconds)
+                if archivedURL != nil {
+                    PendingDictationRecovery.remove(url)
+                } else {
+                    log("pending dictation retained because its transcript could not be archived")
+                }
+                log("pending dictation recovered: \(String(format: "%.2f", duration)) s audio → \(String(format: "%.2f", timing.totalSeconds)) s → \(processed.text.count) chars")
             } catch {
+                DictationArchive.preserveFailedAudio(
+                    recoverySamples,
+                    sourceAudioURL: url,
+                    errorDescription: error.localizedDescription
+                )
                 log("pending dictation recovery deferred: \(error.localizedDescription)")
             }
         }
@@ -10358,7 +11089,8 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         recordingHUDRetargetWorkItem = nil
         recordingHUDTargetSessionToken &+= 1
         recordingHUDTargetQueryInFlight = false
-        recordingHUDWaitingForInitialTarget = settings.showRecordingWaveform
+        recordingHUDWaitingForInitialTarget = false
+        recordingInsertionTarget = nil
         recordingHUDTargetStabilizer.reset(initialApplicationPID: initialContext?.applicationPID)
         setMenuBarState(.recording)
         let timer = Timer(timeInterval: 1.0 / 24.0,
@@ -10370,15 +11102,10 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         RunLoop.main.add(timer, forMode: .common)
         recordingLevelTimer = timer
 
-        if let initialContext {
-            requestRecordingHUDTarget(context: initialContext, isInitial: true)
-        } else {
-            recordingHUDWaitingForInitialTarget = false
-            log("text insertion target unavailable at recording start: frontmost application unavailable")
-            if settings.showRecordingWaveform {
-                showRecordingHUD(mode: .recording, level: 0)
-            }
+        if settings.showRecordingWaveform {
+            showRecordingHUD(mode: .recording, level: 0)
         }
+        requestRecordingHUDTarget(context: initialContext, isInitial: true)
     }
 
     private func stopRecordingLevelMeter(resetImage: Bool = true, hideHUD: Bool = true) {
@@ -10417,8 +11144,6 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let rawLevel = visibleRecordingLevel(rawLevel: unsuppressedLevel)
         let attack: Float = rawLevel > recordingVisualLevel ? 0.65 : 0.28
         recordingVisualLevel += (rawLevel - recordingVisualLevel) * attack
-        let now = ProcessInfo.processInfo.systemUptime
-        refreshRecordingHUDInsertionTargetIfNeeded(at: now)
         if settings.showRecordingWaveform {
             guard !recordingHUDWaitingForInitialTarget else { return }
             if recordingHUDPanel?.isVisible == true {
@@ -10577,7 +11302,6 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let speed = recordingHUDPhaseSpeed(mode: mode, level: recordingVisualLevel)
         recordingHUDPhase += CGFloat(dt) * speed
         recordingHUDView?.phase = recordingHUDPhase
-        _ = moveRecordingHUDTowardInsertionTarget(deltaTime: dt)
         recordingHUDView?.displayIfNeeded()
     }
 
@@ -10594,7 +11318,9 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         panel.backgroundColor = .clear
         panel.isOpaque = false
         panel.hasShadow = false
-        panel.ignoresMouseEvents = true
+        panel.ignoresMouseEvents = false
+        panel.isMovable = true
+        panel.isMovableByWindowBackground = true
         panel.hidesOnDeactivate = false
         panel.level = .floating
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle]
@@ -10625,17 +11351,13 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     private func recordingHUDFrame(size: NSSize) -> NSRect {
-        if let targetFrame = recordingHUDInsertionTargetVisualFrame ?? recordingHUDInsertionTargetFrame {
-            return recordingHUDFrameAboveTarget(targetFrame, size: size)
-        }
-        if let fallbackWindow = recordingHUDFallbackWindowFrame {
-            return recordingHUDFrameInsideFallbackWindow(fallbackWindow, size: size)
-        }
+        // Fixed screen position: the HUD is deliberately independent of the
+        // insertion caret. The user may drag it elsewhere for this recording.
         let visible = NSScreen.main?.visibleFrame
             ?? NSScreen.screens.first?.visibleFrame
             ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
         let x = visible.midX - (size.width / 2)
-        let y = visible.maxY - size.height - 96
+        let y = visible.minY + 28
         return NSRect(x: x, y: y, width: size.width, height: size.height)
     }
 
@@ -10790,6 +11512,17 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
 
         if isInitial {
+            if let target = liveTarget ?? observedTarget {
+                recordingInsertionTarget = CapturedInsertionTarget.capture(
+                    target: target,
+                    applicationName: result.applicationName
+                )
+                if recordingInsertionTarget != nil {
+                    log("text insertion destination locked at recording start: \(result.applicationName)")
+                } else {
+                    log("text insertion destination could not retain its accessibility element at recording start")
+                }
+            }
             recordingHUDWaitingForInitialTarget = false
             if let liveTarget {
                 log("text insertion target captured at recording start: \(liveTarget.resolutionKind), frontmost: \(result.applicationName) (\(result.bundleIdentifier)); \(result.diagnostic)")
@@ -11158,7 +11891,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         // immediately, but its disk/menu updates now overlap inference.
         let asrRequestedAt = ProcessInfo.processInfo.systemUptime
         let transcriptionWorker = asr
-        let language = settings.dictationLanguage.fluidLanguage
+        let language = settings.dictationLanguage
         let transcriptionTask = Task.detached(priority: .userInitiated) {
             let transcription = try await transcriptionWorker.transcribe(
                 samples: samples,
@@ -11203,6 +11936,13 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     let cleaned = processed.text
                     log("\(String(format: "%.2f", dur)) s audio → \(String(format: "%.2f", asrTiming.totalSeconds)) s → \(cleaned.count) chars")
                     if !cleaned.isEmpty {
+                        // The durable text file is written before history and
+                        // before paste. A target-app or pasteboard failure can
+                        // therefore never destroy a completed transcription.
+                        let archivedURL = DictationArchive.saveTranscript(
+                            cleaned,
+                            sourceAudioURL: captured.recoveryURL
+                        )
                         let historyStartedAt = ProcessInfo.processInfo.systemUptime
                         addToHistory(
                             cleaned,
@@ -11216,7 +11956,11 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                         let historyCompletedAt = ProcessInfo.processInfo.systemUptime
 
                         let journalCleanupStartedAt = ProcessInfo.processInfo.systemUptime
-                        PendingDictationRecovery.remove(captured.recoveryURL)
+                        if archivedURL != nil {
+                            PendingDictationRecovery.remove(captured.recoveryURL)
+                        } else {
+                            log("pending dictation retained because its transcript could not be archived")
+                        }
                         let journalCleanupCompletedAt = ProcessInfo.processInfo.systemUptime
 
                         let permissionRecheckStartedAt = ProcessInfo.processInfo.systemUptime
@@ -11230,9 +11974,27 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                         }
 
                         let insertionStartedAt = ProcessInfo.processInfo.systemUptime
-                        let inserted = TextInserter.insert(
-                            pastedText(from: cleaned, suffix: settings.pasteSuffix)
-                        )
+                        let insertionText = pastedText(from: cleaned, suffix: settings.pasteSuffix)
+                        let initialTarget = recordingInsertionTarget
+                        recordingInsertionTarget = nil
+                        let inserted: Bool
+                        if let initialTarget {
+                            if await initialTarget.restore() {
+                                inserted = TextInserter.insert(insertionText)
+                                if !inserted {
+                                    log("text insertion failed after restoring original destination: \(initialTarget.applicationName)")
+                                }
+                            } else {
+                                // Never paste into whatever happened to become active
+                                // during transcription. The complete text is already
+                                // durable in Saved Dictations and can be copied safely.
+                                log("original text destination was unavailable; transcript kept in Saved Dictations")
+                                inserted = false
+                            }
+                        } else {
+                            log("no original text destination was captured; using the active field")
+                            inserted = TextInserter.insert(insertionText)
+                        }
                         let insertionCompletedAt = ProcessInfo.processInfo.systemUptime
                         var enterDelaySeconds: Double?
                         if inserted {
@@ -11278,10 +12040,21 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                             pasteSucceeded: inserted
                         ).logLine)
                     } else {
-                        PendingDictationRecovery.remove(captured.recoveryURL)
+                        DictationArchive.preserveFailedAudio(
+                            samples,
+                            sourceAudioURL: captured.recoveryURL,
+                            errorDescription: "The speech model returned an empty transcript."
+                        )
+                        log("transcription returned empty text; audio retained")
+                        dictationFailed = true
                     }
                 }
             } catch {
+                DictationArchive.preserveFailedAudio(
+                    samples,
+                    sourceAudioURL: captured.recoveryURL,
+                    errorDescription: error.localizedDescription
+                )
                 log("transcribe failed: \(error)")
                 dictationFailed = true
             }
@@ -11340,7 +12113,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 let requestedAt = ProcessInfo.processInfo.systemUptime
                 let transcription = try await asr.transcribe(
                     samples: captured.samples,
-                    language: settings.dictationLanguage.fluidLanguage,
+                    language: settings.dictationLanguage,
                     requestedAt: requestedAt
                 )
                 let completedAt = ProcessInfo.processInfo.systemUptime
@@ -11350,6 +12123,10 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                                                            corrections: settings.transcriptCorrections,
                                                            removeFillerWords: settings.removeFillerWords)
                     if !processed.text.isEmpty {
+                        let archivedURL = DictationArchive.saveTranscript(
+                            processed.text,
+                            sourceAudioURL: captured.recoveryURL
+                        )
                         addToHistory(
                             processed.text,
                             transcriptionDurationSeconds: timing.totalSeconds,
@@ -11358,12 +12135,30 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                         recordDictationUsage(text: processed.text,
                                              audioSeconds: duration,
                                              asrSeconds: timing.totalSeconds)
+                        if archivedURL != nil {
+                            PendingDictationRecovery.remove(captured.recoveryURL)
+                        } else {
+                            recoveryFailed = true
+                            log("pending dictation retained because its transcript could not be archived")
+                        }
+                    } else {
+                        recoveryFailed = true
+                        DictationArchive.preserveFailedAudio(
+                            captured.samples,
+                            sourceAudioURL: captured.recoveryURL,
+                            errorDescription: "The speech model returned an empty transcript."
+                        )
+                        log("dictation recovery returned empty text; audio retained")
                     }
-                    PendingDictationRecovery.remove(captured.recoveryURL)
                     log("recovered dictation: \(String(format: "%.2f", duration)) s audio → \(String(format: "%.2f", timing.totalSeconds)) s → \(processed.text.count) chars in history")
                 }
             } catch {
                 recoveryFailed = true
+                DictationArchive.preserveFailedAudio(
+                    captured.samples,
+                    sourceAudioURL: captured.recoveryURL,
+                    errorDescription: error.localizedDescription
+                )
                 log("dictation recovery failed; audio retained for next launch: \(error.localizedDescription)")
             }
 
@@ -11713,6 +12508,49 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         log("history copied to clipboard (\(text.count) chars)")
     }
 
+    @objc private func openSavedDictationsClicked(_ sender: Any) {
+        do {
+            let url = try DictationArchive.rootDirectoryURL()
+            NSWorkspace.shared.open(url)
+            log("saved dictations folder opened")
+        } catch {
+            log("saved dictations folder open failed: \(error.localizedDescription)")
+            signalDictationFailure()
+        }
+    }
+
+    @objc private func retryPendingDictationsClicked(_ sender: Any) {
+        guard isReady,
+              !isRecording,
+              !isBusy,
+              !isTerminating,
+              !PendingDictationRecovery.pendingURLs().isEmpty else { return }
+
+        cancelAudioIdleStop()
+        isBusy = true
+        setMenuBarState(.busy)
+        showTranscribingHUD()
+        rebuildMenu()
+        log("manual pending dictation recovery started")
+
+        Task { @MainActor in
+            await recoverPendingDictationsAfterStartup()
+            guard !isTerminating else { return }
+
+            let stillPending = !PendingDictationRecovery.pendingURLs().isEmpty
+            isBusy = false
+            finishBusyHUD()
+            if stillPending {
+                signalDictationFailure()
+            } else {
+                setMenuBarState(.idle)
+            }
+            rebuildMenu()
+            scheduleAudioIdleStop(reason: "manual pending recovery finished")
+            log("manual pending dictation recovery finished; remaining=\(stillPending ? "yes" : "no")")
+        }
+    }
+
     @objc private func clearHistoryClicked(_ sender: NSMenuItem) {
         guard !history.isEmpty else { return }
         let count = history.count
@@ -11831,6 +12669,13 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             toolTip: "Статистика",
             target: self,
             action: #selector(showStatisticsFromHistoryOverlayClicked(_:))
+        ))
+        actions.addArrangedSubview(HistoryToolbarButton(
+            symbolName: "folder",
+            accessibilityDescription: "Сохранённые диктовки",
+            toolTip: "Все тексты и аудио после ошибок",
+            target: self,
+            action: #selector(openSavedDictationsClicked(_:))
         ))
         actions.addArrangedSubview(NSView())
         actions.addArrangedSubview(HistoryToolbarButton(
@@ -12333,8 +13178,8 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private func confirmStopDictation() -> Bool {
         let alert = NSAlert()
         alert.alertStyle = .warning
-        alert.messageText = "Stop SuperDictate?"
-        alert.informativeText = "The \(hotkey.hotkey.name) dictation shortcut will stop until you open SuperDictate again. Use Close to hide windows while keeping dictation running."
+        alert.messageText = "Stop MyDictate?"
+        alert.informativeText = "The \(hotkey.hotkey.name) dictation shortcut will stop until you open MyDictate again. Use Close to hide windows while keeping dictation running."
         alert.addButton(withTitle: "Keep Running")
         alert.addButton(withTitle: "Stop Dictation")
         return alert.runModal() == .alertSecondButtonReturn
@@ -12366,7 +13211,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         showAppForModal()
         let alert = NSAlert()
         alert.alertStyle = .informational
-        alert.messageText = "SuperDictate Reopened After an Unexpected Exit"
+        alert.messageText = "MyDictate Reopened After an Unexpected Exit"
         alert.informativeText = """
             Parakey appears to have exited last time without a normal shutdown. Nothing was sent anywhere.
 
@@ -12506,7 +13351,9 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
 
         // Update submenu (lazy — only present when an update exists).
-        if let release = pendingUpdate, !settings.skippedVersions.contains(release.version) {
+        if UPDATE_FEATURE_ENABLED,
+           let release = pendingUpdate,
+           !settings.skippedVersions.contains(release.version) {
             menu.addItem(buildUpdateItem(for: release))
             menu.addItem(.separator())
         }
@@ -12536,6 +13383,10 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             menu.addItem(.separator())
         }
 
+        menu.addItem(buildSavedDictationsItem())
+        menu.addItem(buildSpeechModelQuickItem())
+        menu.addItem(.separator())
+
         // Settings submenu.
         menu.addItem(buildSettingsItem())
         menu.addItem(buildSupportItem())
@@ -12548,7 +13399,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         // in the menu that gets such an indicator — every other row
         // sits flush against the left edge. The wrapper produces the
         // identical behaviour with no auto-glyph.
-        let quit = NSMenuItem(title: "Quit SuperDictate",
+        let quit = NSMenuItem(title: "Quit MyDictate",
                               action: #selector(quitClicked(_:)),
                               keyEquivalent: "q")
         quit.target = self
@@ -12583,6 +13434,63 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         return parent
     }
 
+    private func buildSavedDictationsItem() -> NSMenuItem {
+        let parent = NSMenuItem(title: "Saved Dictations", action: nil, keyEquivalent: "")
+        let sub = NSMenu()
+        sub.autoenablesItems = false
+
+        let open = NSMenuItem(title: "Open Saved Dictations…",
+                              action: #selector(openSavedDictationsClicked(_:)),
+                              keyEquivalent: "")
+        open.target = self
+        open.toolTip = "Open permanent text transcripts and audio retained after recognition errors."
+        sub.addItem(open)
+
+        let pendingCount = PendingDictationRecovery.pendingURLs().count
+        if pendingCount > 0 {
+            sub.addItem(.separator())
+            let retry = NSMenuItem(
+                title: "Retry Saved Audio (\(pendingCount))",
+                action: #selector(retryPendingDictationsClicked(_:)),
+                keyEquivalent: ""
+            )
+            retry.target = self
+            retry.isEnabled = isReady && !isRecording && !isBusy && !isTerminating
+            retry.toolTip = "Run local speech recognition again without deleting the saved audio."
+            sub.addItem(retry)
+        }
+
+        parent.submenu = sub
+        return parent
+    }
+
+    private func buildSpeechModelQuickItem() -> NSMenuItem {
+        let parent = NSMenuItem(title: "Recognition Model", action: nil, keyEquivalent: "")
+        let sub = NSMenu()
+        sub.autoenablesItems = false
+        let canSwitch = !isRecording
+            && !isBusy
+            && !isTerminating
+            && startupTask == nil
+            && !isSwitchingSpeechModel
+            && !isResettingSpeechModelCache
+
+        for profile in SpeechModelProfile.allCases where profile.isProductionSupported {
+            let item = NSMenuItem(title: profile.displayName,
+                                  action: #selector(selectSpeechModelFromMenuClicked(_:)),
+                                  keyEquivalent: "")
+            item.target = self
+            item.representedObject = profile.rawValue
+            item.state = profile == settings.speechModelProfile ? .on : .off
+            item.isEnabled = canSwitch && profile != settings.speechModelProfile
+            item.toolTip = profile.aboutModelText
+            sub.addItem(item)
+        }
+
+        parent.submenu = sub
+        return parent
+    }
+
     private func buildSupportItem() -> NSMenuItem {
         let parent = NSMenuItem(title: "Support", action: nil, keyEquivalent: "")
         let sub = NSMenu()
@@ -12596,16 +13504,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         sub.addItem(.separator())
 
-        let checkUpdates = NSMenuItem(title: isCheckingForUpdates ? "Checking for Updates…" : "Check for Updates…",
-                                      action: #selector(checkForUpdatesClicked(_:)),
-                                      keyEquivalent: "")
-        checkUpdates.target = self
-        checkUpdates.isEnabled = !isCheckingForUpdates && !isTerminating
-        sub.addItem(checkUpdates)
-
-        sub.addItem(.separator())
-
-        let about = NSMenuItem(title: "About SuperDictate",
+        let about = NSMenuItem(title: "About MyDictate",
                                action: #selector(showAboutClicked(_:)),
                                keyEquivalent: "")
         about.target = self
@@ -12697,16 +13596,16 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         if isCoreRuntimeReady {
             return "Starting hotkey listener…"
         }
-        return "SuperDictate is not ready"
+        return "MyDictate is not ready"
     }
 
     private func diagnosticsText() -> String {
         let generated = ISO8601DateFormatter().string(from: Date())
         let bundlePath = Bundle.main.bundlePath
         let installKind: String
-        if bundlePath == "/Applications/SuperDictate.app" {
+        if bundlePath == INSTALLED_APP_BUNDLE_PATH {
             installKind = "Applications app"
-        } else if bundlePath == "/tmp/SuperDictate-dev.app" {
+        } else if bundlePath == "/tmp/MyDictate-dev.app" {
             installKind = "signed dev app"
         } else {
             installKind = "other"
@@ -13208,7 +14107,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             // it before tccutil finished would race the scrub it
             // depends on.
             log("  resetting TCC for \(p.rawValue) before retry")
-            TCC.reset(p, bundleID: Bundle.main.bundleIdentifier ?? "com.local.superdictate") { [weak self] in
+            TCC.reset(p, bundleID: Bundle.main.bundleIdentifier ?? SETTINGS_SUITE) { [weak self] in
                 guard let self, !self.isTerminating else { return }
                 Permissions.request(p)
                 self.startPermissionReadinessMonitor(reason: "permission grant")
@@ -13299,14 +14198,6 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         sounds.state = settings.playFeedbackSounds ? .on : .off
         sub.addItem(sounds)
 
-        let automaticUpdates = NSMenuItem(title: "Automatically check for updates",
-                                          action: #selector(toggleCheckForUpdates(_:)),
-                                          keyEquivalent: "")
-        automaticUpdates.target = self
-        automaticUpdates.state = settings.checkForUpdates ? .on : .off
-        automaticUpdates.toolTip = "Periodically checks GitHub for a newer release and only notifies you."
-        sub.addItem(automaticUpdates)
-
         let launchAtLogin = NSMenuItem(title: "Launch at Login",
                                        action: #selector(toggleLaunchAtLogin(_:)),
                                        keyEquivalent: "")
@@ -13316,13 +14207,13 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             launchAtLogin.state = .on
         case .requiresApproval:
             launchAtLogin.state = .mixed
-            launchAtLogin.toolTip = "Approve SuperDictate in System Settings → General → Login Items."
+            launchAtLogin.toolTip = "Approve MyDictate in System Settings → General → Login Items."
         default:
             launchAtLogin.state = .off
         }
         sub.addItem(launchAtLogin)
 
-        let dock = NSMenuItem(title: "Show SuperDictate in Dock",
+        let dock = NSMenuItem(title: "Show MyDictate in Dock",
                               action: #selector(toggleDock(_:)),
                               keyEquivalent: "")
         dock.target = self
@@ -14771,6 +15662,35 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
     }
 
+    @objc private func selectSpeechModelFromMenuClicked(_ sender: NSMenuItem) {
+        guard !isRecording,
+              !isBusy,
+              startupTask == nil,
+              !isSwitchingSpeechModel,
+              !isResettingSpeechModelCache,
+              !isTerminating,
+              let raw = sender.representedObject as? String,
+              let profile = SpeechModelProfile(rawValue: raw),
+              profile.isProductionSupported,
+              profile != settings.speechModelProfile else { return }
+
+        let previous = settings.speechModelProfile
+        settings.speechModelProfile = profile
+        fallbackSpeechModelProfileAfterStartupFailure = previous
+        isSwitchingSpeechModel = true
+        prepareForStartupAttempt()
+        startupStatusTitle = "Switching to \(profile.shortName)…"
+        log("ASR: menu model switch \(previous.shortName) → \(profile.shortName)")
+        rebuildMenu()
+
+        Task { @MainActor in
+            await asr.unload()
+            guard !isTerminating else { return }
+            isSwitchingSpeechModel = false
+            startStartup(reason: "speech model menu selection")
+        }
+    }
+
     @objc private func resetSpeechModelCacheClicked(_ sender: NSMenuItem) {
         guard !isRecording,
               !isBusy,
@@ -14831,7 +15751,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     @objc private func showAboutClicked(_ sender: NSMenuItem) {
         showAppForModal()
         let alert = NSAlert()
-        alert.messageText = "SuperDictate \(currentBundleVersion())"
+        alert.messageText = "MyDictate \(currentBundleVersion())"
         alert.informativeText = """
             Lightweight push-to-talk dictation for Apple Silicon Macs.
 
@@ -14840,11 +15760,11 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             Model:   \(settings.speechModelProfile.aboutModelText)
 
             Local-only dictation. No cloud transcription, no telemetry.
-            Network: model download, optional update check and install.
+            Network: first download of the selected local model only.
             Permissions: microphone audio, paste-at-cursor, push-to-talk hotkey.
 
-            Open source, based on Parakey by Richard Courtman.
-            github.com/shlgd/SuperDictate · MIT licensed
+            Open-source MyDictate.
+            github.com/Ilyaevst/MyDictate · MIT licensed
             """
         // Use our app icon instead of NSAlert's default exclamation
         // mark. .icns lives in Contents/Resources/Parakey.icns;
@@ -14863,6 +15783,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     // MARK: - Update flow
 
     private func startUpdateCheckLoop() {
+        guard UPDATE_FEATURE_ENABLED else { return }
         guard updateCheckLoopTask == nil else { return }
         updateCheckLoopTask = Task.detached { [weak self] in
             try? await Task.sleep(nanoseconds: UInt64(UPDATE_CHECK_FIRST_DELAY_SECONDS * 1_000_000_000))
@@ -14877,7 +15798,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     /// never alerted. `source` distinguishes the periodic timer tick
     /// from the user re-enabling the settings toggle.
     private func tickUpdateCheck(source: UpdateCheckSource = .automatic) async {
-        guard settings.checkForUpdates else { return }
+        guard UPDATE_FEATURE_ENABLED, settings.checkForUpdates else { return }
         let outcome = await UpdateCheck.fetchLatest()
         await MainActor.run {
             self.recordUpdateCheck(release: try? outcome.get(), source: source)
@@ -14971,7 +15892,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private func showReleaseNotes(for release: GitHubRelease) {
         showAppForModal()
         let alert = NSAlert()
-        alert.messageText = "Parakey v\(release.version)"
+        alert.messageText = "MyDictate v\(release.version)"
         var body = release.body.trimmingCharacters(in: .whitespacesAndNewlines)
         if body.isEmpty { body = "(No release notes available for this version.)" }
         else if body.count > 1500 { body = String(body.prefix(1500)) + "\n\n…" }
@@ -15063,7 +15984,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private func showUpdateAvailableAlert(for release: GitHubRelease, currentVersion: String) {
         showAppForModal()
         let alert = NSAlert()
-        alert.messageText = "Parakey v\(release.version) is available"
+        alert.messageText = "MyDictate v\(release.version) is available"
         alert.informativeText = "You're running v\(currentVersion). Nothing is installed unless you choose Update Now."
         alert.addButton(withTitle: "Update Now")
         alert.addButton(withTitle: "What's New")
@@ -15130,7 +16051,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private func showUpToDateAlert(currentVersion: String) {
         showAppForModal()
         let alert = NSAlert()
-        alert.messageText = "Parakey is up to date"
+        alert.messageText = "MyDictate is up to date"
         alert.informativeText = "You're running v\(currentVersion)."
         alert.addButton(withTitle: "OK")
         alert.runModal()
@@ -15147,10 +16068,8 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     private func startUpdate(for release: GitHubRelease) {
-        showManualUpdateRequired(
-            for: release,
-            reason: "The public source build updates by running the installer again."
-        )
+        log("update click: opening MyDictate control panel for v\(release.version)")
+        openControlPanelFromAgent()
     }
 
     private func showManualUpdateRequired(for release: GitHubRelease, reason: String) {
@@ -15164,7 +16083,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         To update, run this command in Terminal:
 
-        curl -fsSL https://raw.githubusercontent.com/shlgd/SuperDictate/main/install.sh | bash
+        curl -fsSL https://raw.githubusercontent.com/Ilyaevst/MyDictate/main/install.sh | bash
         """
         alert.addButton(withTitle: "Open Release Page")
         alert.addButton(withTitle: "Close")
@@ -15186,7 +16105,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         You can update from Terminal:
 
-        curl -fsSL https://raw.githubusercontent.com/shlgd/SuperDictate/main/install.sh | bash
+        curl -fsSL https://raw.githubusercontent.com/Ilyaevst/MyDictate/main/install.sh | bash
         """
         alert.addButton(withTitle: "OK")
         alert.runModal()
@@ -15367,7 +16286,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         guard last != current else { return }
         log("upgrade detected: \(last) → \(current); checking for stale TCC state")
-        let bundleID = Bundle.main.bundleIdentifier ?? "com.local.superdictate"
+        let bundleID = Bundle.main.bundleIdentifier ?? SETTINGS_SUITE
         for p in Permission.allCases {
             if Permissions.isGranted(p) { continue }
             // Fire-and-forget on TCC's serial queue: these resets are
@@ -15638,13 +16557,13 @@ private enum ParakeySelfTest {
             "log path labels should fall back when no filename is available"
         )
         try expect(
-            privacySafeBundlePath("/Applications/SuperDictate.app"),
-            equals: "/Applications/SuperDictate.app",
+            privacySafeBundlePath("/Applications/MyDictate.app"),
+            equals: "/Applications/MyDictate.app",
             "bundle path labels should keep the canonical install path"
         )
         try expect(
-            privacySafeBundlePath("/Users/example/Downloads/SuperDictate.app"),
-            equals: "SuperDictate.app",
+            privacySafeBundlePath("/Users/example/Downloads/MyDictate.app"),
+            equals: "MyDictate.app",
             "bundle path labels should omit parent directories for nonstandard installs"
         )
 
@@ -15654,7 +16573,7 @@ private enum ParakeySelfTest {
         try fm.createDirectory(at: root, withIntermediateDirectories: false)
         defer { try? fm.removeItem(at: root) }
 
-        let logFile = root.appendingPathComponent("SuperDictate.log")
+        let logFile = root.appendingPathComponent("MyDictate.log")
         try appendPrivateLogData(Data("one\n".utf8), to: logFile)
         try appendPrivateLogData(Data("two\n".utf8), to: logFile)
 
@@ -15721,7 +16640,7 @@ private enum ParakeySelfTest {
                 appVersion: "9.8.7",
                 appBuild: "123",
                 macOS: "Version 26.0",
-                bundleID: "com.local.superdictate",
+                bundleID: "com.local.mydictate",
                 bundlePath: "/Applications/SuperDictate.app",
                 installKind: "Applications app",
                 status: "Hold Right Option to dictate",
@@ -15742,7 +16661,7 @@ private enum ParakeySelfTest {
                 ],
                 updateLines: ["Pending update: none"],
                 microphoneLines: ["Selected: System default", "Available inputs: none reported"],
-                logPath: "~/Library/Logs/SuperDictate.log",
+                logPath: "~/Library/Logs/MyDictate.log",
                 recentLogLines: ["[10:00:00] release: 1.23 s captured, transcribing"]
             )
         )
@@ -15766,7 +16685,7 @@ private enum ParakeySelfTest {
         try fm.createDirectory(at: root, withIntermediateDirectories: false)
         defer { try? fm.removeItem(at: root) }
 
-        let logFile = root.appendingPathComponent("SuperDictate.log")
+        let logFile = root.appendingPathComponent("MyDictate.log")
         for line in 1...6 {
             try appendPrivateLogData(Data("[10:00:0\(line)] line \(line)\n".utf8), to: logFile)
         }
@@ -16091,8 +17010,13 @@ private enum ParakeySelfTest {
 
         try expect(
             productionSpeechModelProfile(rawValue: nil),
-            equals: .multilingualV3,
+            equals: .whisperLargeV3Turbo,
             "missing speech model setting should use the production default"
+        )
+        try expect(
+            productionSpeechModelProfile(rawValue: SpeechModelProfile.whisperLargeV3Turbo.rawValue),
+            equals: .whisperLargeV3Turbo,
+            "stored Whisper speech model should remain valid"
         )
         try expect(
             productionSpeechModelProfile(rawValue: SpeechModelProfile.multilingualV3.rawValue),
@@ -16101,13 +17025,13 @@ private enum ParakeySelfTest {
         )
         try expect(
             productionSpeechModelProfile(rawValue: SpeechModelProfile.englishUnified.rawValue),
-            equals: .multilingualV3,
-            "deprecated Unified speech model setting should migrate back to v3"
+            equals: .whisperLargeV3Turbo,
+            "deprecated Unified speech model setting should migrate to Whisper"
         )
         try expect(
             productionSpeechModelProfile(rawValue: "unknown_model"),
-            equals: .multilingualV3,
-            "unknown speech model setting should migrate back to v3"
+            equals: .whisperLargeV3Turbo,
+            "unknown speech model setting should migrate to Whisper"
         )
 
         try expect(
@@ -16315,7 +17239,7 @@ private enum ParakeySelfTest {
         )
 
         let pasteboardProbe = MainActor.assumeIsolated {
-            let pasteboardName = NSPasteboard.Name("com.local.superdictate.self-test.\(UUID().uuidString)")
+            let pasteboardName = NSPasteboard.Name("com.local.mydictate.self-test.\(UUID().uuidString)")
             let pasteboard = NSPasteboard(name: pasteboardName)
             let wrote = ClipboardPasteInserter.write("pasteboard probe", to: pasteboard)
             let snapshot = PasteboardSnapshot.capture(from: pasteboard)
@@ -17806,7 +18730,7 @@ private enum ParakeySelfTest {
                                        httpVersion: nil,
                                        headerFields: nil)!
         let releaseData = Data(
-            #"{"tag_name":"v9.8.7","body":"Notes","html_url":"https://github.com/shlgd/SuperDictate/releases/tag/v9.8.7"}"#.utf8
+            #"{"tag_name":"v9.8.7","body":"Notes","html_url":"https://github.com/Ilyaevst/MyDictate/releases/tag/v9.8.7"}"#.utf8
         )
 
         try expect(
@@ -17814,7 +18738,7 @@ private enum ParakeySelfTest {
             equals: .success(GitHubRelease(tagName: "v9.8.7",
                                            version: "9.8.7",
                                            body: "Notes",
-                                           htmlURL: "https://github.com/shlgd/SuperDictate/releases/tag/v9.8.7")),
+                                           htmlURL: "https://github.com/Ilyaevst/MyDictate/releases/tag/v9.8.7")),
             "update parsing should decode typed GitHub release payloads"
         )
         try expect(
@@ -17833,7 +18757,7 @@ private enum ParakeySelfTest {
         )
         let oversizedReleaseData = Data(
             """
-            {"tag_name":"v9.8.7","body":"\(String(repeating: "x", count: UpdateCheck.maxReleaseResponseBytes))","html_url":"https://github.com/shlgd/SuperDictate/releases/tag/v9.8.7"}
+            {"tag_name":"v9.8.7","body":"\(String(repeating: "x", count: UpdateCheck.maxReleaseResponseBytes))","html_url":"https://github.com/Ilyaevst/MyDictate/releases/tag/v9.8.7"}
             """.utf8
         )
         try expect(
@@ -17904,7 +18828,7 @@ private enum ParakeySelfTest {
         )
         try expect(
             UpdateCheck.parseLatest(
-                data: Data(#"{"tag_name":"v9.8.7","html_url":"https://github.com/shlgd/SuperDictate/releases/tag/v9.8.8"}"#.utf8),
+                data: Data(#"{"tag_name":"v9.8.7","html_url":"https://github.com/Ilyaevst/MyDictate/releases/tag/v9.8.8"}"#.utf8),
                 response: ok
             ),
             equals: .success(GitHubRelease(tagName: "v9.8.7",
@@ -17956,19 +18880,19 @@ private enum ParakeySelfTest {
             "stored app version normalization should reject oversized numeric components"
         )
         try expect(
-            UpdateCheck.sanitizedReleaseURL("http://github.com/shlgd/SuperDictate/releases/tag/v9.8.7",
+            UpdateCheck.sanitizedReleaseURL("http://github.com/Ilyaevst/MyDictate/releases/tag/v9.8.7",
                                             expectedTag: "v9.8.7"),
             equals: GITHUB_RELEASES_PAGE.absoluteString,
             "release URL sanitizing should require HTTPS"
         )
         try expect(
-            UpdateCheck.sanitizedReleaseURL("https://user@github.com/shlgd/SuperDictate/releases/tag/v9.8.7",
+            UpdateCheck.sanitizedReleaseURL("https://user@github.com/Ilyaevst/MyDictate/releases/tag/v9.8.7",
                                             expectedTag: "v9.8.7"),
             equals: GITHUB_RELEASES_PAGE.absoluteString,
             "release URL sanitizing should reject userinfo"
         )
         try expect(
-            UpdateCheck.sanitizedReleaseURL("https://github.com/shlgd/SuperDictate/releases/tag/v9.8.7?download=1",
+            UpdateCheck.sanitizedReleaseURL("https://github.com/Ilyaevst/MyDictate/releases/tag/v9.8.7?download=1",
                                             expectedTag: "v9.8.7"),
             equals: GITHUB_RELEASES_PAGE.absoluteString,
             "release URL sanitizing should reject query strings"
@@ -18211,16 +19135,16 @@ private enum ParakeySelfTest {
             pid: 123,
             targetVersion: "9.8.7",
             statePath: "/tmp/superdictate-update.state",
-            stagedAppPath: "/tmp/work/release/SuperDictate.app",
+            stagedAppPath: "/tmp/work/release/MyDictate.app",
             workDirectory: "/tmp/work",
             backupAppPath: "/Applications/.SuperDictate-update-backup-test.app",
-            appPath: "/Applications/SuperDictate.app",
+            appPath: "/Applications/MyDictate.app",
             language: .english
         )
         for fragment in [
             "PANEL_PID=123",
             "TARGET_VERSION='9.8.7'",
-            "STAGED_APP='/tmp/work/release/SuperDictate.app'",
+            "STAGED_APP='/tmp/work/release/MyDictate.app'",
             "BACKUP_APP='/Applications/.SuperDictate-update-backup-test.app'",
             "wait_for_panel_exit || rollback",
             "launchctl bootout \"$SERVICE\"",
@@ -18228,7 +19152,7 @@ private enum ParakeySelfTest {
             "/usr/bin/ditto \"$STAGED_APP\" \"$APP_PATH\" || rollback",
             "/usr/bin/codesign --verify --deep --strict \"$APP_PATH\"",
             "if [ -d \"$BACKUP_APP\" ]; then",
-            "state \"complete\" 'SuperDictate v9.8.7 is installed.'",
+            "state \"complete\" 'MyDictate v9.8.7 is installed.'",
         ] {
             guard directScript.contains(fragment) else {
                 throw SelfTestFailure.failed("direct update helper missing fragment: \(fragment)")
@@ -18398,11 +19322,11 @@ private enum ParakeySelfTest {
             .appendingPathComponent("superdictate-update-replacement-test-\(UUID().uuidString)",
                                     isDirectory: true)
         let applications = root.appendingPathComponent("Applications", isDirectory: true)
-        let currentApp = applications.appendingPathComponent("SuperDictate.app", isDirectory: true)
+        let currentApp = applications.appendingPathComponent("MyDictate.app", isDirectory: true)
         let workDirectory = root.appendingPathComponent("work", isDirectory: true)
         let stagedApp = workDirectory
             .appendingPathComponent("release", isDirectory: true)
-            .appendingPathComponent("SuperDictate.app", isDirectory: true)
+            .appendingPathComponent("MyDictate.app", isDirectory: true)
         let backupApp = applications.appendingPathComponent(".SuperDictate-update-backup.app",
                                                              isDirectory: true)
         let statePath = root.appendingPathComponent("state.txt")
@@ -18458,14 +19382,14 @@ private enum ParakeySelfTest {
         let fileManager = FileManager.default
         let executableDirectory = appURL.appendingPathComponent("Contents/MacOS", isDirectory: true)
         try fileManager.createDirectory(at: executableDirectory, withIntermediateDirectories: true)
-        let executableURL = executableDirectory.appendingPathComponent("SuperDictate")
+        let executableURL = executableDirectory.appendingPathComponent("MyDictate")
         try fileManager.copyItem(at: sourceExecutable, to: executableURL)
         try fileManager.setAttributes([.posixPermissions: 0o755],
                                       ofItemAtPath: executableURL.path)
         let info: [String: Any] = [
-            "CFBundleExecutable": "SuperDictate",
-            "CFBundleIdentifier": "com.local.superdictate",
-            "CFBundleName": "SuperDictate",
+            "CFBundleExecutable": "MyDictate",
+            "CFBundleIdentifier": "com.local.mydictate",
+            "CFBundleName": "MyDictate",
             "CFBundlePackageType": "APPL",
             "CFBundleShortVersionString": version,
             "CFBundleVersion": "1",
@@ -18702,6 +19626,102 @@ private enum ParakeySelfTest {
             recoveryMode.intValue,
             equals: 0o600,
             "pending dictation journal should be private"
+        )
+
+        let archiveRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mydictate-archive-test-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: archiveRoot) }
+        let archiveSource = archiveRoot
+            .appendingPathComponent("pending-archive-test")
+            .appendingPathExtension("sdaudio")
+        try FileManager.default.createDirectory(at: archiveRoot,
+                                                withIntermediateDirectories: false)
+        try Data().write(to: archiveSource)
+
+        let transcriptDirectory = archiveRoot.appendingPathComponent("Transcripts", isDirectory: true)
+        guard let transcriptURL = DictationArchive.saveTranscript(
+            "Long dictation survived.",
+            sourceAudioURL: archiveSource,
+            directoryOverride: transcriptDirectory
+        ) else {
+            throw SelfTestFailure.failed("completed transcript should be archived")
+        }
+        try expect(
+            try String(contentsOf: transcriptURL, encoding: .utf8),
+            equals: "Long dictation survived.\n",
+            "transcript archive should contain copyable plain text"
+        )
+        let transcriptAttributes = try FileManager.default.attributesOfItem(atPath: transcriptURL.path)
+        guard let transcriptMode = transcriptAttributes[.posixPermissions] as? NSNumber else {
+            throw SelfTestFailure.failed("transcript archive should expose POSIX permissions")
+        }
+        try expect(
+            transcriptMode.intValue,
+            equals: 0o600,
+            "transcript archive should be private"
+        )
+
+        let failedAudioDirectory = archiveRoot.appendingPathComponent("Failed Audio", isDirectory: true)
+        DictationArchive.preserveFailedAudio(
+            expectedSamples,
+            sourceAudioURL: archiveSource,
+            errorDescription: "test recognition failure",
+            directoryOverride: failedAudioDirectory
+        )
+        let failedFiles = try FileManager.default.contentsOfDirectory(
+            at: failedAudioDirectory,
+            includingPropertiesForKeys: nil
+        )
+        guard let wavURL = failedFiles.first(where: { $0.pathExtension == "wav" }),
+              let errorURL = failedFiles.first(where: {
+                  $0.pathExtension == "txt" && $0.lastPathComponent.contains("error")
+              }) else {
+            throw SelfTestFailure.failed("failed dictation should preserve WAV audio and an error note")
+        }
+        let wavData = try Data(contentsOf: wavURL)
+        try expect(
+            String(data: wavData.prefix(4), encoding: .ascii),
+            equals: "RIFF",
+            "failed dictation audio should be a standard WAV file"
+        )
+        try expect(
+            wavData.count,
+            equals: 44 + expectedSamples.count * MemoryLayout<Int16>.size,
+            "failed dictation WAV should contain one 16-bit sample per captured float"
+        )
+        try expect(
+            (try String(contentsOf: errorURL, encoding: .utf8)).contains("test recognition failure"),
+            equals: true,
+            "failed dictation error note should explain why audio was retained"
+        )
+
+        let pendingAudioDirectory = archiveRoot.appendingPathComponent("Pending Audio", isDirectory: true)
+        try FileManager.default.createDirectory(at: pendingAudioDirectory,
+                                                withIntermediateDirectories: false)
+        let archiveSnapshot = savedDictationArchiveSnapshot(
+            transcriptsDirectory: transcriptDirectory,
+            failedAudioDirectory: failedAudioDirectory,
+            pendingAudioDirectory: pendingAudioDirectory
+        )
+        try expect(
+            archiveSnapshot.totalTranscriptCount,
+            equals: 1,
+            "saved dictation browser should count transcript files"
+        )
+        try expect(
+            archiveSnapshot.transcripts.map(\.text),
+            equals: ["Long dictation survived."],
+            "saved dictation browser should load copyable transcript text"
+        )
+        try expect(
+            archiveSnapshot.failedAudioCount,
+            equals: 1,
+            "saved dictation browser should count failed WAV recordings"
+        )
+        try expect(
+            archiveSnapshot.pendingAudioCount,
+            equals: 0,
+            "saved dictation browser should report pending recovery recordings separately"
         )
 
         let processed = processedDictationText(
@@ -19504,6 +20524,7 @@ private enum ControlPanelShortcutKind: Int {
 private struct ControlPanelSettingsDraft: Equatable {
     var hotkeyWithoutEnter: HotkeyChoice
     var hotkeyWithEnter: HotkeyChoice
+    var speechModelProfile: SpeechModelProfile
     var recordingColor: RecordingHUDAccentColor
     var transcribingColor: RecordingHUDAccentColor
     var backgroundStyle: RecordingHUDBackgroundStyle
@@ -19512,6 +20533,7 @@ private struct ControlPanelSettingsDraft: Equatable {
     init(settings: Settings) {
         hotkeyWithoutEnter = settings.configuredHotkey
         hotkeyWithEnter = settings.configuredEnterHotkey
+        speechModelProfile = settings.speechModelProfile
         recordingColor = settings.recordingHUDRecordingColor
         transcribingColor = settings.recordingHUDTranscribingColor
         backgroundStyle = settings.recordingHUDBackgroundStyle
@@ -19549,10 +20571,149 @@ private enum ControlPanelUpdateState: Equatable, Sendable {
     case failed(String)
 }
 
+private struct SavedDictationTranscript {
+    let url: URL
+    let text: String
+    let date: Date
+}
+
+private struct SavedDictationArchiveSnapshot {
+    let transcripts: [SavedDictationTranscript]
+    let totalTranscriptCount: Int
+    let failedAudioCount: Int
+    let pendingAudioCount: Int
+}
+
+private func savedDictationArchiveSnapshot(transcriptsDirectory: URL,
+                                           failedAudioDirectory: URL,
+                                           pendingAudioDirectory: URL,
+                                           maximumLoadedTranscripts: Int = 200) -> SavedDictationArchiveSnapshot {
+    let fm = FileManager.default
+
+    func regularFiles(in directory: URL, extension fileExtension: String) -> [URL] {
+        guard let urls = try? fm.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: [
+                .isRegularFileKey,
+                .isSymbolicLinkKey,
+                .contentModificationDateKey,
+                .creationDateKey,
+                .fileSizeKey,
+            ],
+            options: [.skipsHiddenFiles]
+        ) else { return [] }
+        return urls.filter { url in
+            guard url.pathExtension.caseInsensitiveCompare(fileExtension) == .orderedSame,
+                  let values = try? url.resourceValues(forKeys: [
+                    .isRegularFileKey,
+                    .isSymbolicLinkKey,
+                  ]) else { return false }
+            return values.isRegularFile == true && values.isSymbolicLink != true
+        }
+    }
+
+    let transcriptURLs = regularFiles(in: transcriptsDirectory, extension: "txt")
+        .sorted { lhs, rhs in
+            let leftValues = try? lhs.resourceValues(forKeys: [
+                .contentModificationDateKey,
+                .creationDateKey,
+            ])
+            let rightValues = try? rhs.resourceValues(forKeys: [
+                .contentModificationDateKey,
+                .creationDateKey,
+            ])
+            let left = leftValues?.contentModificationDate
+                ?? leftValues?.creationDate
+                ?? .distantPast
+            let right = rightValues?.contentModificationDate
+                ?? rightValues?.creationDate
+                ?? .distantPast
+            return left > right
+        }
+
+    let loadLimit = max(0, maximumLoadedTranscripts)
+    let transcripts = transcriptURLs.prefix(loadLimit).compactMap { url -> SavedDictationTranscript? in
+        guard let values = try? url.resourceValues(forKeys: [
+            .contentModificationDateKey,
+            .creationDateKey,
+            .fileSizeKey,
+        ]),
+        let fileSize = values.fileSize,
+        fileSize >= 0,
+        fileSize <= 5 * 1024 * 1024,
+        let text = try? String(contentsOf: url, encoding: .utf8) else { return nil }
+        let cleaned = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleaned.isEmpty else { return nil }
+        return SavedDictationTranscript(
+            url: url,
+            text: cleaned,
+            date: values.contentModificationDate ?? values.creationDate ?? .distantPast
+        )
+    }
+
+    return SavedDictationArchiveSnapshot(
+        transcripts: transcripts,
+        totalTranscriptCount: transcriptURLs.count,
+        failedAudioCount: regularFiles(in: failedAudioDirectory, extension: "wav").count,
+        pendingAudioCount: regularFiles(in: pendingAudioDirectory, extension: "sdaudio").count
+    )
+}
+
+private final class SavedTranscriptCopyButton: NSButton {
+    let transcriptText: String
+
+    init(title: String,
+         transcriptText: String,
+         target: AnyObject?,
+         action: Selector?) {
+        self.transcriptText = transcriptText
+        super.init(frame: .zero)
+        self.title = title
+        self.target = target
+        self.action = action
+        bezelStyle = .rounded
+        controlSize = .small
+        setContentHuggingPriority(.required, for: .horizontal)
+    }
+
+    required init?(coder: NSCoder) {
+        nil
+    }
+}
+
+private final class SavedTranscriptActionButton: NSButton {
+    let transcript: SavedDictationTranscript
+
+    init(title: String,
+         transcript: SavedDictationTranscript,
+         target: AnyObject?,
+         action: Selector?) {
+        self.transcript = transcript
+        super.init(frame: .zero)
+        self.title = title
+        self.target = target
+        self.action = action
+        bezelStyle = .rounded
+        controlSize = .small
+        setContentHuggingPriority(.required, for: .horizontal)
+    }
+
+    required init?(coder: NSCoder) {
+        nil
+    }
+}
+
+private final class FlippedArchiveStackView: NSStackView {
+    override var isFlipped: Bool { true }
+}
+
 @MainActor
 private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var window: NSWindow?
     private var settingsWindow: NSWindow?
+    private var modelWindow: NSWindow?
+    private var savedDictationsWindow: NSWindow?
+    private var savedDictationDetailWindow: NSWindow?
     private var refreshTimer: Timer?
     private var serviceOperation: ControlPanelServiceOperation?
     private var updateTask: Task<Void, Never>?
@@ -19561,19 +20722,27 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
     private let settings = Settings.shared
     private var permissionClickCount: [Permission: Int] = [:]
     private var settingsDraft: ControlPanelSettingsDraft?
+    // A normal Dock/Cmd-Q termination is the user's explicit request to stop
+    // MyDictate completely, including its separate LaunchAgent. Internal
+    // hand-offs (opening a second panel or installing an update) opt out.
+    private var stopAgentWhenControlPanelTerminates = true
 
     private var language: InterfaceLanguage { settings.interfaceLanguage }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
+        settings.enableMyDictateUpdatesIfNeeded()
         if SuperDictateControlPanelRegistry.activateExistingPanelIfPresent() {
+            stopAgentWhenControlPanelTerminates = false
             NSApp.terminate(nil)
             return
         }
         SuperDictateControlPanelRegistry.claimCurrentPanel()
         showWindow()
         startRefreshTimer()
-        checkForUpdates()
+        if UPDATE_FEATURE_ENABLED {
+            checkForUpdates()
+        }
         if settings.agentEnabled && !SuperDictateAgentService.isAgentRunning() {
             beginServiceOperation(.starting)
         }
@@ -19584,13 +20753,21 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         return true
     }
 
-    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+    // Closing the red window button keeps the control panel alive in the Dock.
+    // Clicking its Dock icon calls applicationShouldHandleReopen and restores
+    // the same window. Only an explicit Quit terminates the application.
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
 
     func applicationWillTerminate(_ notification: Notification) {
         refreshTimer?.invalidate()
         refreshTimer = nil
         updateTask?.cancel()
         updateTask = nil
+        if stopAgentWhenControlPanelTerminates,
+           SuperDictateAgentService.isAgentRunning() {
+            SuperDictateAgentService.stop()
+            log("control panel quit: background dictation service stopped")
+        }
         SuperDictateControlPanelRegistry.clearCurrentPanel()
     }
 
@@ -19601,10 +20778,29 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             settingsDraft = nil
             return
         }
+        if closingWindow === modelWindow {
+            modelWindow = nil
+            return
+        }
+        if closingWindow === savedDictationsWindow {
+            savedDictationDetailWindow?.close()
+            savedDictationDetailWindow = nil
+            savedDictationsWindow = nil
+            return
+        }
+        if closingWindow === savedDictationDetailWindow {
+            savedDictationDetailWindow = nil
+            return
+        }
         if closingWindow === window {
             settingsWindow?.orderOut(nil)
             settingsWindow = nil
-            NSApp.terminate(nil)
+            modelWindow?.orderOut(nil)
+            modelWindow = nil
+            savedDictationsWindow?.orderOut(nil)
+            savedDictationsWindow = nil
+            savedDictationDetailWindow?.orderOut(nil)
+            savedDictationDetailWindow = nil
         }
     }
 
@@ -19620,13 +20816,13 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             return
         }
 
-        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 520, height: 310),
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 520, height: 332),
                               styleMask: [.titled, .closable, .miniaturizable],
                               backing: .buffered,
                               defer: false)
-        window.title = "SuperDictate"
-        window.contentMinSize = NSSize(width: 520, height: 310)
-        window.contentMaxSize = NSSize(width: 520, height: 310)
+        window.title = "MyDictate"
+        window.contentMinSize = NSSize(width: 520, height: 332)
+        window.contentMaxSize = NSSize(width: 520, height: 332)
         window.isReleasedWhenClosed = false
         window.delegate = self
         self.window = window
@@ -19655,18 +20851,31 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         let fingerprint = renderFingerprint()
         guard force || fingerprint != lastRenderFingerprint else { return }
         lastRenderFingerprint = fingerprint
-        resizeCompactPanel(window)
-        window.title = t("SuperDictate — панель управления", "SuperDictate — Control Panel")
+        window.title = t("MyDictate — панель управления", "MyDictate — Control Panel")
         window.contentView = makeContentView()
+        // Replacing the content view can make AppKit adopt its fitting width.
+        // Enforce the compact panel size afterwards so long transient status
+        // messages never widen the main window while switching models.
+        resizeCompactPanel(window)
         if let settingsWindow, settingsWindow.isVisible {
-            settingsWindow.title = t("Настройки SuperDictate", "SuperDictate Settings")
+            settingsWindow.title = t("Настройки MyDictate", "MyDictate Settings")
             settingsWindow.contentView = makeSettingsContentView()
+        }
+        if let modelWindow, modelWindow.isVisible {
+            modelWindow.title = t("Модели распознавания", "Speech Recognition Models")
+            modelWindow.contentView = makeModelSelectionContentView()
+        }
+        if let savedDictationsWindow, savedDictationsWindow.isVisible {
+            savedDictationsWindow.title = t("Сохранённые диктовки", "Saved Dictations")
+            savedDictationsWindow.contentView = makeSavedDictationsContentView()
+            resizeSavedDictationsWindow(savedDictationsWindow)
         }
     }
 
     private func resizeCompactPanel(_ window: NSWindow) {
         let missingCount = Permission.allCases.filter { !Permissions.isGranted($0) }.count
-        let height = CGFloat(310 + max(0, missingCount - 1) * 28)
+        let baseHeight: CGFloat = UPDATE_FEATURE_ENABLED ? 366 : 306
+        let height = baseHeight + CGFloat(missingCount) * 28
         let oldTop = window.frame.maxY
         let size = NSSize(width: 520, height: height)
         window.contentMinSize = size
@@ -19697,11 +20906,13 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                 permissions,
                 settings.configuredHotkey.name,
                 settings.configuredEnterHotkey.name,
+                settings.speechModelProfile.rawValue,
                 settings.triggerMode.rawValue,
                 settings.recordingHUDRecordingColor.rawValue,
                 settings.recordingHUDTranscribingColor.rawValue,
                 settings.recordingHUDBackgroundStyle.rawValue,
                 settings.recordingHUDSize.rawValue,
+                savedDictationArchiveFingerprint(),
                 permissionClickCount.description].joined(separator: "::")
     }
 
@@ -19720,6 +20931,30 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         }
     }
 
+    private func currentSavedDictationSnapshot(maximumLoadedTranscripts: Int = 200) -> SavedDictationArchiveSnapshot {
+        guard let transcripts = try? DictationArchive.transcriptsDirectoryURL(),
+              let failedAudio = try? DictationArchive.failedAudioDirectoryURL(),
+              let pendingAudio = try? DictationArchive.pendingAudioDirectoryURL() else {
+            return SavedDictationArchiveSnapshot(
+                transcripts: [],
+                totalTranscriptCount: 0,
+                failedAudioCount: 0,
+                pendingAudioCount: 0
+            )
+        }
+        return savedDictationArchiveSnapshot(
+            transcriptsDirectory: transcripts,
+            failedAudioDirectory: failedAudio,
+            pendingAudioDirectory: pendingAudio,
+            maximumLoadedTranscripts: maximumLoadedTranscripts
+        )
+    }
+
+    private func savedDictationArchiveFingerprint() -> String {
+        let snapshot = currentSavedDictationSnapshot(maximumLoadedTranscripts: 0)
+        return "\(snapshot.totalTranscriptCount):\(snapshot.failedAudioCount):\(snapshot.pendingAudioCount)"
+    }
+
     private func makeContentView() -> NSView {
         let root = NSStackView()
         root.orientation = .vertical
@@ -19730,8 +20965,11 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
 
         root.addArrangedSubview(compactHeaderView())
         root.addArrangedSubview(compactServiceCard())
+        root.addArrangedSubview(compactQuickAccessRow())
+        if UPDATE_FEATURE_ENABLED {
+            root.addArrangedSubview(compactUpdateCard())
+        }
         root.addArrangedSubview(compactPermissionsCard())
-        root.addArrangedSubview(compactUpdateCard())
         root.addArrangedSubview(compactPrivacyFooter())
 
         let background = NSVisualEffectView()
@@ -19755,6 +20993,498 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         return background
     }
 
+    private func makeModelSelectionContentView() -> NSView {
+        let root = NSStackView()
+        root.orientation = .vertical
+        root.alignment = .leading
+        root.spacing = 11
+        root.edgeInsets = NSEdgeInsets(top: 22, left: 22, bottom: 18, right: 22)
+        root.translatesAutoresizingMaskIntoConstraints = false
+
+        let header = NSStackView()
+        header.orientation = .horizontal
+        header.alignment = .centerY
+        header.spacing = 12
+        header.addArrangedSubview(panelSymbol("cpu",
+                                              color: .systemBlue,
+                                              description: nil,
+                                              pointSize: 24))
+        let headerText = NSStackView()
+        headerText.orientation = .vertical
+        headerText.alignment = .leading
+        headerText.spacing = 2
+        headerText.addArrangedSubview(panelLabel(
+            t("Модель распознавания", "Speech recognition model"),
+            size: 20,
+            weight: .semibold
+        ))
+        headerText.addArrangedSubview(panelLabel(
+            serviceOperation == nil
+                ? t("Выберите модель — MyDictate переключится автоматически.",
+                    "Choose a model — MyDictate switches automatically.")
+                : t("Переключаю модель и перезапускаю фоновую службу…",
+                    "Switching model and restarting the background service…"),
+            size: 11.5,
+            color: serviceOperation == nil ? .secondaryLabelColor : .systemBlue
+        ))
+        header.addArrangedSubview(headerText)
+        header.addArrangedSubview(NSView())
+        root.addArrangedSubview(header)
+        root.addArrangedSubview(separator())
+
+        for profile in SpeechModelProfile.allCases where profile.isProductionSupported {
+            let card = modelChoiceCard(profile)
+            root.addArrangedSubview(card)
+            card.widthAnchor.constraint(equalTo: root.widthAnchor,
+                                        constant: -(root.edgeInsets.left + root.edgeInsets.right)).isActive = true
+        }
+
+        let footer = NSStackView()
+        footer.orientation = .horizontal
+        footer.alignment = .centerY
+        footer.spacing = 10
+        footer.addArrangedSubview(panelLabel(
+            t("Первое включение новой модели может потребовать загрузки.",
+              "The first use of a model may require a download."),
+            size: 10.5,
+            color: .tertiaryLabelColor
+        ))
+        footer.addArrangedSubview(NSView())
+        footer.addArrangedSubview(panelButton(
+            t("Закрыть", "Close"),
+            action: #selector(closeModelSelectionClicked(_:))
+        ))
+        root.addArrangedSubview(footer)
+
+        let background = NSVisualEffectView()
+        background.material = .underWindowBackground
+        background.blendingMode = .behindWindow
+        background.state = .active
+        background.addSubview(root)
+        NSLayoutConstraint.activate([
+            root.leadingAnchor.constraint(equalTo: background.leadingAnchor),
+            root.trailingAnchor.constraint(equalTo: background.trailingAnchor),
+            root.topAnchor.constraint(equalTo: background.topAnchor),
+            root.bottomAnchor.constraint(equalTo: background.bottomAnchor),
+            header.widthAnchor.constraint(equalTo: root.widthAnchor,
+                                          constant: -(root.edgeInsets.left + root.edgeInsets.right)),
+            footer.widthAnchor.constraint(equalTo: root.widthAnchor,
+                                          constant: -(root.edgeInsets.left + root.edgeInsets.right)),
+        ])
+        return background
+    }
+
+    private func modelChoiceCard(_ profile: SpeechModelProfile) -> NSView {
+        let selected = profile == settings.speechModelProfile
+        let card = compactCard()
+        card.layer?.cornerRadius = 11
+        card.layer?.backgroundColor = selected
+            ? NSColor.systemBlue.withAlphaComponent(0.11).cgColor
+            : NSColor.controlBackgroundColor.withAlphaComponent(0.72).cgColor
+        card.layer?.borderColor = selected
+            ? NSColor.systemBlue.withAlphaComponent(0.75).cgColor
+            : NSColor.separatorColor.withAlphaComponent(0.42).cgColor
+        card.layer?.borderWidth = selected ? 1.5 : 1
+
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 12
+        row.translatesAutoresizingMaskIntoConstraints = false
+        row.addArrangedSubview(panelSymbol(selected ? "checkmark.circle.fill" : "circle",
+                                           color: selected ? .systemBlue : .tertiaryLabelColor,
+                                           description: nil,
+                                           pointSize: 19))
+
+        let text = NSStackView()
+        text.orientation = .vertical
+        text.alignment = .leading
+        text.spacing = 3
+        text.addArrangedSubview(panelLabel(localizedSpeechModelName(profile),
+                                           size: 13,
+                                           weight: .semibold))
+        let detail = panelLabel(localizedSpeechModelDetail(profile),
+                                size: 11,
+                                color: .secondaryLabelColor)
+        detail.maximumNumberOfLines = 2
+        detail.lineBreakMode = .byWordWrapping
+        text.addArrangedSubview(detail)
+        row.addArrangedSubview(text)
+        row.addArrangedSubview(NSView())
+
+        let badge = panelLabel(
+            selected ? t("Текущая", "Current") : t("Выбрать", "Choose"),
+            size: 11,
+            weight: .semibold,
+            color: selected ? .systemBlue : .secondaryLabelColor
+        )
+        badge.setContentHuggingPriority(.required, for: .horizontal)
+        row.addArrangedSubview(badge)
+        pin(row, inside: card, horizontal: 14, vertical: 11)
+
+        if !selected {
+            let button = NSButton(title: "",
+                                  target: self,
+                                  action: #selector(selectQuickSpeechModelClicked(_:)))
+            button.identifier = NSUserInterfaceItemIdentifier(profile.rawValue)
+            button.isBordered = false
+            button.isTransparent = true
+            button.isEnabled = serviceOperation == nil
+            button.setAccessibilityLabel(t("Выбрать \(localizedSpeechModelName(profile))",
+                                           "Choose \(profile.displayName)"))
+            button.translatesAutoresizingMaskIntoConstraints = false
+            card.addSubview(button)
+            NSLayoutConstraint.activate([
+                button.leadingAnchor.constraint(equalTo: card.leadingAnchor),
+                button.trailingAnchor.constraint(equalTo: card.trailingAnchor),
+                button.topAnchor.constraint(equalTo: card.topAnchor),
+                button.bottomAnchor.constraint(equalTo: card.bottomAnchor),
+            ])
+        }
+        return card
+    }
+
+    private func makeSavedDictationsContentView() -> NSView {
+        let snapshot = currentSavedDictationSnapshot()
+        let root = NSStackView()
+        root.orientation = .vertical
+        root.alignment = .leading
+        root.spacing = 12
+        root.edgeInsets = NSEdgeInsets(top: 20, left: 20, bottom: 16, right: 20)
+        root.translatesAutoresizingMaskIntoConstraints = false
+
+        let header = NSStackView()
+        header.orientation = .horizontal
+        header.alignment = .centerY
+        header.spacing = 12
+        header.addArrangedSubview(panelSymbol("doc.on.doc.fill",
+                                              color: .systemPurple,
+                                              description: nil,
+                                              pointSize: 24))
+        let headerText = NSStackView()
+        headerText.orientation = .vertical
+        headerText.alignment = .leading
+        headerText.spacing = 2
+        headerText.addArrangedSubview(panelLabel(t("Сохранённые диктовки", "Saved dictations"),
+                                                 size: 20,
+                                                 weight: .semibold))
+        let archiveSummary = panelLabel(
+            t("\(snapshot.totalTranscriptCount) текстов · \(snapshot.failedAudioCount) аудио после ошибок · \(snapshot.pendingAudioCount) ожидают повтора",
+              "\(snapshot.totalTranscriptCount) texts · \(snapshot.failedAudioCount) failed audio · \(snapshot.pendingAudioCount) awaiting retry"),
+            size: 11.5,
+            color: .secondaryLabelColor
+        )
+        archiveSummary.maximumNumberOfLines = 1
+        archiveSummary.lineBreakMode = .byTruncatingTail
+        archiveSummary.preferredMaxLayoutWidth = 420
+        archiveSummary.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        archiveSummary.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        headerText.addArrangedSubview(archiveSummary)
+        header.addArrangedSubview(headerText)
+        header.addArrangedSubview(NSView())
+        let openFolder = panelButton(t("Открыть папку", "Open Folder"),
+                                     action: #selector(openSavedDictationsFolderClicked(_:)),
+                                     toolTip: t("Показать все файлы в Finder",
+                                                "Show all files in Finder"))
+        openFolder.controlSize = .small
+        openFolder.image = NSImage(systemSymbolName: "folder",
+                                   accessibilityDescription: nil)
+        openFolder.imagePosition = .imageLeading
+        header.addArrangedSubview(openFolder)
+        root.addArrangedSubview(header)
+        root.addArrangedSubview(separator())
+
+        let scroll = NSScrollView()
+        scroll.hasVerticalScroller = true
+        scroll.hasHorizontalScroller = false
+        scroll.autohidesScrollers = true
+        scroll.horizontalScrollElasticity = .none
+        scroll.drawsBackground = false
+        scroll.borderType = .noBorder
+        let list = FlippedArchiveStackView()
+        list.orientation = .vertical
+        list.alignment = .leading
+        list.spacing = 8
+        list.edgeInsets = NSEdgeInsets(top: 2, left: 2, bottom: 6, right: 8)
+        list.translatesAutoresizingMaskIntoConstraints = false
+        scroll.documentView = list
+        NSLayoutConstraint.activate([
+            list.leadingAnchor.constraint(equalTo: scroll.contentView.leadingAnchor),
+            list.trailingAnchor.constraint(equalTo: scroll.contentView.trailingAnchor),
+            list.topAnchor.constraint(equalTo: scroll.contentView.topAnchor),
+            list.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor),
+        ])
+
+        if snapshot.transcripts.isEmpty {
+            let empty = savedDictationsEmptyView()
+            list.addArrangedSubview(empty)
+            empty.widthAnchor.constraint(equalTo: list.widthAnchor,
+                                         constant: -(list.edgeInsets.left + list.edgeInsets.right)).isActive = true
+        } else {
+            for transcript in snapshot.transcripts {
+                let row = savedTranscriptCard(transcript)
+                list.addArrangedSubview(row)
+                row.widthAnchor.constraint(equalTo: list.widthAnchor,
+                                           constant: -(list.edgeInsets.left + list.edgeInsets.right)).isActive = true
+            }
+        }
+        root.addArrangedSubview(scroll)
+
+        let footer = NSStackView()
+        footer.orientation = .horizontal
+        footer.alignment = .centerY
+        footer.spacing = 9
+        let loadedCount = snapshot.transcripts.count
+        let footerText: String
+        if snapshot.totalTranscriptCount > loadedCount {
+            footerText = t("Показаны последние \(loadedCount) из \(snapshot.totalTranscriptCount). Все файлы доступны в папке.",
+                           "Showing the latest \(loadedCount) of \(snapshot.totalTranscriptCount). All files remain in the folder.")
+        } else {
+            footerText = t("Текст сохраняется до вставки и остаётся здесь без ограничения срока.",
+                           "Text is saved before pasting and remains here until you delete it.")
+        }
+        let footerLabel = panelLabel(footerText,
+                                     size: 10.5,
+                                     color: .tertiaryLabelColor)
+        footerLabel.maximumNumberOfLines = 1
+        footerLabel.lineBreakMode = .byTruncatingTail
+        footerLabel.preferredMaxLayoutWidth = 420
+        footerLabel.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        footerLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        footer.addArrangedSubview(footerLabel)
+        footer.addArrangedSubview(NSView())
+        if snapshot.failedAudioCount + snapshot.pendingAudioCount > 0 {
+            let audio = panelButton(
+                t("Аудио после ошибок", "Error Audio"),
+                action: #selector(openFailedAudioFolderClicked(_:)),
+                toolTip: t("Открыть WAV и ожидающие повторного распознавания записи",
+                           "Open WAV files and recordings awaiting another recognition attempt")
+            )
+            audio.controlSize = .small
+            footer.addArrangedSubview(audio)
+        }
+        footer.addArrangedSubview(panelButton(t("Закрыть", "Close"),
+                                              action: #selector(closeSavedDictationsClicked(_:))))
+        root.addArrangedSubview(footer)
+
+        let background = NSVisualEffectView()
+        background.material = .underWindowBackground
+        background.blendingMode = .behindWindow
+        background.state = .active
+        background.addSubview(root)
+        NSLayoutConstraint.activate([
+            root.leadingAnchor.constraint(equalTo: background.leadingAnchor),
+            root.trailingAnchor.constraint(equalTo: background.trailingAnchor),
+            root.topAnchor.constraint(equalTo: background.topAnchor),
+            root.bottomAnchor.constraint(equalTo: background.bottomAnchor),
+            header.widthAnchor.constraint(equalTo: root.widthAnchor,
+                                          constant: -(root.edgeInsets.left + root.edgeInsets.right)),
+            scroll.widthAnchor.constraint(equalTo: root.widthAnchor,
+                                          constant: -(root.edgeInsets.left + root.edgeInsets.right)),
+            scroll.heightAnchor.constraint(equalToConstant: 310),
+            footer.widthAnchor.constraint(equalTo: root.widthAnchor,
+                                          constant: -(root.edgeInsets.left + root.edgeInsets.right)),
+        ])
+        return background
+    }
+
+    private func savedTranscriptCard(_ transcript: SavedDictationTranscript) -> NSView {
+        let card = compactCard()
+        card.layer?.cornerRadius = 10
+        let content = NSStackView()
+        content.orientation = .vertical
+        content.alignment = .leading
+        content.spacing = 6
+        content.translatesAutoresizingMaskIntoConstraints = false
+
+        let top = NSStackView()
+        top.orientation = .horizontal
+        top.alignment = .centerY
+        top.spacing = 10
+        let date = panelLabel(savedTranscriptDateText(transcript.date),
+                              size: 10.5,
+                              weight: .medium,
+                              color: .secondaryLabelColor)
+        top.addArrangedSubview(date)
+        top.addArrangedSubview(NSView())
+        let reveal = SavedTranscriptActionButton(
+            title: "",
+            transcript: transcript,
+            target: self,
+            action: #selector(revealSavedTranscriptInFinderClicked(_:))
+        )
+        reveal.image = NSImage(systemSymbolName: "folder", accessibilityDescription: nil)
+        reveal.imagePosition = .imageOnly
+        reveal.toolTip = t("Показать файл в Finder", "Show this file in Finder")
+        reveal.setAccessibilityLabel(t("Показать файл в Finder", "Show this file in Finder"))
+        top.addArrangedSubview(reveal)
+        let open = SavedTranscriptActionButton(
+            title: t("Открыть", "Open"),
+            transcript: transcript,
+            target: self,
+            action: #selector(openSavedTranscriptClicked(_:))
+        )
+        open.toolTip = t("Открыть полный текст в небольшом окне", "Open the full text in a compact window")
+        top.addArrangedSubview(open)
+        let copy = SavedTranscriptCopyButton(
+            title: t("Копировать", "Copy"),
+            transcriptText: transcript.text,
+            target: self,
+            action: #selector(copySavedTranscriptClicked(_:))
+        )
+        copy.image = NSImage(systemSymbolName: "doc.on.doc", accessibilityDescription: nil)
+        copy.imagePosition = .imageLeading
+        copy.toolTip = t("Скопировать весь текст, а не только предпросмотр",
+                         "Copy the complete text, not only the preview")
+        top.addArrangedSubview(copy)
+        content.addArrangedSubview(top)
+        top.widthAnchor.constraint(equalTo: content.widthAnchor).isActive = true
+
+        let preview = panelLabel(transcript.text, size: 12, color: .labelColor)
+        preview.maximumNumberOfLines = 2
+        preview.lineBreakMode = .byTruncatingTail
+        preview.preferredMaxLayoutWidth = 540
+        preview.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        preview.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        preview.toolTip = t("Откройте запись, чтобы посмотреть полный текст", "Open to view the full text")
+        content.addArrangedSubview(preview)
+        preview.widthAnchor.constraint(equalTo: content.widthAnchor).isActive = true
+        pin(content, inside: card, horizontal: 13, vertical: 10)
+        return card
+    }
+
+    private func makeSavedTranscriptDetailContentView(_ transcript: SavedDictationTranscript) -> NSView {
+        let root = NSStackView()
+        root.orientation = .vertical
+        root.alignment = .leading
+        root.spacing = 10
+        root.edgeInsets = NSEdgeInsets(top: 18, left: 20, bottom: 16, right: 20)
+        root.translatesAutoresizingMaskIntoConstraints = false
+
+        let header = NSStackView()
+        header.orientation = .vertical
+        header.alignment = .leading
+        header.spacing = 2
+        header.addArrangedSubview(panelLabel(t("Сохранённая диктовка", "Saved Dictation"),
+                                             size: 17,
+                                             weight: .semibold))
+        header.addArrangedSubview(panelLabel(savedTranscriptDateText(transcript.date),
+                                             size: 11,
+                                             color: .secondaryLabelColor))
+        root.addArrangedSubview(header)
+        root.addArrangedSubview(separator())
+
+        let textView = NSTextView(frame: NSRect(x: 0, y: 0, width: 600, height: 280))
+        textView.string = transcript.text
+        textView.font = .systemFont(ofSize: 13)
+        textView.textColor = .labelColor
+        textView.backgroundColor = .clear
+        textView.isEditable = false
+        textView.isSelectable = true
+        textView.isRichText = false
+        textView.textContainerInset = NSSize(width: 8, height: 8)
+        textView.minSize = NSSize(width: 0, height: 280)
+        textView.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude,
+                                  height: CGFloat.greatestFiniteMagnitude)
+        textView.isVerticallyResizable = true
+        textView.isHorizontallyResizable = false
+        textView.autoresizingMask = [.width]
+        textView.textContainer?.widthTracksTextView = true
+        textView.textContainer?.containerSize = NSSize(width: 600,
+                                                       height: CGFloat.greatestFiniteMagnitude)
+
+        let scroll = NSScrollView()
+        scroll.documentView = textView
+        scroll.hasVerticalScroller = true
+        scroll.hasHorizontalScroller = false
+        scroll.autohidesScrollers = true
+        scroll.borderType = .bezelBorder
+        root.addArrangedSubview(scroll)
+
+        let footer = NSStackView()
+        footer.orientation = .horizontal
+        footer.alignment = .centerY
+        footer.spacing = 8
+        footer.addArrangedSubview(NSView())
+        let reveal = SavedTranscriptActionButton(
+            title: t("Показать в Finder", "Show in Finder"),
+            transcript: transcript,
+            target: self,
+            action: #selector(revealSavedTranscriptInFinderClicked(_:))
+        )
+        reveal.image = NSImage(systemSymbolName: "folder", accessibilityDescription: nil)
+        reveal.imagePosition = .imageLeading
+        footer.addArrangedSubview(reveal)
+        let copy = SavedTranscriptCopyButton(
+            title: t("Копировать", "Copy"),
+            transcriptText: transcript.text,
+            target: self,
+            action: #selector(copySavedTranscriptClicked(_:))
+        )
+        copy.image = NSImage(systemSymbolName: "doc.on.doc", accessibilityDescription: nil)
+        copy.imagePosition = .imageLeading
+        footer.addArrangedSubview(copy)
+        footer.addArrangedSubview(panelButton(t("Закрыть", "Close"),
+                                              action: #selector(closeSavedTranscriptDetailClicked(_:))))
+        root.addArrangedSubview(footer)
+
+        let background = NSVisualEffectView()
+        background.material = .underWindowBackground
+        background.blendingMode = .behindWindow
+        background.state = .active
+        background.addSubview(root)
+        NSLayoutConstraint.activate([
+            root.leadingAnchor.constraint(equalTo: background.leadingAnchor),
+            root.trailingAnchor.constraint(equalTo: background.trailingAnchor),
+            root.topAnchor.constraint(equalTo: background.topAnchor),
+            root.bottomAnchor.constraint(equalTo: background.bottomAnchor),
+            header.widthAnchor.constraint(equalTo: root.widthAnchor,
+                                          constant: -(root.edgeInsets.left + root.edgeInsets.right)),
+            scroll.widthAnchor.constraint(equalTo: root.widthAnchor,
+                                         constant: -(root.edgeInsets.left + root.edgeInsets.right)),
+            scroll.heightAnchor.constraint(equalToConstant: 280),
+            footer.widthAnchor.constraint(equalTo: root.widthAnchor,
+                                          constant: -(root.edgeInsets.left + root.edgeInsets.right)),
+        ])
+        return background
+    }
+
+    private func savedDictationsEmptyView() -> NSView {
+        let container = NSView()
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .centerX
+        stack.spacing = 8
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        stack.addArrangedSubview(panelSymbol("doc.text",
+                                             color: .tertiaryLabelColor,
+                                             description: nil,
+                                             pointSize: 30))
+        stack.addArrangedSubview(panelLabel(t("Пока нет сохранённых диктовок",
+                                             "No saved dictations yet"),
+                                            size: 14,
+                                            weight: .semibold,
+                                            color: .secondaryLabelColor))
+        let detail = panelLabel(
+            t("После следующей диктовки полный текст появится здесь до попытки вставки.",
+              "After your next dictation, the complete text will appear here before MyDictate attempts to paste it."),
+            size: 11.5,
+            color: .tertiaryLabelColor
+        )
+        detail.alignment = .center
+        detail.preferredMaxLayoutWidth = 420
+        stack.addArrangedSubview(detail)
+        container.addSubview(stack)
+        NSLayoutConstraint.activate([
+            container.heightAnchor.constraint(greaterThanOrEqualToConstant: 240),
+            stack.centerXAnchor.constraint(equalTo: container.centerXAnchor),
+            stack.centerYAnchor.constraint(equalTo: container.centerYAnchor),
+            stack.leadingAnchor.constraint(greaterThanOrEqualTo: container.leadingAnchor, constant: 24),
+            stack.trailingAnchor.constraint(lessThanOrEqualTo: container.trailingAnchor, constant: -24),
+        ])
+        return container
+    }
+
     private func makeSettingsContentView() -> NSView {
         let draft = settingsDraft ?? ControlPanelSettingsDraft(settings: settings)
         let root = NSStackView()
@@ -19765,6 +21495,19 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         root.translatesAutoresizingMaskIntoConstraints = false
 
         root.addArrangedSubview(settingsHeaderView())
+        root.addArrangedSubview(separator())
+        root.addArrangedSubview(popupRow(
+            title: t("Модель распознавания", "Speech recognition model"),
+            detail: t("Локальная модель. При первом выборе она загрузится; затем работает без облака.",
+                      "Local model. It downloads on first use, then runs without the cloud."),
+            selectedValue: draft.speechModelProfile.rawValue,
+            options: SpeechModelProfile.allCases
+                .filter(\.isProductionSupported)
+                .map { (localizedSpeechModelName($0), $0.rawValue) },
+            action: #selector(selectSpeechModelProfile(_:)),
+            toolTip: t("Выберите модель и нажмите «Сохранить и перезапустить».",
+                       "Choose a model, then click Save & Restart.")
+        ))
         root.addArrangedSubview(separator())
         root.addArrangedSubview(statusRow(
             title: t("Диктовка без Enter", "Dictation without Enter"),
@@ -19868,7 +21611,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         text.orientation = .vertical
         text.alignment = .leading
         text.spacing = 1
-        text.addArrangedSubview(panelLabel("SuperDictate", size: 20, weight: .semibold))
+        text.addArrangedSubview(panelLabel("MyDictate", size: 20, weight: .semibold))
         text.addArrangedSubview(panelLabel(
             t("Локальная диктовка · работает в фоне", "Local dictation · runs in the background"),
             size: 11.5,
@@ -19877,7 +21620,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
 
         let version = panelLabel("v\(currentBundleVersion())", size: 11, color: .tertiaryLabelColor)
         version.setContentHuggingPriority(.required, for: .horizontal)
-        version.toolTip = t("Установленная версия SuperDictate", "Installed SuperDictate version")
+        version.toolTip = t("Установленная версия MyDictate", "Installed MyDictate version")
 
         let languageControl = NSSegmentedControl(labels: ["RU", "EN"],
                                                  trackingMode: .selectOne,
@@ -19895,11 +21638,18 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                        "Open dictation and indicator appearance settings"),
             action: #selector(openSettingsClicked(_:))
         )
+        let helpButton = compactIconButton(
+            symbol: "questionmark.circle",
+            accessibilityTitle: t("Как работает вставка текста", "How text insertion works"),
+            toolTip: t("Куда попадёт текст после диктовки", "Where a completed dictation is inserted"),
+            action: #selector(showDictationHelpClicked(_:))
+        )
 
         row.addArrangedSubview(text)
         row.addArrangedSubview(NSView())
         row.addArrangedSubview(version)
         row.addArrangedSubview(languageControl)
+        row.addArrangedSubview(helpButton)
         row.addArrangedSubview(settingsButton)
         return row
     }
@@ -19946,15 +21696,26 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         text.orientation = .vertical
         text.alignment = .leading
         text.spacing = 2
-        text.addArrangedSubview(panelLabel(presentation.status, size: 14, weight: .semibold))
+        text.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        text.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        let status = panelLabel(presentation.status, size: 14, weight: .semibold)
+        status.maximumNumberOfLines = 1
+        status.lineBreakMode = .byTruncatingTail
+        status.preferredMaxLayoutWidth = 330
+        status.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        status.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        text.addArrangedSubview(status)
         let detail = panelLabel(
-            "\(presentation.detail)\n\(t("Без Enter", "Without Enter")): \(localizedHotkeyName(settings.configuredHotkey, language: language)) · \(t("с Enter", "with Enter")): \(localizedHotkeyName(settings.configuredEnterHotkey, language: language))",
+            "\(presentation.detail) · \(t("Модель", "Model")): \(localizedSpeechModelName(settings.speechModelProfile))\n\(t("Без Enter", "Without Enter")): \(localizedHotkeyName(settings.configuredHotkey, language: language)) · \(t("с Enter", "with Enter")): \(localizedHotkeyName(settings.configuredEnterHotkey, language: language))",
             size: 11.5,
             color: .secondaryLabelColor
         )
         detail.maximumNumberOfLines = 2
         detail.lineBreakMode = .byTruncatingTail
-        detail.toolTip = "\(presentation.detail)\n\(t("Без Enter", "Without Enter")): \(localizedHotkeyName(settings.configuredHotkey, language: language))\n\(t("С Enter", "With Enter")): \(localizedHotkeyName(settings.configuredEnterHotkey, language: language))"
+        detail.preferredMaxLayoutWidth = 330
+        detail.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        detail.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        detail.toolTip = "\(presentation.detail)\n\(t("Модель", "Model")): \(settings.speechModelProfile.aboutModelText)\n\(t("Без Enter", "Without Enter")): \(localizedHotkeyName(settings.configuredHotkey, language: language))\n\(t("С Enter", "With Enter")): \(localizedHotkeyName(settings.configuredEnterHotkey, language: language))"
         text.addArrangedSubview(detail)
 
         let actions = NSStackView()
@@ -19999,6 +21760,44 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         return card
     }
 
+    private func compactQuickAccessRow() -> NSView {
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 10
+
+        let modelCard = dashboardLinkCard(
+            symbol: "cpu",
+            symbolColor: .systemBlue,
+            title: t("Модель распознавания", "Recognition model"),
+            detail: settings.speechModelProfile.shortName,
+            accessibilityTitle: t("Выбрать модель распознавания",
+                                  "Choose recognition model"),
+            action: #selector(openModelSelectionClicked(_:))
+        )
+
+        let snapshot = currentSavedDictationSnapshot(maximumLoadedTranscripts: 0)
+        let recoverableAudioCount = snapshot.failedAudioCount + snapshot.pendingAudioCount
+        let archiveDetail = t(
+            "Текстов: \(snapshot.totalTranscriptCount) · аудио: \(recoverableAudioCount)",
+            "\(snapshot.totalTranscriptCount) texts · \(recoverableAudioCount) audio"
+        )
+        let archiveCard = dashboardLinkCard(
+            symbol: "doc.on.doc.fill",
+            symbolColor: .systemPurple,
+            title: t("Сохранённые диктовки", "Saved dictations"),
+            detail: archiveDetail,
+            accessibilityTitle: t("Открыть сохранённые диктовки",
+                                  "Open saved dictations"),
+            action: #selector(openSavedDictationsClicked(_:))
+        )
+
+        row.addArrangedSubview(modelCard)
+        row.addArrangedSubview(archiveCard)
+        modelCard.widthAnchor.constraint(equalTo: archiveCard.widthAnchor).isActive = true
+        return row
+    }
+
     private func compactPermissionsCard() -> NSView {
         let missing = Permission.allCases.filter { !Permissions.isGranted($0) }
         let card = compactCard()
@@ -20030,22 +21829,16 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         ))
         content.addArrangedSubview(header)
 
-        if missing.isEmpty {
-            let ready = panelLabel(
-                t("Микрофон, вставка текста и глобальный хоткей доступны.",
-                  "Microphone, text insertion, and the global shortcut are available."),
-                size: 11,
-                color: .secondaryLabelColor
-            )
-            ready.toolTip = t("SuperDictate получил все три необходимых разрешения macOS.",
-                              "SuperDictate has all three required macOS permissions.")
-            content.addArrangedSubview(ready)
-        } else {
+        if !missing.isEmpty {
             for permission in missing {
                 content.addArrangedSubview(compactPermissionRow(permission))
             }
         }
-        pin(content, inside: card, horizontal: 13, vertical: 10)
+        pin(content, inside: card, horizontal: 13, vertical: missing.isEmpty ? 8 : 10)
+        card.toolTip = missing.isEmpty
+            ? t("Микрофон, вставка текста и глобальный хоткей доступны.",
+                "Microphone, text insertion, and the global shortcut are available.")
+            : nil
         return card
     }
 
@@ -20125,7 +21918,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                     nil, nil, false, nil)
         case .upToDate:
             return ("checkmark.circle.fill", .systemGreen,
-                    t("SuperDictate актуален", "SuperDictate is up to date"),
+                    t("MyDictate актуален", "MyDictate is up to date"),
                     t("Установлена последняя версия v\(currentBundleVersion())",
                       "Latest version v\(currentBundleVersion()) is installed"),
                     t("Проверить", "Check"), #selector(updateButtonClicked(_:)), true,
@@ -20136,8 +21929,8 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                     t("Скачается, проверится и установится автоматически",
                       "Downloads, verifies, and installs automatically"),
                     t("Обновить", "Update"), #selector(updateButtonClicked(_:)), serviceOperation == nil,
-                    t("Обновить SuperDictate до v\(release.version) одной кнопкой",
-                      "Update SuperDictate to v\(release.version) with one click"))
+                    t("Обновить MyDictate до v\(release.version) одной кнопкой",
+                      "Update MyDictate to v\(release.version) with one click"))
         case .preparing(let version, let phase):
             return ("arrow.down.circle", .systemBlue,
                     t("Обновляю до v\(version)", "Updating to v\(version)"),
@@ -20161,13 +21954,13 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                                            description: nil,
                                            pointSize: 10))
         let label = panelLabel(
-            t("Аудио и распознавание остаются на этом Mac.",
-              "Audio and transcription stay on this Mac."),
+            t("Все распознанные тексты сохраняются на этом Mac.",
+              "Every recognized transcript is saved on this Mac."),
             size: 10.5,
             color: .tertiaryLabelColor
         )
-        label.toolTip = t("Интернет используется только для первой загрузки модели и обновлений.",
-                          "Internet is only used for the first model download and updates.")
+        label.toolTip = t("При ошибке исходное аудио сохраняется для повторного распознавания. Интернет нужен только для первой загрузки модели.",
+                          "After an error, the original audio is retained for another recognition attempt. Internet is only used for the first model download.")
         row.addArrangedSubview(label)
         row.addArrangedSubview(NSView())
         return row
@@ -20178,8 +21971,8 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         case .starting: return t("Запускаю службу диктовки", "Starting dictation service")
         case .restarting: return t("Перезапускаю фоновую службу", "Restarting background service")
         case .stopping: return t("Останавливаю фоновую службу", "Stopping background service")
-        case .applyingSettings: return t("Применяю настройки и перезапускаю службу",
-                                         "Applying settings and restarting service")
+        case .applyingSettings: return t("Сохраняю настройки…",
+                                         "Saving settings…")
         }
     }
 
@@ -20188,9 +21981,12 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         case .starting:
             return t("Подключаю глобальный хоткей и локальную модель. Обычно 1–3 секунды; при первой загрузке дольше.",
                      "Enabling the global shortcut and local model. Usually 1–3 seconds; the first download takes longer.")
-        case .restarting, .applyingSettings:
+        case .restarting:
             return t("Диктовка временно недоступна. Панель не зависла — новый воркер уже запускается.",
                      "Dictation is temporarily unavailable. The panel is responsive while the new worker starts.")
+        case .applyingSettings:
+            return t("Перезапускаю службу. Диктовка временно недоступна.",
+                     "Restarting the service. Dictation is temporarily unavailable.")
         case .stopping:
             return t("Хоткей перестанет работать, но настройки и история сохранятся.",
                      "The shortcut will stop; settings and history remain saved.")
@@ -20257,7 +22053,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         case .httpStatus(let code):
             return "GitHub вернул ошибку HTTP \(code). Повторите попытку позже."
         case .unexpectedResponse:
-            return "GitHub вернул ответ, который SuperDictate не смог проверить."
+            return "GitHub вернул ответ, который MyDictate не смог проверить."
         }
     }
 
@@ -20358,6 +22154,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         }
 
         updateTask = nil
+        stopAgentWhenControlPanelTerminates = false
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
             NSApp.terminate(nil)
         }
@@ -20539,8 +22336,8 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         icon.contentTintColor = .secondaryLabelColor
         row.addArrangedSubview(icon)
         row.addArrangedSubview(panelLabel(
-            t("Аудио и распознавание остаются на Mac. Интернет нужен только для первой загрузки модели и обновлений.",
-              "Audio and transcription stay on this Mac. Internet is only used for the first model download and updates."),
+            t("Аудио и распознавание остаются на Mac. Интернет нужен только для первой загрузки выбранной модели.",
+              "Audio and transcription stay on this Mac. Internet is only used for the first download of the selected model."),
             size: 11.5,
             color: .secondaryLabelColor
         ))
@@ -20603,6 +22400,65 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         card.layer?.borderWidth = 1
         card.setContentHuggingPriority(.required, for: .vertical)
         card.setContentCompressionResistancePriority(.required, for: .vertical)
+        return card
+    }
+
+    private func dashboardLinkCard(symbol: String,
+                                   symbolColor: NSColor,
+                                   title: String,
+                                   detail: String,
+                                   accessibilityTitle: String,
+                                   action: Selector) -> NSView {
+        let card = compactCard()
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 9
+        row.translatesAutoresizingMaskIntoConstraints = false
+
+        row.addArrangedSubview(panelSymbol(symbol,
+                                           color: symbolColor,
+                                           description: accessibilityTitle,
+                                           pointSize: 18))
+        let text = NSStackView()
+        text.orientation = .vertical
+        text.alignment = .leading
+        text.spacing = 1
+        text.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        text.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        let titleLabel = panelLabel(title, size: 11.5, weight: .semibold)
+        titleLabel.maximumNumberOfLines = 1
+        titleLabel.lineBreakMode = .byTruncatingTail
+        titleLabel.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        titleLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        let detailLabel = panelLabel(detail, size: 10.5, color: .secondaryLabelColor)
+        detailLabel.maximumNumberOfLines = 1
+        detailLabel.lineBreakMode = .byTruncatingTail
+        detailLabel.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        detailLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        text.addArrangedSubview(titleLabel)
+        text.addArrangedSubview(detailLabel)
+        row.addArrangedSubview(text)
+        row.addArrangedSubview(NSView())
+        row.addArrangedSubview(panelSymbol("chevron.right",
+                                           color: .tertiaryLabelColor,
+                                           description: nil,
+                                           pointSize: 10))
+        pin(row, inside: card, horizontal: 11, vertical: 9)
+
+        let button = NSButton(title: "", target: self, action: action)
+        button.isBordered = false
+        button.isTransparent = true
+        button.setAccessibilityLabel(accessibilityTitle)
+        button.toolTip = accessibilityTitle
+        button.translatesAutoresizingMaskIntoConstraints = false
+        card.addSubview(button)
+        NSLayoutConstraint.activate([
+            button.leadingAnchor.constraint(equalTo: card.leadingAnchor),
+            button.trailingAnchor.constraint(equalTo: card.trailingAnchor),
+            button.topAnchor.constraint(equalTo: card.topAnchor),
+            button.bottomAnchor.constraint(equalTo: card.bottomAnchor),
+        ])
         return card
     }
 
@@ -20736,6 +22592,46 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         }
     }
 
+    private func localizedSpeechModelName(_ profile: SpeechModelProfile) -> String {
+        guard language == .russian else { return profile.displayName }
+        switch profile {
+        case .whisperLargeV3Turbo:
+            return "Whisper Turbo Full — лучшее качество"
+        case .whisperLargeV3TurboQ5:
+            return "Whisper Turbo Q5 — компактнее и быстрее"
+        case .multilingualV3:
+            return "Parakeet TDT v3 — самый быстрый"
+        case .englishUnified:
+            return "Parakeet Unified — устаревшая"
+        }
+    }
+
+    private func localizedSpeechModelDetail(_ profile: SpeechModelProfile) -> String {
+        switch profile {
+        case .whisperLargeV3Turbo:
+            return t("Максимальная точность для русской речи и английских технических терминов · 1,62 ГБ",
+                     "Best accuracy for multilingual speech and technical terms · 1.62 GB")
+        case .whisperLargeV3TurboQ5:
+            return t("Почти то же качество, компактнее и экономнее по памяти · 574 МБ",
+                     "Nearly the same quality with a smaller model and lower memory use · 574 MB")
+        case .multilingualV3:
+            return t("Самая высокая скорость; слабее на смешанной технической речи · 500–700 МБ",
+                     "Fastest option; less reliable for mixed technical speech · 500–700 MB")
+        case .englishUnified:
+            return t("Устаревшая английская модель", "Deprecated English model")
+        }
+    }
+
+    private func savedTranscriptDateText(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.locale = language == .russian
+            ? Locale(identifier: "ru_RU")
+            : Locale(identifier: "en_US")
+        formatter.dateStyle = .medium
+        formatter.timeStyle = .short
+        return formatter.string(from: date)
+    }
+
     private func beginServiceOperation(_ operation: ControlPanelServiceOperation) {
         guard serviceOperation == nil else { return }
         serviceOperation = operation
@@ -20828,6 +22724,191 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         beginServiceOperation(.stopping)
     }
 
+    @objc private func openModelSelectionClicked(_ sender: NSButton) {
+        _ = settings.refreshFromDisk()
+        if let modelWindow {
+            modelWindow.contentView = makeModelSelectionContentView()
+            modelWindow.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            return
+        }
+
+        let modelWindow = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 620, height: 350),
+            styleMask: [.titled, .closable, .miniaturizable],
+            backing: .buffered,
+            defer: false
+        )
+        modelWindow.title = t("Модели распознавания", "Speech Recognition Models")
+        modelWindow.contentMinSize = NSSize(width: 620, height: 350)
+        modelWindow.contentMaxSize = NSSize(width: 620, height: 350)
+        modelWindow.isReleasedWhenClosed = false
+        modelWindow.delegate = self
+        modelWindow.contentView = makeModelSelectionContentView()
+        positionSecondaryWindow(modelWindow)
+        self.modelWindow = modelWindow
+        modelWindow.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    @objc private func selectQuickSpeechModelClicked(_ sender: NSButton) {
+        guard serviceOperation == nil,
+              let raw = sender.identifier?.rawValue,
+              let profile = SpeechModelProfile(rawValue: raw),
+              profile.isProductionSupported,
+              profile != settings.speechModelProfile else { return }
+
+        settings.speechModelProfile = profile
+        settings.agentEnabled = true
+        if var draft = settingsDraft {
+            draft.speechModelProfile = profile
+            settingsDraft = draft
+        }
+        _ = settings.refreshFromDisk()
+        lastRenderFingerprint = ""
+        beginServiceOperation(.applyingSettings)
+        log("control panel quick model selection: \(profile.shortName)")
+    }
+
+    @objc private func closeModelSelectionClicked(_ sender: NSButton) {
+        modelWindow?.close()
+    }
+
+    @objc private func openSavedDictationsClicked(_ sender: NSButton) {
+        if let savedDictationsWindow {
+            savedDictationsWindow.contentView = makeSavedDictationsContentView()
+            resizeSavedDictationsWindow(savedDictationsWindow)
+            savedDictationsWindow.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            return
+        }
+
+        let savedDictationsWindow = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 650, height: 470),
+            styleMask: [.titled, .closable, .miniaturizable],
+            backing: .buffered,
+            defer: false
+        )
+        savedDictationsWindow.title = t("Сохранённые диктовки", "Saved Dictations")
+        savedDictationsWindow.isReleasedWhenClosed = false
+        savedDictationsWindow.delegate = self
+        savedDictationsWindow.contentView = makeSavedDictationsContentView()
+        resizeSavedDictationsWindow(savedDictationsWindow)
+        positionSecondaryWindow(savedDictationsWindow)
+        self.savedDictationsWindow = savedDictationsWindow
+        savedDictationsWindow.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    private func resizeSavedDictationsWindow(_ savedDictationsWindow: NSWindow) {
+        let size = NSSize(width: 650, height: 470)
+        savedDictationsWindow.contentMinSize = size
+        savedDictationsWindow.contentMaxSize = size
+        savedDictationsWindow.setContentSize(size)
+    }
+
+    @objc private func copySavedTranscriptClicked(_ sender: SavedTranscriptCopyButton) {
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(sender.transcriptText, forType: .string)
+        sender.title = t("Скопировано", "Copied")
+        sender.image = NSImage(systemSymbolName: "checkmark", accessibilityDescription: nil)
+        log("saved transcript copied from archive window (\(sender.transcriptText.count) chars)")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.4) { [weak self, weak sender] in
+            guard let self, let sender, sender.window != nil else { return }
+            sender.title = self.t("Копировать", "Copy")
+            sender.image = NSImage(systemSymbolName: "doc.on.doc", accessibilityDescription: nil)
+        }
+    }
+
+    @objc private func openSavedTranscriptClicked(_ sender: SavedTranscriptActionButton) {
+        if let savedDictationDetailWindow {
+            savedDictationDetailWindow.title = t("Сохранённая диктовка", "Saved Dictation")
+            savedDictationDetailWindow.contentView = makeSavedTranscriptDetailContentView(sender.transcript)
+            resizeSavedTranscriptDetailWindow(savedDictationDetailWindow)
+            savedDictationDetailWindow.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            return
+        }
+
+        let detailWindow = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 650, height: 420),
+            styleMask: [.titled, .closable, .miniaturizable],
+            backing: .buffered,
+            defer: false
+        )
+        detailWindow.title = t("Сохранённая диктовка", "Saved Dictation")
+        detailWindow.isReleasedWhenClosed = false
+        detailWindow.delegate = self
+        detailWindow.contentView = makeSavedTranscriptDetailContentView(sender.transcript)
+        resizeSavedTranscriptDetailWindow(detailWindow)
+        if let archiveWindow = savedDictationsWindow {
+            let frame = archiveWindow.frame
+            detailWindow.setFrameOrigin(NSPoint(x: frame.minX + 22, y: frame.maxY - detailWindow.frame.height - 22))
+        } else {
+            detailWindow.center()
+        }
+        savedDictationDetailWindow = detailWindow
+        detailWindow.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    private func resizeSavedTranscriptDetailWindow(_ detailWindow: NSWindow) {
+        let size = NSSize(width: 650, height: 420)
+        detailWindow.contentMinSize = size
+        detailWindow.contentMaxSize = size
+        detailWindow.setContentSize(size)
+    }
+
+    @objc private func revealSavedTranscriptInFinderClicked(_ sender: SavedTranscriptActionButton) {
+        NSWorkspace.shared.activateFileViewerSelecting([sender.transcript.url])
+    }
+
+    @objc private func openSavedDictationsFolderClicked(_ sender: NSButton) {
+        do {
+            NSWorkspace.shared.open(try DictationArchive.rootDirectoryURL())
+        } catch {
+            showError(title: t("Не удалось открыть папку", "Could Not Open Folder"),
+                      detail: error.localizedDescription)
+        }
+    }
+
+    @objc private func openFailedAudioFolderClicked(_ sender: NSButton) {
+        do {
+            NSWorkspace.shared.open(try DictationArchive.rootDirectoryURL())
+        } catch {
+            showError(title: t("Не удалось открыть папку с аудио",
+                               "Could Not Open Audio Folder"),
+                      detail: error.localizedDescription)
+        }
+    }
+
+    @objc private func closeSavedDictationsClicked(_ sender: NSButton) {
+        savedDictationsWindow?.close()
+    }
+
+    @objc private func closeSavedTranscriptDetailClicked(_ sender: NSButton) {
+        savedDictationDetailWindow?.close()
+    }
+
+    private func positionSecondaryWindow(_ secondary: NSWindow) {
+        guard let mainWindow = window,
+              let visibleFrame = mainWindow.screen?.visibleFrame else {
+            secondary.center()
+            return
+        }
+        let mainFrame = mainWindow.frame
+        let preferredRight = mainFrame.maxX + 14
+        let preferredLeft = mainFrame.minX - secondary.frame.width - 14
+        let x = preferredRight + secondary.frame.width <= visibleFrame.maxX
+            ? preferredRight
+            : max(visibleFrame.minX, preferredLeft)
+        let y = min(max(visibleFrame.minY,
+                        mainFrame.maxY - secondary.frame.height),
+                    visibleFrame.maxY - secondary.frame.height)
+        secondary.setFrameOrigin(NSPoint(x: x, y: y))
+    }
+
     @objc private func openSettingsClicked(_ sender: NSButton) {
         if let settingsWindow {
             settingsWindow.contentView = makeSettingsContentView()
@@ -20839,14 +22920,14 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         settingsDraft = ControlPanelSettingsDraft(settings: settings)
 
         let settingsWindow = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 600, height: 535),
+            contentRect: NSRect(x: 0, y: 0, width: 620, height: 620),
             styleMask: [.titled, .closable, .miniaturizable],
             backing: .buffered,
             defer: false
         )
-        settingsWindow.title = t("Настройки SuperDictate", "SuperDictate Settings")
-        settingsWindow.contentMinSize = NSSize(width: 600, height: 535)
-        settingsWindow.contentMaxSize = NSSize(width: 600, height: 535)
+        settingsWindow.title = t("Настройки MyDictate", "MyDictate Settings")
+        settingsWindow.contentMinSize = NSSize(width: 620, height: 620)
+        settingsWindow.contentMaxSize = NSSize(width: 620, height: 620)
         settingsWindow.isReleasedWhenClosed = false
         settingsWindow.delegate = self
         settingsWindow.contentView = makeSettingsContentView()
@@ -20867,6 +22948,18 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         self.settingsWindow = settingsWindow
         settingsWindow.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+    }
+
+    @objc private func showDictationHelpClicked(_ sender: NSButton) {
+        let alert = NSAlert()
+        alert.alertStyle = .informational
+        alert.messageText = t("Куда вставляется диктовка", "Where dictation is inserted")
+        alert.informativeText = t(
+            "Когда вы начинаете запись, MyDictate запоминает поле ввода. Можно перейти в настройки или другое приложение: после распознавания текст вернётся в исходное поле. Если исходное окно или поле уже закрыто, текст не вставится в другое место — он останется в «Сохранённых диктовках», откуда его можно скопировать или открыть в Finder.",
+            "When recording starts, MyDictate remembers the input field. You can open settings or another app: after transcription, text returns to that original field. If that window or field has been closed, MyDictate will not paste into another place; the text remains in Saved Dictations, where you can copy it or reveal it in Finder."
+        )
+        alert.addButton(withTitle: t("Понятно", "OK"))
+        alert.runModal()
     }
 
     @objc private func recordDictationShortcutClicked(_ sender: NSButton) {
@@ -20938,6 +23031,16 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         refreshSettingsWindow()
     }
 
+    @objc private func selectSpeechModelProfile(_ sender: NSPopUpButton) {
+        guard let raw = sender.selectedItem?.representedObject as? String,
+              let profile = SpeechModelProfile(rawValue: raw),
+              profile.isProductionSupported else { return }
+        var draft = settingsDraft ?? ControlPanelSettingsDraft(settings: settings)
+        draft.speechModelProfile = profile
+        settingsDraft = draft
+        refreshSettingsWindow()
+    }
+
     @objc private func selectRecordingHUDTranscribingColor(_ sender: NSPopUpButton) {
         guard let raw = sender.selectedItem?.representedObject as? String,
               let color = RecordingHUDAccentColor(rawValue: raw) else { return }
@@ -20975,6 +23078,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
               settingsValidationMessage(draft) == nil else { return }
         settings.setConfiguredHotkey(draft.hotkeyWithoutEnter)
         settings.setConfiguredEnterHotkey(draft.hotkeyWithEnter)
+        settings.speechModelProfile = draft.speechModelProfile
         settings.recordingHUDRecordingColor = draft.recordingColor
         settings.recordingHUDTranscribingColor = draft.transcribingColor
         settings.recordingHUDBackgroundStyle = draft.backgroundStyle
@@ -21027,7 +23131,7 @@ let app = NSApplication.shared
 let launchArguments = Array(CommandLine.arguments.dropFirst())
 if launchArguments.first == RECORDING_HUD_EXPORT_ARGUMENT {
     guard launchArguments.count == 2 else {
-        fputs("usage: SuperDictate --export-hud-animation <frames-directory>\n", stderr)
+        fputs("usage: MyDictate --export-hud-animation <frames-directory>\n", stderr)
         exit(EXIT_FAILURE)
     }
     do {

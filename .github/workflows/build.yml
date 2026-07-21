@@ -18,22 +18,20 @@ jobs:
       - name: Swift self-tests
         run: swift run -c debug --package-path swift Parakey --self-test all
       - name: Build app bundle
-        run: ./scripts/build-app.sh "$RUNNER_TEMP/SuperDictate.app"
+        run: ./scripts/build-app.sh "$RUNNER_TEMP/MyDictate.app"
       - name: Verify app bundle
         run: |
-          test -x "$RUNNER_TEMP/SuperDictate.app/Contents/MacOS/SuperDictate"
-          codesign --verify --deep --strict "$RUNNER_TEMP/SuperDictate.app"
+          test -x "$RUNNER_TEMP/MyDictate.app/Contents/MacOS/MyDictate"
+          codesign --verify --deep --strict "$RUNNER_TEMP/MyDictate.app"
       - name: Exercise installer and uninstaller
         run: |
           mkdir -p "$RUNNER_TEMP/release"
           ditto -c -k --sequesterRsrc --keepParent \
-            "$RUNNER_TEMP/SuperDictate.app" "$RUNNER_TEMP/release/SuperDictate.zip"
-          checksum="$(shasum -a 256 "$RUNNER_TEMP/release/SuperDictate.zip" | awk '{print $1}')"
-          SUPERDICTATE_RELEASE_URL="file://$RUNNER_TEMP/release/SuperDictate.zip" \
-          SUPERDICTATE_RELEASE_SHA256="$checksum" \
-          SUPERDICTATE_NO_OPEN=1 \
+            "$RUNNER_TEMP/MyDictate.app" "$RUNNER_TEMP/release/MyDictate.zip"
+          MYDICTATE_APP_PATH="$RUNNER_TEMP/Applications/MyDictate.app" \
+          MYDICTATE_NO_OPEN=1 \
             ./install.sh
-          test -x /Applications/SuperDictate.app/Contents/MacOS/SuperDictate
-          codesign --verify --deep --strict /Applications/SuperDictate.app
-          ./uninstall.sh
-          test ! -e /Applications/SuperDictate.app
+          test -x "$RUNNER_TEMP/Applications/MyDictate.app/Contents/MacOS/MyDictate"
+          codesign --verify --deep --strict "$RUNNER_TEMP/Applications/MyDictate.app"
+          MYDICTATE_APP_PATH="$RUNNER_TEMP/Applications/MyDictate.app" ./uninstall.sh
+          test ! -e "$RUNNER_TEMP/Applications/MyDictate.app"

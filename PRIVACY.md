@@ -1,24 +1,35 @@
 # Privacy
 
-SuperDictate is designed for local dictation.
+MyDictate is designed for local dictation.
 
 ## Data that stays on the Mac
 
 - Microphone audio is processed locally and is not sent to a transcription API.
-- Successful transcripts, timing statistics, corrections, and preferences are
-  stored under `~/Library/Application Support/SuperDictate`.
-- Diagnostic logs are stored under `~/Library/Logs` and avoid transcript text.
-- Pending audio is kept only as a crash-recovery safeguard and is removed after
-  it has been handled.
+- Every successful transcript is saved as a plain-text file under
+  `~/Library/Application Support/MyDictate/Saved Dictations/Transcripts` before
+  MyDictate attempts to paste it. These files remain until the user deletes
+  them.
+- Timing statistics, corrections, preferences, and the short in-app history are
+  stored locally under `~/Library/Application Support/MyDictate`.
+- Diagnostic logs are stored in `~/Library/Logs/MyDictate.log` and avoid
+  transcript text.
+- While dictation is active, recoverable audio is continuously journaled under
+  `~/Library/Application Support/MyDictate/Saved Dictations/Pending Audio`.
+  After successful recognition and transcript archival, that pending audio is
+  removed.
+- If recognition fails or returns no text, the pending audio is retained for a
+  retry and a standard WAV copy is saved under
+  `~/Library/Application Support/MyDictate/Saved Dictations/Failed Audio`.
 - The speech model is cached by FluidAudio under
   `~/Library/Application Support/FluidAudio/Models`.
 
 ## Network access
 
-SuperDictate uses the network only to download the speech model through
-FluidAudio and to check the public GitHub releases endpoint for updates. The
-installer downloads the application from the same public repository. It has no
-account system, advertising, analytics, or telemetry.
+MyDictate uses the network only to download a selected speech model and to
+check the public GitHub Releases feed for MyDictate updates. When the user
+presses Update, it downloads the corresponding application archive and its
+SHA-256 manifest from the same public repository. Recognition itself is local.
+It has no account system, advertising, analytics, or telemetry.
 
 ## macOS permissions
 

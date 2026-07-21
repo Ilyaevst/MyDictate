@@ -29,6 +29,10 @@ let package = Package(
             name: "Parakey",
             dependencies: [
                 .product(name: "FluidAudio", package: "FluidAudio"),
+                "whisper",
+            ],
+            linkerSettings: [
+                .unsafeFlags(["-Xlinker", "-rpath", "-Xlinker", "@executable_path/../Frameworks"]),
             ]
             // No `resources:` here on purpose. SwiftPM bundles them as
             // a `<Package>_<Target>.bundle` directory next to the
@@ -39,6 +43,10 @@ let package = Package(
             // where Bundle.main finds them via the standard search
             // path. Source PNGs live in swift/Resources/ at the repo
             // root, NOT in the SwiftPM target, so SwiftPM never sees them.
+        ),
+        .binaryTarget(
+            name: "whisper",
+            path: "../vendor/whisper/build-apple/whisper.xcframework"
         ),
     ]
 )

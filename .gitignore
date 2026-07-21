@@ -2,5 +2,5 @@
 .build/
 swift/.build/
 dist/
+vendor/whisper/
 *.xcuserstate
-
