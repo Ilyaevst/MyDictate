@@ -20874,8 +20874,10 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
 
     private func resizeCompactPanel(_ window: NSWindow) {
         let missingCount = Permission.allCases.filter { !Permissions.isGranted($0) }.count
-        let baseHeight: CGFloat = UPDATE_FEATURE_ENABLED ? 366 : 306
-        let height = baseHeight + CGFloat(missingCount) * 28
+        // The panel must follow its compact cards, not leave a tall empty
+        // permission area while setup is still incomplete.
+        let baseHeight: CGFloat = UPDATE_FEATURE_ENABLED ? 338 : 286
+        let height = baseHeight + CGFloat(missingCount) * 26
         let oldTop = window.frame.maxY
         let size = NSSize(width: 520, height: height)
         window.contentMinSize = size
@@ -21705,17 +21707,22 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         status.setContentHuggingPriority(.defaultLow, for: .horizontal)
         status.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         text.addArrangedSubview(status)
-        let detail = panelLabel(
-            "\(presentation.detail) · \(t("Модель", "Model")): \(localizedSpeechModelName(settings.speechModelProfile))\n\(t("Без Enter", "Without Enter")): \(localizedHotkeyName(settings.configuredHotkey, language: language)) · \(t("с Enter", "with Enter")): \(localizedHotkeyName(settings.configuredEnterHotkey, language: language))",
-            size: 11.5,
-            color: .secondaryLabelColor
-        )
-        detail.maximumNumberOfLines = 2
+        let serviceDetail: String
+        if running, state?.status == "ready" {
+            serviceDetail = t(
+                "Правый Command — распознать · Option + Правый Command — отправить",
+                "Right Command — dictate · Option + Right Command — send"
+            )
+        } else {
+            serviceDetail = presentation.detail
+        }
+        let detail = panelLabel(serviceDetail, size: 11.5, color: .secondaryLabelColor)
+        detail.maximumNumberOfLines = 1
         detail.lineBreakMode = .byTruncatingTail
         detail.preferredMaxLayoutWidth = 330
         detail.setContentHuggingPriority(.defaultLow, for: .horizontal)
         detail.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        detail.toolTip = "\(presentation.detail)\n\(t("Модель", "Model")): \(settings.speechModelProfile.aboutModelText)\n\(t("Без Enter", "Without Enter")): \(localizedHotkeyName(settings.configuredHotkey, language: language))\n\(t("С Enter", "With Enter")): \(localizedHotkeyName(settings.configuredEnterHotkey, language: language))"
+        detail.toolTip = serviceDetail
         text.addArrangedSubview(detail)
 
         let actions = NSStackView()
@@ -21765,6 +21772,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         row.orientation = .horizontal
         row.alignment = .centerY
         row.spacing = 10
+        row.distribution = .fillEqually
 
         let modelCard = dashboardLinkCard(
             symbol: "cpu",
@@ -21794,7 +21802,6 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
 
         row.addArrangedSubview(modelCard)
         row.addArrangedSubview(archiveCard)
-        modelCard.widthAnchor.constraint(equalTo: archiveCard.widthAnchor).isActive = true
         return row
     }
 
@@ -21804,7 +21811,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         let content = NSStackView()
         content.orientation = .vertical
         content.alignment = .leading
-        content.spacing = 7
+        content.spacing = 3
         content.translatesAutoresizingMaskIntoConstraints = false
 
         let header = NSStackView()
@@ -21834,7 +21841,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                 content.addArrangedSubview(compactPermissionRow(permission))
             }
         }
-        pin(content, inside: card, horizontal: 13, vertical: missing.isEmpty ? 8 : 10)
+        pin(content, inside: card, horizontal: 13, vertical: missing.isEmpty ? 8 : 6)
         card.toolTip = missing.isEmpty
             ? t("Микрофон, вставка текста и глобальный хоткей доступны.",
                 "Microphone, text insertion, and the global shortcut are available.")
@@ -22006,9 +22013,9 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                     t("Фоновый процесс запущен и готовит модель.", "The background process is preparing the model."),
                     .systemOrange)
         }
-        return (settings.agentEnabled ? t("Остановлена", "Stopped") : t("Выключена", "Off"),
-                t("Хоткей не работает, пока служба не запущена.",
-                  "The shortcut is unavailable until the service starts."),
+        return (settings.agentEnabled ? t("Служба остановлена", "Service stopped") : t("Служба выключена", "Service off"),
+                t("Нажмите «Запустить службу».",
+                  "Click Start Service to begin."),
                 settings.agentEnabled ? .systemRed : .secondaryLabelColor)
     }
 
