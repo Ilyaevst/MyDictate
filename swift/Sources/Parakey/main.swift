@@ -12510,7 +12510,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     @objc private func openSavedDictationsClicked(_ sender: Any) {
         do {
-            let url = try DictationArchive.rootDirectoryURL()
+            let url = try DictationArchive.transcriptsDirectoryURL()
             NSWorkspace.shared.open(url)
             log("saved dictations folder opened")
         } catch {
@@ -20514,6 +20514,7 @@ private enum ControlPanelServiceOperation: String, Sendable {
     case restarting
     case stopping
     case applyingSettings
+    case switchingModel
 }
 
 private enum ControlPanelShortcutKind: Int {
@@ -20700,6 +20701,42 @@ private final class SavedTranscriptActionButton: NSButton {
 
     required init?(coder: NSCoder) {
         nil
+    }
+}
+
+private final class SavedTranscriptCard: NSView {
+    let transcript: SavedDictationTranscript
+    var onOpen: ((SavedDictationTranscript) -> Void)?
+
+    init(transcript: SavedDictationTranscript,
+         onOpen: @escaping (SavedDictationTranscript) -> Void) {
+        self.transcript = transcript
+        self.onOpen = onOpen
+        super.init(frame: .zero)
+    }
+
+    required init?(coder: NSCoder) {
+        nil
+    }
+
+    // The whole record is a single, calm click target.  Buttons placed inside
+    // it (currently only Copy) keep their normal behaviour.
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard let hit = super.hitTest(point) else { return nil }
+        var candidate: NSView? = hit
+        while let view = candidate, view !== self {
+            if view is NSButton { return hit }
+            candidate = view.superview
+        }
+        return self
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        onOpen?(transcript)
+    }
+
+    override func resetCursorRects() {
+        addCursorRect(bounds, cursor: .pointingHand)
     }
 }
 
@@ -20996,6 +21033,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
     }
 
     private func makeModelSelectionContentView() -> NSView {
+        let isSwitchingModel = serviceOperation == .switchingModel
         let root = NSStackView()
         root.orientation = .vertical
         root.alignment = .leading
@@ -21011,6 +21049,13 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                                               color: .systemBlue,
                                               description: nil,
                                               pointSize: 24))
+        if isSwitchingModel {
+            let spinner = NSProgressIndicator()
+            spinner.style = .spinning
+            spinner.controlSize = .small
+            spinner.startAnimation(nil)
+            header.addArrangedSubview(spinner)
+        }
         let headerText = NSStackView()
         headerText.orientation = .vertical
         headerText.alignment = .leading
@@ -21021,13 +21066,14 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             weight: .semibold
         ))
         headerText.addArrangedSubview(panelLabel(
-            serviceOperation == nil
-                ? t("Выберите модель — MyDictate переключится автоматически.",
-                    "Choose a model — MyDictate switches automatically.")
-                : t("Переключаю модель и перезапускаю фоновую службу…",
-                    "Switching model and restarting the background service…"),
-            size: 11.5,
-            color: serviceOperation == nil ? .secondaryLabelColor : .systemBlue
+            isSwitchingModel
+                ? t("Переключаю модель и перезапускаю службу…",
+                    "Switching the model and restarting the service…")
+                : t("Выберите модель — MyDictate переключится автоматически.",
+                    "Choose a model — MyDictate switches automatically."),
+            size: isSwitchingModel ? 13 : 11.5,
+            weight: isSwitchingModel ? .semibold : .regular,
+            color: isSwitchingModel ? .systemOrange : .secondaryLabelColor
         ))
         header.addArrangedSubview(headerText)
         header.addArrangedSubview(NSView())
@@ -21078,6 +21124,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
 
     private func modelChoiceCard(_ profile: SpeechModelProfile) -> NSView {
         let selected = profile == settings.speechModelProfile
+        let isSwitchingModel = serviceOperation == .switchingModel
         let card = compactCard()
         card.layer?.cornerRadius = 11
         card.layer?.backgroundColor = selected
@@ -21115,10 +21162,14 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         row.addArrangedSubview(NSView())
 
         let badge = panelLabel(
-            selected ? t("Текущая", "Current") : t("Выбрать", "Choose"),
+            selected && isSwitchingModel
+                ? t("Меняется…", "Switching…")
+                : (selected ? t("Текущая", "Current") : t("Выбрать", "Choose")),
             size: 11,
             weight: .semibold,
-            color: selected ? .systemBlue : .secondaryLabelColor
+            color: selected && isSwitchingModel
+                ? .systemOrange
+                : (selected ? .systemBlue : .secondaryLabelColor)
         )
         badge.setContentHuggingPriority(.required, for: .horizontal)
         row.addArrangedSubview(badge)
@@ -21184,10 +21235,10 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         headerText.addArrangedSubview(archiveSummary)
         header.addArrangedSubview(headerText)
         header.addArrangedSubview(NSView())
-        let openFolder = panelButton(t("Открыть папку", "Open Folder"),
+        let openFolder = panelButton(t("Папка с текстами", "Text Folder"),
                                      action: #selector(openSavedDictationsFolderClicked(_:)),
-                                     toolTip: t("Показать все файлы в Finder",
-                                                "Show all files in Finder"))
+                                     toolTip: t("Открыть в Finder папку с сохранёнными текстами",
+                                                "Open the folder with saved transcripts in Finder"))
         openFolder.controlSize = .small
         openFolder.image = NSImage(systemSymbolName: "folder",
                                    accessibilityDescription: nil)
@@ -21291,7 +21342,13 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
     }
 
     private func savedTranscriptCard(_ transcript: SavedDictationTranscript) -> NSView {
-        let card = compactCard()
+        let card = SavedTranscriptCard(transcript: transcript) { [weak self] transcript in
+            self?.openSavedTranscript(transcript)
+        }
+        card.wantsLayer = true
+        card.layer?.backgroundColor = NSColor.controlBackgroundColor.withAlphaComponent(0.70).cgColor
+        card.layer?.borderColor = NSColor.separatorColor.withAlphaComponent(0.42).cgColor
+        card.layer?.borderWidth = 1
         card.layer?.cornerRadius = 10
         let content = NSStackView()
         content.orientation = .vertical
@@ -21309,46 +21366,33 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                               color: .secondaryLabelColor)
         top.addArrangedSubview(date)
         top.addArrangedSubview(NSView())
-        let reveal = SavedTranscriptActionButton(
-            title: "",
-            transcript: transcript,
-            target: self,
-            action: #selector(revealSavedTranscriptInFinderClicked(_:))
-        )
-        reveal.image = NSImage(systemSymbolName: "folder", accessibilityDescription: nil)
-        reveal.imagePosition = .imageOnly
-        reveal.toolTip = t("Показать файл в Finder", "Show this file in Finder")
-        reveal.setAccessibilityLabel(t("Показать файл в Finder", "Show this file in Finder"))
-        top.addArrangedSubview(reveal)
-        let open = SavedTranscriptActionButton(
-            title: t("Открыть", "Open"),
-            transcript: transcript,
-            target: self,
-            action: #selector(openSavedTranscriptClicked(_:))
-        )
-        open.toolTip = t("Открыть полный текст в небольшом окне", "Open the full text in a compact window")
-        top.addArrangedSubview(open)
         let copy = SavedTranscriptCopyButton(
-            title: t("Копировать", "Copy"),
+            title: "",
             transcriptText: transcript.text,
             target: self,
             action: #selector(copySavedTranscriptClicked(_:))
         )
         copy.image = NSImage(systemSymbolName: "doc.on.doc", accessibilityDescription: nil)
-        copy.imagePosition = .imageLeading
+        copy.imagePosition = .imageOnly
+        copy.bezelStyle = .texturedRounded
         copy.toolTip = t("Скопировать весь текст, а не только предпросмотр",
                          "Copy the complete text, not only the preview")
+        copy.setAccessibilityLabel(t("Копировать текст", "Copy text"))
         top.addArrangedSubview(copy)
+        top.addArrangedSubview(panelSymbol("chevron.right",
+                                           color: .tertiaryLabelColor,
+                                           description: nil,
+                                           pointSize: 10))
         content.addArrangedSubview(top)
         top.widthAnchor.constraint(equalTo: content.widthAnchor).isActive = true
 
         let preview = panelLabel(transcript.text, size: 12, color: .labelColor)
-        preview.maximumNumberOfLines = 2
+        preview.maximumNumberOfLines = 3
         preview.lineBreakMode = .byTruncatingTail
         preview.preferredMaxLayoutWidth = 540
         preview.setContentHuggingPriority(.defaultLow, for: .horizontal)
         preview.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        preview.toolTip = t("Откройте запись, чтобы посмотреть полный текст", "Open to view the full text")
+        preview.toolTip = t("Нажмите на запись, чтобы открыть полный текст", "Click the record to open the full text")
         content.addArrangedSubview(preview)
         preview.widthAnchor.constraint(equalTo: content.widthAnchor).isActive = true
         pin(content, inside: card, horizontal: 13, vertical: 10)
@@ -21980,6 +22024,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         case .stopping: return t("Останавливаю фоновую службу", "Stopping background service")
         case .applyingSettings: return t("Сохраняю настройки…",
                                          "Saving settings…")
+        case .switchingModel: return t("Переключаю модель", "Switching model")
         }
     }
 
@@ -21994,6 +22039,9 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         case .applyingSettings:
             return t("Перезапускаю службу. Диктовка временно недоступна.",
                      "Restarting the service. Dictation is temporarily unavailable.")
+        case .switchingModel:
+            return t("Модель меняется, затем служба запустится заново. Панель не зависла.",
+                     "The model is changing, then the service will restart. The panel is still responsive.")
         case .stopping:
             return t("Хоткей перестанет работать, но настройки и история сохранятся.",
                      "The shortcut will stop; settings and history remain saved.")
@@ -22652,7 +22700,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                     switch operation {
                     case .starting:
                         try SuperDictateAgentService.installAndStart()
-                    case .restarting, .applyingSettings:
+                    case .restarting, .applyingSettings, .switchingModel:
                         try SuperDictateAgentService.restart()
                     case .stopping:
                         SuperDictateAgentService.stop()
@@ -22773,7 +22821,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         }
         _ = settings.refreshFromDisk()
         lastRenderFingerprint = ""
-        beginServiceOperation(.applyingSettings)
+        beginServiceOperation(.switchingModel)
         log("control panel quick model selection: \(profile.shortName)")
     }
 
@@ -22829,9 +22877,13 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
     }
 
     @objc private func openSavedTranscriptClicked(_ sender: SavedTranscriptActionButton) {
+        openSavedTranscript(sender.transcript)
+    }
+
+    private func openSavedTranscript(_ transcript: SavedDictationTranscript) {
         if let savedDictationDetailWindow {
             savedDictationDetailWindow.title = t("Сохранённая диктовка", "Saved Dictation")
-            savedDictationDetailWindow.contentView = makeSavedTranscriptDetailContentView(sender.transcript)
+            savedDictationDetailWindow.contentView = makeSavedTranscriptDetailContentView(transcript)
             resizeSavedTranscriptDetailWindow(savedDictationDetailWindow)
             savedDictationDetailWindow.makeKeyAndOrderFront(nil)
             NSApp.activate(ignoringOtherApps: true)
@@ -22847,7 +22899,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         detailWindow.title = t("Сохранённая диктовка", "Saved Dictation")
         detailWindow.isReleasedWhenClosed = false
         detailWindow.delegate = self
-        detailWindow.contentView = makeSavedTranscriptDetailContentView(sender.transcript)
+        detailWindow.contentView = makeSavedTranscriptDetailContentView(transcript)
         resizeSavedTranscriptDetailWindow(detailWindow)
         if let archiveWindow = savedDictationsWindow {
             let frame = archiveWindow.frame
@@ -22873,7 +22925,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
 
     @objc private func openSavedDictationsFolderClicked(_ sender: NSButton) {
         do {
-            NSWorkspace.shared.open(try DictationArchive.rootDirectoryURL())
+            NSWorkspace.shared.open(try DictationArchive.transcriptsDirectoryURL())
         } catch {
             showError(title: t("Не удалось открыть папку", "Could Not Open Folder"),
                       detail: error.localizedDescription)
