@@ -7985,6 +7985,65 @@ enum SuperDictateUpdateInstaller {
             && fileManager.isWritableFile(atPath: appURL.deletingLastPathComponent().path)
     }
 
+    /// `whisper.framework` uses Apple's conventional `Versions/Current` layout:
+    /// `Current` and a handful of top-level entries are relative symlinks to
+    /// files in the same framework.  An earlier updater rejected every
+    /// symlink, which made otherwise valid MyDictate releases impossible to
+    /// install.  Keep the archive boundary strict, but allow this one standard
+    /// framework layout only when the target stays lexically inside it.
+    private static func isSafeWhisperFrameworkSymbolicLink(at itemURL: URL,
+                                                            appURL: URL,
+                                                            fileManager: FileManager) -> Bool {
+        let frameworkURL = appURL
+            .appendingPathComponent("Contents/Frameworks/whisper.framework", isDirectory: true)
+            .standardizedFileURL
+        let frameworkPath = frameworkURL.path
+        let frameworkPrefix = frameworkPath.hasSuffix("/") ? frameworkPath : "\(frameworkPath)/"
+        let itemPath = itemURL.standardizedFileURL.path
+
+        // The framework bundle itself must not be a link.  Only entries below
+        // it may use the standard framework versioning links.
+        guard itemPath.hasPrefix(frameworkPrefix),
+              let destination = try? fileManager.destinationOfSymbolicLink(atPath: itemURL.path),
+              !destination.isEmpty,
+              !destination.hasPrefix("/") else {
+            return false
+        }
+
+        let targetPath = URL(
+            fileURLWithPath: (itemURL.deletingLastPathComponent().path as NSString)
+                .appendingPathComponent(destination)
+        ).standardizedFileURL.path
+        let targetIsInsideFramework = targetPath == frameworkPath
+            || targetPath.hasPrefix(frameworkPrefix)
+        guard targetIsInsideFramework else { return false }
+
+        // Broken links and cycles are not part of a valid signed framework.
+        // Checking every link below also rejects a chain that ultimately
+        // attempts to leave the framework.
+        return fileManager.fileExists(atPath: targetPath)
+    }
+
+    static func validateArchiveSymbolicLinks(in appURL: URL) throws {
+        let fileManager = FileManager.default
+        guard let enumerator = fileManager.enumerator(at: appURL,
+                                                      includingPropertiesForKeys: [.isSymbolicLinkKey],
+                                                      options: []) else {
+            throw SuperDictateUpdateInstallerError.invalidBundle("не удалось проверить содержимое архива")
+        }
+
+        for case let itemURL as URL in enumerator {
+            guard (try? itemURL.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) == true else {
+                continue
+            }
+            guard isSafeWhisperFrameworkSymbolicLink(at: itemURL,
+                                                      appURL: appURL,
+                                                      fileManager: fileManager) else {
+                throw SuperDictateUpdateInstallerError.invalidBundle("архив содержит небезопасную символическую ссылку")
+            }
+        }
+    }
+
     static func validateApp(at appURL: URL, expectedVersion: String) throws {
         let fileManager = FileManager.default
         let infoURL = appURL.appendingPathComponent("Contents/Info.plist")
@@ -8000,15 +8059,7 @@ enum SuperDictateUpdateInstaller {
             throw SuperDictateUpdateInstallerError.invalidBundle("неверный идентификатор или версия")
         }
 
-        if let enumerator = fileManager.enumerator(at: appURL,
-                                                   includingPropertiesForKeys: [.isSymbolicLinkKey],
-                                                   options: []) {
-            for case let itemURL as URL in enumerator {
-                if (try? itemURL.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) == true {
-                    throw SuperDictateUpdateInstallerError.invalidBundle("архив содержит символическую ссылку")
-                }
-            }
-        }
+        try validateArchiveSymbolicLinks(in: appURL)
 
         let signature = SuperDictateAgentService.run("/usr/bin/codesign",
                                                       ["--verify", "--deep", "--strict", appURL.path])
@@ -18842,6 +18893,7 @@ private enum ParakeySelfTest {
         try testUpdateCheckParsing()
         try testUpdateCheckState()
         try testDirectUpdateManifest()
+        try testUpdateBundleLinkValidation()
         try testUpdateHelperScript()
         try testDirectUpdateReplacement()
         try testUpdateProgressState()
@@ -18875,6 +18927,81 @@ private enum ParakeySelfTest {
         } catch let error as SuperDictateUpdateInstallerError {
             try expect(error, equals: .invalidManifest,
                        "direct update manifest should reject malformed checksums")
+        }
+    }
+
+    private static func testUpdateBundleLinkValidation() throws {
+        let fileManager = FileManager.default
+        let root = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("mydictate-update-link-test-\(UUID().uuidString)", isDirectory: true)
+        let appURL = root.appendingPathComponent("MyDictate.app", isDirectory: true)
+        let frameworkURL = appURL
+            .appendingPathComponent("Contents/Frameworks/whisper.framework", isDirectory: true)
+        let versionAURL = frameworkURL.appendingPathComponent("Versions/A", isDirectory: true)
+        defer { try? fileManager.removeItem(at: root) }
+
+        try fileManager.createDirectory(at: versionAURL.appendingPathComponent("Resources", isDirectory: true),
+                                        withIntermediateDirectories: true)
+        try Data("framework".utf8).write(to: versionAURL.appendingPathComponent("whisper"))
+        try fileManager.createSymbolicLink(
+            atPath: frameworkURL.appendingPathComponent("Versions/Current").path,
+            withDestinationPath: "A"
+        )
+        try fileManager.createSymbolicLink(
+            atPath: frameworkURL.appendingPathComponent("Resources").path,
+            withDestinationPath: "Versions/Current/Resources"
+        )
+        try SuperDictateUpdateInstaller.validateArchiveSymbolicLinks(in: appURL)
+
+        let unsafeFrameworkLink = frameworkURL.appendingPathComponent("outside")
+        try fileManager.createSymbolicLink(atPath: unsafeFrameworkLink.path, withDestinationPath: "/tmp")
+        var externalLinkRejected = false
+        do {
+            try SuperDictateUpdateInstaller.validateArchiveSymbolicLinks(in: appURL)
+        } catch let error as SuperDictateUpdateInstallerError {
+            externalLinkRejected = error == .invalidBundle("архив содержит небезопасную символическую ссылку")
+        }
+        try expect(externalLinkRejected, equals: true,
+                   "update validation should reject absolute framework links")
+        try fileManager.removeItem(at: unsafeFrameworkLink)
+
+        let escapedFrameworkLink = frameworkURL.appendingPathComponent("escape")
+        try fileManager.createSymbolicLink(atPath: escapedFrameworkLink.path,
+                                           withDestinationPath: "../../../../outside")
+        var escapedLinkRejected = false
+        do {
+            try SuperDictateUpdateInstaller.validateArchiveSymbolicLinks(in: appURL)
+        } catch let error as SuperDictateUpdateInstallerError {
+            escapedLinkRejected = error == .invalidBundle("архив содержит небезопасную символическую ссылку")
+        }
+        try expect(escapedLinkRejected, equals: true,
+                   "update validation should reject framework links that escape their bundle")
+        try fileManager.removeItem(at: escapedFrameworkLink)
+
+        let unexpectedLink = appURL.appendingPathComponent("Contents/Resources/outside")
+        try fileManager.createDirectory(at: unexpectedLink.deletingLastPathComponent(),
+                                        withIntermediateDirectories: true)
+        try fileManager.createSymbolicLink(atPath: unexpectedLink.path, withDestinationPath: "../Frameworks")
+        var unexpectedLinkRejected = false
+        do {
+            try SuperDictateUpdateInstaller.validateArchiveSymbolicLinks(in: appURL)
+        } catch let error as SuperDictateUpdateInstallerError {
+            unexpectedLinkRejected = error == .invalidBundle("архив содержит небезопасную символическую ссылку")
+        }
+        try expect(unexpectedLinkRejected, equals: true,
+                   "update validation should reject links outside whisper.framework")
+
+        // When self-tests run from the packaged app, validate the exact
+        // framework layout that will be delivered in the update archive too.
+        let currentBundleURL = Bundle.main.bundleURL
+        let currentInfoURL = currentBundleURL.appendingPathComponent("Contents/Info.plist")
+        if currentBundleURL.pathExtension == "app",
+           let infoData = try? Data(contentsOf: currentInfoURL),
+           let info = try? PropertyListSerialization.propertyList(from: infoData,
+                                                                  format: nil) as? [String: Any],
+           let version = info["CFBundleShortVersionString"] as? String {
+            try SuperDictateUpdateInstaller.validateApp(at: currentBundleURL,
+                                                         expectedVersion: version)
         }
     }
 
