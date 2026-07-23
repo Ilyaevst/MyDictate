@@ -6709,155 +6709,6 @@ private enum FocusedInsertionTargetLocator {
     }
 }
 
-/// The accessibility object for the text field that was focused when a
-/// dictation began.  Keeping this separately from the HUD tracker is
-/// intentional: the HUD can observe the user's current window while they
-/// work, but the completed transcript must return to the original field.
-@MainActor
-private final class CapturedInsertionTarget {
-    private static let maximumScanCount = 1_000
-    private static let messagingTimeout: Float = 0.18
-
-    let applicationPID: pid_t
-    let applicationName: String
-    let targetFrame: NSRect
-    private let element: AXUIElement?
-    private let window: AXUIElement?
-
-    private init(applicationPID: pid_t,
-                 applicationName: String,
-                 targetFrame: NSRect,
-                 element: AXUIElement?,
-                 window: AXUIElement?) {
-        self.applicationPID = applicationPID
-        self.applicationName = applicationName
-        self.targetFrame = targetFrame
-        self.element = element
-        self.window = window
-    }
-
-    static func capture(target: FocusedInsertionTargetFrame,
-                        applicationName: String) -> CapturedInsertionTarget? {
-        guard AXIsProcessTrusted() else { return nil }
-        let app = AXUIElementCreateApplication(target.identity.applicationPID)
-        AXUIElementSetMessagingTimeout(app, messagingTimeout)
-        let element = findElement(in: app, matchingToken: target.identity.elementToken)
-        let window = element.flatMap(windowElement(for:))
-            ?? findElement(in: app, matchingToken: target.identity.windowToken)
-        guard element != nil else { return nil }
-        return CapturedInsertionTarget(
-            applicationPID: target.identity.applicationPID,
-            applicationName: applicationName,
-            targetFrame: target.frame,
-            element: element,
-            window: window
-        )
-    }
-
-    /// Restores the original application and focused accessibility element.
-    /// If a web view refuses the AX focus request, a final click inside the
-    /// captured text field gives Chromium/Electron inputs the same result.
-    func restore() async -> Bool {
-        guard let application = NSRunningApplication(processIdentifier: applicationPID),
-              !application.isTerminated else {
-            return false
-        }
-        guard application.activate(options: [.activateIgnoringOtherApps]) else {
-            return false
-        }
-        try? await Task.sleep(nanoseconds: 120_000_000)
-
-        guard let element else { return false }
-        let app = AXUIElementCreateApplication(applicationPID)
-        AXUIElementSetMessagingTimeout(app, Self.messagingTimeout)
-        if let window {
-            _ = AXUIElementSetAttributeValue(app, kAXFocusedWindowAttribute as CFString, window)
-        }
-        if AXUIElementSetAttributeValue(app,
-                                        kAXFocusedUIElementAttribute as CFString,
-                                        element) == .success {
-            try? await Task.sleep(nanoseconds: 35_000_000)
-            return true
-        }
-        if AXUIElementPerformAction(element, kAXPressAction as CFString) == .success {
-            try? await Task.sleep(nanoseconds: 35_000_000)
-            return true
-        }
-        return clickCapturedField()
-    }
-
-    private func clickCapturedField() -> Bool {
-        let point = CGPoint(x: targetFrame.midX, y: targetFrame.midY)
-        guard point.x.isFinite,
-              point.y.isFinite,
-              let source = CGEventSource(stateID: .hidSystemState),
-              let down = CGEvent(mouseEventSource: source,
-                                 mouseType: .leftMouseDown,
-                                 mouseCursorPosition: point,
-                                 mouseButton: .left),
-              let up = CGEvent(mouseEventSource: source,
-                               mouseType: .leftMouseUp,
-                               mouseCursorPosition: point,
-                               mouseButton: .left) else {
-            return false
-        }
-        down.post(tap: .cghidEventTap)
-        up.post(tap: .cghidEventTap)
-        return true
-    }
-
-    private static func findElement(in root: AXUIElement,
-                                    matchingToken: UInt) -> AXUIElement? {
-        guard matchingToken != 0 else { return nil }
-        var queue = [root]
-        var index = 0
-        var visited: Set<UInt> = []
-        while index < queue.count, visited.count < maximumScanCount {
-            let current = queue[index]
-            index += 1
-            let token = CFHash(current)
-            guard visited.insert(token).inserted else { continue }
-            if token == matchingToken { return current }
-            AXUIElementSetMessagingTimeout(current, messagingTimeout)
-            if let focused = elementAttribute(current, kAXFocusedUIElementAttribute as CFString),
-               !CFEqual(focused, current) {
-                queue.append(focused)
-            }
-            queue.append(contentsOf: elementArrayAttribute(current, kAXSelectedChildrenAttribute as CFString))
-            queue.append(contentsOf: elementArrayAttribute(current, kAXChildrenAttribute as CFString))
-        }
-        return nil
-    }
-
-    private static func copyAttribute(_ element: AXUIElement,
-                                      _ attribute: CFString) -> CFTypeRef? {
-        var raw: CFTypeRef?
-        return AXUIElementCopyAttributeValue(element, attribute, &raw) == .success ? raw : nil
-    }
-
-    private static func axElement(_ raw: CFTypeRef?) -> AXUIElement? {
-        guard let raw, CFGetTypeID(raw) == AXUIElementGetTypeID() else { return nil }
-        return unsafeDowncast(raw, to: AXUIElement.self)
-    }
-
-    private static func elementAttribute(_ element: AXUIElement,
-                                         _ attribute: CFString) -> AXUIElement? {
-        axElement(copyAttribute(element, attribute))
-    }
-
-    private static func elementArrayAttribute(_ element: AXUIElement,
-                                              _ attribute: CFString) -> [AXUIElement] {
-        guard let raw = copyAttribute(element, attribute) else { return [] }
-        if let single = axElement(raw) { return [single] }
-        return raw as? [AXUIElement] ?? []
-    }
-
-    private static func windowElement(for element: AXUIElement) -> AXUIElement? {
-        elementAttribute(element, kAXWindowAttribute as CFString)
-            ?? elementAttribute(element, kAXTopLevelUIElementAttribute as CFString)
-    }
-}
-
 func textInsertionStrategyChain(primary: TextInsertionStrategy) -> [TextInsertionStrategy] {
     switch primary {
     case .clipboardPaste:
@@ -10113,9 +9964,9 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var recordingHUDTargetQueryInFlight = false
     private var recordingHUDTargetSessionToken = 0
     private var recordingHUDWaitingForInitialTarget = false
-    /// The destination selected when the hotkey started this recording.
-    /// It must never be replaced by later HUD/window observations.
-    private var recordingInsertionTarget: CapturedInsertionTarget?
+    /// Diagnostic only: insertion always targets the field that is active
+    /// when transcription completes, never the field active at recording start.
+    private var recordingStartApplicationDescription: String?
     private var insertionTargetCache: [pid_t: CachedInsertionTarget] = [:]
     private var globalMouseDownMonitor: Any?
     private var lastExternalClick: LastExternalClick?
@@ -11207,7 +11058,6 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         recordingHUDTargetSessionToken &+= 1
         recordingHUDTargetQueryInFlight = false
         recordingHUDWaitingForInitialTarget = false
-        recordingInsertionTarget = nil
         recordingHUDTargetStabilizer.reset(initialApplicationPID: initialContext?.applicationPID)
         setMenuBarState(.recording)
         let timer = Timer(timeInterval: 1.0 / 24.0,
@@ -11629,31 +11479,20 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
 
         if isInitial {
-            if let target = liveTarget ?? observedTarget {
-                recordingInsertionTarget = CapturedInsertionTarget.capture(
-                    target: target,
-                    applicationName: result.applicationName
-                )
-                if recordingInsertionTarget != nil {
-                    log("text insertion destination locked at recording start: \(result.applicationName)")
-                } else {
-                    log("text insertion destination could not retain its accessibility element at recording start")
-                }
-            }
             recordingHUDWaitingForInitialTarget = false
             if let liveTarget {
-                log("text insertion target captured at recording start: \(liveTarget.resolutionKind), frontmost: \(result.applicationName) (\(result.bundleIdentifier)); \(result.diagnostic)")
+                log("recording HUD target found at recording start: \(liveTarget.resolutionKind), frontmost: \(result.applicationName) (\(result.bundleIdentifier)); \(result.diagnostic)")
             } else if observedTarget != nil {
-                log("text insertion target restored from recent cache, frontmost: \(result.applicationName) (\(result.bundleIdentifier)); \(result.diagnostic)")
+                log("recording HUD target restored from recent cache, frontmost: \(result.applicationName) (\(result.bundleIdentifier)); \(result.diagnostic)")
             } else {
-                log("text insertion target unavailable at recording start, frontmost: \(result.applicationName) (\(result.bundleIdentifier)); \(result.diagnostic)")
+                log("recording HUD target unavailable at recording start, frontmost: \(result.applicationName) (\(result.bundleIdentifier)); \(result.diagnostic)")
             }
             if settings.showRecordingWaveform {
                 showRecordingHUD(mode: .recording, level: recordingVisualLevel)
             }
         } else if liveTarget != nil,
                   case .switchTarget(let target) = decision {
-            log("text insertion target switched during recording: \(target.resolutionKind), frontmost: \(result.applicationName) (\(result.bundleIdentifier))")
+            log("recording HUD target switched during recording: \(target.resolutionKind), frontmost: \(result.applicationName) (\(result.bundleIdentifier))")
         }
     }
 
@@ -11897,14 +11736,23 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         flashErrorMenuBarIcon()
     }
 
-    /// When macOS does not expose the original editor through Accessibility,
-    /// a clipboard hand-off is safer than guessing the current focus.  The
-    /// transcript and WAV have already been made durable before this runs.
+    /// The transcript and WAV are durable before this runs. If macOS rejects
+    /// the paste event for the field currently in focus, hand the text to the
+    /// user through the clipboard instead of losing it.
     private func copyTranscriptForRecovery(_ text: String) {
         let pasteboard = NSPasteboard.general
         pasteboard.clearContents()
         pasteboard.setString(text, forType: .string)
         log("dictation copied to clipboard for recovery (\(text.count) chars)")
+    }
+
+    private func activeApplicationDescription() -> String {
+        guard let application = NSWorkspace.shared.frontmostApplication else {
+            return "unavailable"
+        }
+        let name = application.localizedName ?? "unknown"
+        let bundleIdentifier = application.bundleIdentifier ?? "unknown"
+        return "\(name) (\(bundleIdentifier), pid=\(application.processIdentifier))"
     }
 
     private func presentInsertionRecoveryNotice() {
@@ -11915,13 +11763,23 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                                             content: notification,
                                             trigger: nil)
         let center = UNUserNotificationCenter.current()
-        center.requestAuthorization(options: [.alert]) { granted, error in
-            guard granted else {
-                if let error { log("dictation recovery notification unavailable: \(error.localizedDescription)") }
-                return
-            }
-            center.add(request) { error in
-                if let error { log("dictation recovery notification delivery failed: \(error.localizedDescription)") }
+        // Keep the entire notification path on MainActor. The callback-based
+        // API invokes completions on its own queue, which previously caused a
+        // Swift executor assertion when it touched this app's state.
+        Task { @MainActor [weak self] in
+            guard let self, !self.isTerminating else { return }
+            do {
+                let granted = try await center.requestAuthorization(options: [.alert])
+                guard granted else {
+                    log("dictation recovery notification unavailable: permission not granted")
+                    return
+                }
+                try await center.add(request)
+                guard !self.isTerminating else { return }
+                log("dictation recovery notification delivered")
+            } catch {
+                guard !self.isTerminating else { return }
+                log("dictation recovery notification delivery failed: \(error.localizedDescription)")
             }
         }
 
@@ -11934,7 +11792,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             alert.messageText = "Не удалось вставить диктовку"
             alert.informativeText = "Текст сохранён в «Сохранённых диктовках» и уже скопирован в буфер обмена. Вернитесь в нужное поле и нажмите ⌘V. Исходное аудио сохранено на 7 дней."
             alert.addButton(withTitle: "Понятно")
-            NSApp.activate(ignoringOtherApps: true)
+            self.showAppForModal()
             alert.runModal()
         }
     }
@@ -11966,6 +11824,9 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             return
         }
         let initialInsertionContext = insertionTargetQueryContext()
+        recordingStartApplicationDescription = initialInsertionContext.map {
+            "\($0.applicationName) (\($0.bundleIdentifier), pid=\($0.applicationPID))"
+        } ?? "unavailable"
         cancelAudioIdleStop()
         var recoveryJournal: PendingDictationJournal?
         do {
@@ -11994,7 +11855,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             Sounds.playStart()
         }
         muteIfNeededForRecording()
-        log("press: recording")
+        log("press: recording; started in \(recordingStartApplicationDescription ?? "unavailable")")
 
         scheduleMaxDurationAutoRelease()
         rebuildMenu()
@@ -12003,6 +11864,8 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private func handleRelease(shortcut: DictationReleaseShortcut = .standard,
                                hotkeyDetectedAt: TimeInterval? = nil) {
         guard isRecording, !isTerminating else { return }
+        let recordingStart = recordingStartApplicationDescription ?? "unavailable"
+        recordingStartApplicationDescription = nil
         let releaseReceivedAt = ProcessInfo.processInfo.systemUptime
         let hotkeyDispatchSeconds = hotkeyDetectedAt.map { max(0, releaseReceivedAt - $0) }
         let settingsRefreshStartedAt = ProcessInfo.processInfo.systemUptime
@@ -12126,29 +11989,15 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
                         let insertionStartedAt = ProcessInfo.processInfo.systemUptime
                         let insertionText = pastedText(from: cleaned, suffix: settings.pasteSuffix)
-                        let initialTarget = recordingInsertionTarget
-                        recordingInsertionTarget = nil
-                        let inserted: Bool
-                        if let initialTarget {
-                            if await initialTarget.restore() {
-                                inserted = TextInserter.insert(insertionText)
-                                if !inserted {
-                                    log("text insertion failed after restoring original destination: \(initialTarget.applicationName)")
-                                }
-                            } else {
-                                // Never paste into whatever happened to become active
-                                // during transcription. The complete text is already
-                                // durable in Saved Dictations and can be copied safely.
-                                log("original text destination was unavailable; transcript kept in Saved Dictations")
-                                inserted = false
-                            }
-                        } else {
-                            // We cannot prove that the active field at release is
-                            // the field where the dictation began.  Never risk
-                            // pasting into the wrong chat, browser tab or command
-                            // line: copy it and make the recovery explicit.
-                            log("no original text destination was captured; using clipboard recovery")
-                            inserted = false
+                        // Dictation always goes to the field that has focus now.
+                        // This works uniformly for native, browser and Electron
+                        // apps and does not depend on an app exposing its input
+                        // field through the Accessibility tree at recording start.
+                        let activeDestination = activeApplicationDescription()
+                        log("text insertion dispatch: active field; started=\(recordingStart); destination=\(activeDestination)")
+                        let inserted = TextInserter.insert(insertionText)
+                        if !inserted {
+                            log("text insertion event could not be posted; destination=\(activeDestination)")
                         }
                         let insertionCompletedAt = ProcessInfo.processInfo.systemUptime
                         var enterDelaySeconds: Double?
@@ -12177,7 +12026,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                             DictationArchive.preserveFailedAudio(
                                 samples,
                                 sourceAudioURL: captured.recoveryURL,
-                                errorDescription: "Text could not be safely inserted. The transcript was copied to the clipboard."
+                                errorDescription: "Text could not be inserted into the active field. The transcript was copied to the clipboard."
                             )
                             PendingDictationRecovery.remove(captured.recoveryURL)
                             copyTranscriptForRecovery(cleaned)
@@ -12320,7 +12169,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                             DictationArchive.preserveFailedAudio(
                                 captured.samples,
                                 sourceAudioURL: captured.recoveryURL,
-                                errorDescription: "Recording ended before MyDictate could return the text to its original field (\(reason))."
+                                errorDescription: "Recording ended before MyDictate could insert the text into the active field (\(reason))."
                             )
                             PendingDictationRecovery.remove(captured.recoveryURL)
                         } else {
@@ -23382,8 +23231,8 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         alert.alertStyle = .informational
         alert.messageText = t("Куда вставляется диктовка", "Where dictation is inserted")
         alert.informativeText = t(
-            "Когда вы начинаете запись, MyDictate запоминает поле ввода. Можно перейти в настройки или другое приложение: после распознавания текст вернётся в исходное поле. Если исходное окно или поле уже закрыто, текст не вставится в другое место — он останется в «Сохранённых диктовках», откуда его можно скопировать или открыть в Finder.",
-            "When recording starts, MyDictate remembers the input field. You can open settings or another app: after transcription, text returns to that original field. If that window or field has been closed, MyDictate will not paste into another place; the text remains in Saved Dictations, where you can copy it or reveal it in Finder."
+            "После распознавания MyDictate вставляет текст туда, где в этот момент стоит текстовый курсор. Перед завершением диктовки перейдите в нужное поле. Полный текст всегда сохраняется в «Сохранённых диктовках», откуда его можно скопировать или открыть в Finder.",
+            "After transcription, MyDictate inserts text where the text cursor is at that moment. Before finishing dictation, switch to the field you want. The complete text is always saved in Saved Dictations, where you can copy it or reveal it in Finder."
         )
         alert.addButton(withTitle: t("Понятно", "OK"))
         alert.runModal()

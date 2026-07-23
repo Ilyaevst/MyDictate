@@ -9,7 +9,7 @@ bash -n install.sh uninstall.sh scripts/build-app.sh scripts/check.sh scripts/pr
 plutil -lint swift/Info.plist entitlements.plist
 
 app_version="$(plutil -extract CFBundleShortVersionString raw -o - swift/Info.plist)"
-[[ "$app_version" == "1.0.5" ]] || {
+[[ "$app_version" == "1.0.6" ]] || {
     printf 'Unexpected MyDictate version: %s\n' "$app_version" >&2
     exit 1
 }
