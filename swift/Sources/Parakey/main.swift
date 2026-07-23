@@ -36,6 +36,7 @@ import IOKit
 import QuartzCore
 import ServiceManagement
 import UniformTypeIdentifiers
+import UserNotifications
 import whisper
 
 // MARK: - Constants
@@ -461,8 +462,9 @@ let DICTATION_LANGUAGE_DISPLAY: [DictationLanguage: String] = [
 ]
 
 enum SpeechModelProfile: String, CaseIterable {
+    case whisperSmall = "whisper_small"
+    case whisperMedium = "whisper_medium"
     case whisperLargeV3Turbo = "whisper_large_v3_turbo"
-    case whisperLargeV3TurboQ5 = "whisper_large_v3_turbo_q5"
     case multilingualV3 = "multilingual_v3"
     // Deprecated production option. Kept only so old saved preferences
     // can be read and migrated back to the supported v3 model.
@@ -472,7 +474,8 @@ enum SpeechModelProfile: String, CaseIterable {
 
     var isProductionSupported: Bool {
         self == .whisperLargeV3Turbo
-            || self == .whisperLargeV3TurboQ5
+            || self == .whisperSmall
+            || self == .whisperMedium
             || self == .multilingualV3
     }
 
@@ -483,9 +486,11 @@ enum SpeechModelProfile: String, CaseIterable {
     var displayName: String {
         switch self {
         case .whisperLargeV3Turbo:
-            return "Whisper Turbo Full — best quality"
-        case .whisperLargeV3TurboQ5:
-            return "Whisper Turbo Q5 — smaller and faster"
+            return "Whisper Large V3 Turbo — best quality"
+        case .whisperSmall:
+            return "Whisper Small — faster and lighter"
+        case .whisperMedium:
+            return "Whisper Medium — balanced"
         case .multilingualV3:
             return "Parakeet TDT v3 — fastest"
         case .englishUnified:
@@ -496,9 +501,11 @@ enum SpeechModelProfile: String, CaseIterable {
     var shortName: String {
         switch self {
         case .whisperLargeV3Turbo:
-            return "Whisper Turbo Full"
-        case .whisperLargeV3TurboQ5:
-            return "Whisper Turbo Q5"
+            return "Whisper Large V3 Turbo"
+        case .whisperSmall:
+            return "Whisper Small"
+        case .whisperMedium:
+            return "Whisper Medium"
         case .multilingualV3:
             return "Parakeet TDT v3"
         case .englishUnified:
@@ -510,8 +517,10 @@ enum SpeechModelProfile: String, CaseIterable {
         switch self {
         case .whisperLargeV3Turbo:
             return "whisper.cpp · large-v3-turbo full (Metal · local · 1.62 GB)"
-        case .whisperLargeV3TurboQ5:
-            return "whisper.cpp · large-v3-turbo Q5 (Metal · local · 574 MB)"
+        case .whisperSmall:
+            return "whisper.cpp · small (Metal · local · 488 MB)"
+        case .whisperMedium:
+            return "whisper.cpp · medium (Metal · local · 1.53 GB)"
         case .multilingualV3:
             return "FluidAudio · Parakeet TDT v3 multilingual (CoreML / ANE)"
         case .englishUnified:
@@ -525,7 +534,7 @@ enum SpeechModelProfile: String, CaseIterable {
 
     var cacheResetDetail: String {
         switch self {
-        case .whisperLargeV3Turbo, .whisperLargeV3TurboQ5:
+        case .whisperLargeV3Turbo, .whisperSmall, .whisperMedium:
             return "MyDictate will delete the selected local Whisper model, unload it, and download a fresh verified copy before dictation is available again."
         case .multilingualV3:
             return "Parakey will delete the local Parakeet TDT v3 model cache, unload the current speech model, and download a fresh verified copy before dictation is available again."
@@ -538,8 +547,10 @@ enum SpeechModelProfile: String, CaseIterable {
         switch self {
         case .whisperLargeV3Turbo:
             return 1_624_555_275
-        case .whisperLargeV3TurboQ5:
-            return 574_041_195
+        case .whisperSmall:
+            return 487_601_967
+        case .whisperMedium:
+            return 1_533_763_059
         case .multilingualV3, .englishUnified:
             return 700 * 1024 * 1024
         }
@@ -549,8 +560,10 @@ enum SpeechModelProfile: String, CaseIterable {
         switch self {
         case .whisperLargeV3Turbo:
             return "about 1.6 GB"
-        case .whisperLargeV3TurboQ5:
-            return "about 574 MB"
+        case .whisperSmall:
+            return "about 488 MB"
+        case .whisperMedium:
+            return "about 1.53 GB"
         case .multilingualV3, .englishUnified:
             return "about 500-700 MB"
         }
@@ -560,8 +573,10 @@ enum SpeechModelProfile: String, CaseIterable {
         switch self {
         case .whisperLargeV3Turbo:
             return "ggml-large-v3-turbo.bin"
-        case .whisperLargeV3TurboQ5:
-            return "ggml-large-v3-turbo-q5_0.bin"
+        case .whisperSmall:
+            return "ggml-small.bin"
+        case .whisperMedium:
+            return "ggml-medium.bin"
         case .multilingualV3, .englishUnified:
             return nil
         }
@@ -577,8 +592,10 @@ enum SpeechModelProfile: String, CaseIterable {
         switch self {
         case .whisperLargeV3Turbo:
             return "1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69"
-        case .whisperLargeV3TurboQ5:
-            return "394221709cd5ad1f40c46e6031ca61bce88931e6e088c188294c6d5a55ffa7e2"
+        case .whisperSmall:
+            return "1be3a9b2063867b937e64e2ec7483364a79917e157fa98c5d94b5c1fffea987b"
+        case .whisperMedium:
+            return "6c14d5adee5f86394037b4e4e8b59f1673b6cee10e3cf0b11bbdbee79c156208"
         case .multilingualV3, .englishUnified:
             return nil
         }
@@ -1748,9 +1765,12 @@ func speechModelCacheDirectory(for profile: SpeechModelProfile) -> URL {
     case .whisperLargeV3Turbo:
         return speechModelCacheBaseDirectory()
             .appendingPathComponent("whisper-large-v3-turbo", isDirectory: true)
-    case .whisperLargeV3TurboQ5:
+    case .whisperSmall:
         return speechModelCacheBaseDirectory()
-            .appendingPathComponent("whisper-large-v3-turbo-q5", isDirectory: true)
+            .appendingPathComponent("whisper-small", isDirectory: true)
+    case .whisperMedium:
+        return speechModelCacheBaseDirectory()
+            .appendingPathComponent("whisper-medium", isDirectory: true)
     case .multilingualV3, .englishUnified:
         return AsrModels.defaultCacheDirectory(for: .v3)
     }
@@ -4553,6 +4573,46 @@ private enum DictationArchive {
         }
     }
 
+    /// A transcript made only of punctuation (for example ". . . .") is a
+    /// decoder failure just as surely as an empty string.  Keeping the WAV
+    /// gives the user something real to retry instead of treating it as a
+    /// successful dictation and deleting the only source recording.
+    static func hasMeaningfulTranscriptContent(_ text: String) -> Bool {
+        text.unicodeScalars.contains { scalar in
+            CharacterSet.letters.contains(scalar) || CharacterSet.decimalDigits.contains(scalar)
+        }
+    }
+
+    /// Failed and not-yet-retried recordings are intentionally temporary.
+    /// Text transcripts remain permanent; only source audio and its sidecar
+    /// error note are removed after a week to avoid silently filling the disk.
+    static func removeExpiredRecoverableAudio(now: Date = Date(),
+                                              maximumAge: TimeInterval = 7 * 24 * 60 * 60) {
+        let fm = FileManager.default
+        let cutoff = now.addingTimeInterval(-maximumAge)
+        let directories = [try? failedAudioDirectoryURL(), try? pendingAudioDirectoryURL()]
+            .compactMap { $0 }
+        for directory in directories {
+            guard let urls = try? fm.contentsOfDirectory(
+                at: directory,
+                includingPropertiesForKeys: [.contentModificationDateKey, .creationDateKey, .isRegularFileKey],
+                options: [.skipsHiddenFiles]
+            ) else { continue }
+            for url in urls {
+                guard let values = try? url.resourceValues(forKeys: [.contentModificationDateKey, .creationDateKey, .isRegularFileKey]),
+                      values.isRegularFile == true else { continue }
+                let date = values.contentModificationDate ?? values.creationDate ?? now
+                guard date < cutoff else { continue }
+                do {
+                    try fm.removeItem(at: url)
+                    log("expired recoverable dictation audio removed: \(privacySafeLogPath(url))")
+                } catch {
+                    log("recoverable dictation audio cleanup failed: \(error.localizedDescription)")
+                }
+            }
+        }
+    }
+
     private static func createPrivateDirectory(_ url: URL) throws {
         try FileManager.default.createDirectory(at: url,
                                                 withIntermediateDirectories: true,
@@ -5458,7 +5518,7 @@ actor TranscriptionWorker {
         }
         let t0 = Date()
         switch profile {
-        case .whisperLargeV3Turbo, .whisperLargeV3TurboQ5:
+        case .whisperLargeV3Turbo, .whisperSmall, .whisperMedium:
             engine = .whisperLargeV3Turbo(
                 try await loadWhisper(profile: profile, progressHandler: progressHandler)
             )
@@ -10164,6 +10224,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         settings.enableMyDictateUpdatesIfNeeded()
         pendingUpdate = nil
+        DictationArchive.removeExpiredRecoverableAudio()
         if settings.normalizeSpeechModelProfileForCurrentBuild() {
             log("ASR: reset unsupported saved speech model selection to \(settings.speechModelProfile.shortName)")
         }
@@ -10542,13 +10603,18 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 let processed = processedDictationText(rawTranscript: transcription.text,
                                                        corrections: settings.transcriptCorrections,
                                                        removeFillerWords: settings.removeFillerWords)
-                guard !processed.text.isEmpty else {
+                guard DictationArchive.hasMeaningfulTranscriptContent(processed.text) else {
+                    if !processed.text.isEmpty {
+                        _ = DictationArchive.saveTranscript(processed.text, sourceAudioURL: url)
+                    }
                     DictationArchive.preserveFailedAudio(
                         samples,
                         sourceAudioURL: url,
-                        errorDescription: "The speech model returned an empty transcript."
+                        errorDescription: processed.text.isEmpty
+                            ? "The speech model returned an empty transcript."
+                            : "The speech model returned only punctuation or no readable words."
                     )
-                    log("pending dictation recovery returned empty text; audio retained")
+                    log("pending dictation recovery returned no meaningful text; audio retained")
                     continue
                 }
 
@@ -11780,6 +11846,48 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         flashErrorMenuBarIcon()
     }
 
+    /// When macOS does not expose the original editor through Accessibility,
+    /// a clipboard hand-off is safer than guessing the current focus.  The
+    /// transcript and WAV have already been made durable before this runs.
+    private func copyTranscriptForRecovery(_ text: String) {
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(text, forType: .string)
+        log("dictation copied to clipboard for recovery (\(text.count) chars)")
+    }
+
+    private func presentInsertionRecoveryNotice() {
+        let notification = UNMutableNotificationContent()
+        notification.title = "MyDictate: текст сохранён"
+        notification.body = "Не удалось безопасно вставить диктовку. Текст уже скопирован — вернитесь в нужное поле и нажмите ⌘V. Исходное аудио сохранено на 7 дней."
+        let request = UNNotificationRequest(identifier: "dictation-insertion-\(UUID().uuidString)",
+                                            content: notification,
+                                            trigger: nil)
+        let center = UNUserNotificationCenter.current()
+        center.requestAuthorization(options: [.alert]) { granted, error in
+            guard granted else {
+                if let error { log("dictation recovery notification unavailable: \(error.localizedDescription)") }
+                return
+            }
+            center.add(request) { error in
+                if let error { log("dictation recovery notification delivery failed: \(error.localizedDescription)") }
+            }
+        }
+
+        // The notification reaches the user even with the panel minimised;
+        // the alert adds an unmissable in-app explanation if MyDictate is
+        // visible or becomes active.
+        DispatchQueue.main.async { [weak self] in
+            guard let self, !self.isTerminating else { return }
+            let alert = NSAlert()
+            alert.messageText = "Не удалось вставить диктовку"
+            alert.informativeText = "Текст сохранён в «Сохранённых диктовках» и уже скопирован в буфер обмена. Вернитесь в нужное поле и нажмите ⌘V. Исходное аудио сохранено на 7 дней."
+            alert.addButton(withTitle: "Понятно")
+            NSApp.activate(ignoringOtherApps: true)
+            alert.runModal()
+        }
+    }
+
     private func flashErrorMenuBarIcon() {
         errorFlashWorkItem?.cancel()
         setMenuBarState(.error)
@@ -11935,7 +12043,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     }
                     let cleaned = processed.text
                     log("\(String(format: "%.2f", dur)) s audio → \(String(format: "%.2f", asrTiming.totalSeconds)) s → \(cleaned.count) chars")
-                    if !cleaned.isEmpty {
+                    if DictationArchive.hasMeaningfulTranscriptContent(cleaned) {
                         // The durable text file is written before history and
                         // before paste. A target-app or pasteboard failure can
                         // therefore never destroy a completed transcription.
@@ -11954,14 +12062,6 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                                              audioSeconds: dur,
                                              asrSeconds: asrTiming.totalSeconds)
                         let historyCompletedAt = ProcessInfo.processInfo.systemUptime
-
-                        let journalCleanupStartedAt = ProcessInfo.processInfo.systemUptime
-                        if archivedURL != nil {
-                            PendingDictationRecovery.remove(captured.recoveryURL)
-                        } else {
-                            log("pending dictation retained because its transcript could not be archived")
-                        }
-                        let journalCleanupCompletedAt = ProcessInfo.processInfo.systemUptime
 
                         let permissionRecheckStartedAt = ProcessInfo.processInfo.systemUptime
                         let missing = missingPermissions()
@@ -11992,12 +12092,22 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                                 inserted = false
                             }
                         } else {
-                            log("no original text destination was captured; using the active field")
-                            inserted = TextInserter.insert(insertionText)
+                            // We cannot prove that the active field at release is
+                            // the field where the dictation began.  Never risk
+                            // pasting into the wrong chat, browser tab or command
+                            // line: copy it and make the recovery explicit.
+                            log("no original text destination was captured; using clipboard recovery")
+                            inserted = false
                         }
                         let insertionCompletedAt = ProcessInfo.processInfo.systemUptime
                         var enterDelaySeconds: Double?
+                        let journalCleanupStartedAt = ProcessInfo.processInfo.systemUptime
                         if inserted {
+                            if archivedURL != nil {
+                                PendingDictationRecovery.remove(captured.recoveryURL)
+                            } else {
+                                log("pending dictation retained because its transcript could not be archived")
+                            }
                             if shouldPressEnterAfterInsertion {
                                 let enterDelayStartedAt = ProcessInfo.processInfo.systemUptime
                                 try? await Task.sleep(nanoseconds: ENTER_AFTER_INSERT_DELAY_NANOSECONDS)
@@ -12013,8 +12123,17 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                             }
                         } else {
                             log("text insertion failed")
+                            DictationArchive.preserveFailedAudio(
+                                samples,
+                                sourceAudioURL: captured.recoveryURL,
+                                errorDescription: "Text could not be safely inserted. The transcript was copied to the clipboard."
+                            )
+                            PendingDictationRecovery.remove(captured.recoveryURL)
+                            copyTranscriptForRecovery(cleaned)
+                            presentInsertionRecoveryNotice()
                             dictationFailed = true
                         }
+                        let journalCleanupCompletedAt = ProcessInfo.processInfo.systemUptime
 
                         log(DictationLatencyMetrics(
                             audioSeconds: dur,
@@ -12040,12 +12159,23 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                             pasteSucceeded: inserted
                         ).logLine)
                     } else {
+                        // Preserve the visible bad result as evidence, but retain
+                        // the source audio and retry journal rather than accepting
+                        // punctuation-only output as a successful dictation.
+                        if !cleaned.isEmpty {
+                            _ = DictationArchive.saveTranscript(
+                                cleaned,
+                                sourceAudioURL: captured.recoveryURL
+                            )
+                        }
                         DictationArchive.preserveFailedAudio(
                             samples,
                             sourceAudioURL: captured.recoveryURL,
-                            errorDescription: "The speech model returned an empty transcript."
+                            errorDescription: cleaned.isEmpty
+                                ? "The speech model returned an empty transcript."
+                                : "The speech model returned only punctuation or no readable words."
                         )
-                        log("transcription returned empty text; audio retained")
+                        log("transcription returned no meaningful text; audio retained for retry")
                         dictationFailed = true
                     }
                 }
@@ -12122,7 +12252,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     let processed = processedDictationText(rawTranscript: transcription.text,
                                                            corrections: settings.transcriptCorrections,
                                                            removeFillerWords: settings.removeFillerWords)
-                    if !processed.text.isEmpty {
+                    if DictationArchive.hasMeaningfulTranscriptContent(processed.text) {
                         let archivedURL = DictationArchive.saveTranscript(
                             processed.text,
                             sourceAudioURL: captured.recoveryURL
@@ -12136,6 +12266,11 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                                              audioSeconds: duration,
                                              asrSeconds: timing.totalSeconds)
                         if archivedURL != nil {
+                            DictationArchive.preserveFailedAudio(
+                                captured.samples,
+                                sourceAudioURL: captured.recoveryURL,
+                                errorDescription: "Recording ended before MyDictate could return the text to its original field (\(reason))."
+                            )
                             PendingDictationRecovery.remove(captured.recoveryURL)
                         } else {
                             recoveryFailed = true
@@ -12143,12 +12278,20 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                         }
                     } else {
                         recoveryFailed = true
+                        if !processed.text.isEmpty {
+                            _ = DictationArchive.saveTranscript(
+                                processed.text,
+                                sourceAudioURL: captured.recoveryURL
+                            )
+                        }
                         DictationArchive.preserveFailedAudio(
                             captured.samples,
                             sourceAudioURL: captured.recoveryURL,
-                            errorDescription: "The speech model returned an empty transcript."
+                            errorDescription: processed.text.isEmpty
+                                ? "The speech model returned an empty transcript."
+                                : "The speech model returned only punctuation or no readable words."
                         )
-                        log("dictation recovery returned empty text; audio retained")
+                        log("dictation recovery returned no meaningful text; audio retained")
                     }
                     log("recovered dictation: \(String(format: "%.2f", duration)) s audio → \(String(format: "%.2f", timing.totalSeconds)) s → \(processed.text.count) chars in history")
                 }
@@ -17024,6 +17167,21 @@ private enum ParakeySelfTest {
             "stored v3 speech model should remain valid"
         )
         try expect(
+            productionSpeechModelProfile(rawValue: SpeechModelProfile.whisperSmall.rawValue),
+            equals: .whisperSmall,
+            "stored Whisper Small selection should remain valid"
+        )
+        try expect(
+            productionSpeechModelProfile(rawValue: SpeechModelProfile.whisperMedium.rawValue),
+            equals: .whisperMedium,
+            "stored Whisper Medium selection should remain valid"
+        )
+        try expect(
+            productionSpeechModelProfile(rawValue: "whisper_large_v3_turbo_q5"),
+            equals: .whisperLargeV3Turbo,
+            "removed Whisper Q5 selection should migrate to the default"
+        )
+        try expect(
             productionSpeechModelProfile(rawValue: SpeechModelProfile.englishUnified.rawValue),
             equals: .whisperLargeV3Turbo,
             "deprecated Unified speech model setting should migrate to Whisper"
@@ -19574,6 +19732,16 @@ private enum ParakeySelfTest {
 
     private static func testRecordingLifecycle() throws {
         try expect(
+            DictationArchive.hasMeaningfulTranscriptContent(". . . ."),
+            equals: false,
+            "punctuation-only transcript must retain recovery audio"
+        )
+        try expect(
+            DictationArchive.hasMeaningfulTranscriptContent("GitHub main 2026"),
+            equals: true,
+            "words and digits should be accepted as a usable transcript"
+        )
+        try expect(
             recordingReleaseAction(capturedSampleCount: 3_999,
                                    sampleRate: 16_000,
                                    minimumClipSeconds: 0.25),
@@ -20576,6 +20744,11 @@ private struct SavedDictationTranscript {
     let url: URL
     let text: String
     let date: Date
+    /// A matching WAV means the text was not safe to use as-is (or could not
+    /// be inserted).  A matching pending journal can be retried by restarting
+    /// the service from the archive window.
+    let recoveryAudioURL: URL?
+    let retryPending: Bool
 }
 
 private struct SavedDictationArchiveSnapshot {
@@ -20632,6 +20805,17 @@ private func savedDictationArchiveSnapshot(transcriptsDirectory: URL,
             return left > right
         }
 
+    let failedAudioByStem = Dictionary(
+        uniqueKeysWithValues: regularFiles(in: failedAudioDirectory, extension: "wav").map {
+            ($0.deletingPathExtension().lastPathComponent, $0)
+        }
+    )
+    let pendingAudioByStem = Dictionary(
+        uniqueKeysWithValues: regularFiles(in: pendingAudioDirectory, extension: "sdaudio").map {
+            ($0.deletingPathExtension().lastPathComponent.replacingOccurrences(of: "pending-", with: ""), $0)
+        }
+    )
+
     let loadLimit = max(0, maximumLoadedTranscripts)
     let transcripts = transcriptURLs.prefix(loadLimit).compactMap { url -> SavedDictationTranscript? in
         guard let values = try? url.resourceValues(forKeys: [
@@ -20648,7 +20832,10 @@ private func savedDictationArchiveSnapshot(transcriptsDirectory: URL,
         return SavedDictationTranscript(
             url: url,
             text: cleaned,
-            date: values.contentModificationDate ?? values.creationDate ?? .distantPast
+            date: values.contentModificationDate ?? values.creationDate ?? .distantPast,
+            recoveryAudioURL: failedAudioByStem[url.deletingPathExtension().lastPathComponent]
+                ?? pendingAudioByStem[url.deletingPathExtension().lastPathComponent],
+            retryPending: pendingAudioByStem[url.deletingPathExtension().lastPathComponent] != nil
         )
     }
 
@@ -21316,6 +21503,18 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             audio.controlSize = .small
             footer.addArrangedSubview(audio)
         }
+        if snapshot.pendingAudioCount > 0 {
+            let retry = panelButton(
+                t("Распознать ещё раз (\(snapshot.pendingAudioCount))", "Retry recognition (\(snapshot.pendingAudioCount))"),
+                action: #selector(retrySavedAudioRecognitionClicked(_:)),
+                toolTip: t("Перезапустить службу и повторить распознавание сохранённого аудио. Текст и аудио не удаляются до успешного результата.",
+                           "Restart the service and retry saved audio. Text and audio remain until recognition succeeds.")
+            )
+            retry.image = NSImage(systemSymbolName: "arrow.clockwise", accessibilityDescription: nil)
+            retry.imagePosition = .imageLeading
+            retry.controlSize = .small
+            footer.addArrangedSubview(retry)
+        }
         footer.addArrangedSubview(panelButton(t("Закрыть", "Close"),
                                               action: #selector(closeSavedDictationsClicked(_:))))
         root.addArrangedSubview(footer)
@@ -21365,6 +21564,18 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                               weight: .medium,
                               color: .secondaryLabelColor)
         top.addArrangedSubview(date)
+        if transcript.recoveryAudioURL != nil {
+            let status = panelLabel(
+                transcript.retryPending
+                    ? t("Нужно повторить распознавание", "Recognition needs retry")
+                    : t("Аудио сохранено после ошибки", "Audio retained after an error"),
+                size: 10.5,
+                weight: .medium,
+                color: .systemOrange
+            )
+            status.lineBreakMode = .byTruncatingTail
+            top.addArrangedSubview(status)
+        }
         top.addArrangedSubview(NSView())
         let copy = SavedTranscriptCopyButton(
             title: "",
@@ -21417,10 +21628,20 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         header.addArrangedSubview(panelLabel(savedTranscriptDateText(transcript.date),
                                              size: 11,
                                              color: .secondaryLabelColor))
+        if transcript.recoveryAudioURL != nil {
+            header.addArrangedSubview(panelLabel(
+                transcript.retryPending
+                    ? t("Распознано не полностью — исходное аудио сохранено; можно повторить распознавание.", "Recognition is incomplete — source audio is saved; you can retry.")
+                    : t("Текст не был вставлен — исходное аудио сохранено на 7 дней.", "Text was not inserted — source audio is saved for 7 days."),
+                size: 11,
+                weight: .medium,
+                color: .systemOrange
+            ))
+        }
         root.addArrangedSubview(header)
         root.addArrangedSubview(separator())
 
-        let textView = NSTextView(frame: NSRect(x: 0, y: 0, width: 600, height: 280))
+        let textView = NSTextView(frame: NSRect(x: 0, y: 0, width: 1, height: 280))
         textView.string = transcript.text
         textView.font = .systemFont(ofSize: 13)
         textView.textColor = .labelColor
@@ -21436,7 +21657,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         textView.isHorizontallyResizable = false
         textView.autoresizingMask = [.width]
         textView.textContainer?.widthTracksTextView = true
-        textView.textContainer?.containerSize = NSSize(width: 600,
+        textView.textContainer?.containerSize = NSSize(width: CGFloat.greatestFiniteMagnitude,
                                                        height: CGFloat.greatestFiniteMagnitude)
 
         let scroll = NSScrollView()
@@ -22651,9 +22872,11 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         guard language == .russian else { return profile.displayName }
         switch profile {
         case .whisperLargeV3Turbo:
-            return "Whisper Turbo Full — лучшее качество"
-        case .whisperLargeV3TurboQ5:
-            return "Whisper Turbo Q5 — компактнее и быстрее"
+            return "Whisper Large V3 Turbo — лучшее качество"
+        case .whisperSmall:
+            return "Whisper Small — быстрее и легче"
+        case .whisperMedium:
+            return "Whisper Medium — баланс скорости и качества"
         case .multilingualV3:
             return "Parakeet TDT v3 — самый быстрый"
         case .englishUnified:
@@ -22666,9 +22889,12 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         case .whisperLargeV3Turbo:
             return t("Максимальная точность для русской речи и английских технических терминов · 1,62 ГБ",
                      "Best accuracy for multilingual speech and technical terms · 1.62 GB")
-        case .whisperLargeV3TurboQ5:
-            return t("Почти то же качество, компактнее и экономнее по памяти · 574 МБ",
-                     "Nearly the same quality with a smaller model and lower memory use · 574 MB")
+        case .whisperSmall:
+            return t("Быстрее и легче; заметно слабее на смешанной русско-английской речи · 488 МБ",
+                     "Faster and lighter; less accurate on mixed Russian-English speech · 488 MB")
+        case .whisperMedium:
+            return t("Баланс скорости и качества для русской речи и терминов · 1,53 ГБ",
+                     "Balanced speed and quality for Russian speech and technical terms · 1.53 GB")
         case .multilingualV3:
             return t("Самая высокая скорость; слабее на смешанной технической речи · 500–700 МБ",
                      "Fastest option; less reliable for mixed technical speech · 500–700 MB")
@@ -22940,6 +23166,21 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                                "Could Not Open Audio Folder"),
                       detail: error.localizedDescription)
         }
+    }
+
+    @objc private func retrySavedAudioRecognitionClicked(_ sender: NSButton) {
+        guard serviceOperation == nil else { return }
+        guard !PendingDictationRecovery.pendingURLs().isEmpty else {
+            refresh(force: true)
+            return
+        }
+        // The agent owns the loaded ASR engine.  Restarting it invokes its
+        // existing recovery queue, which processes the retained .sdaudio
+        // journal without ever deleting the original WAV first.
+        settings.agentEnabled = true
+        _ = settings.refreshFromDisk()
+        beginServiceOperation(.restarting)
+        log("saved audio retry requested from archive window")
     }
 
     @objc private func closeSavedDictationsClicked(_ sender: NSButton) {
