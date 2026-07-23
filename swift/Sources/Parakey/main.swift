@@ -3637,7 +3637,12 @@ final class Permissions {
             if status == .denied {
                 openSettingsPane("Privacy_Microphone")
             } else {
-                AVCaptureDevice.requestAccess(for: .audio) { granted in
+                // The callback API invokes its completion on a TCC worker
+                // queue. Calling code from this @MainActor type there causes
+                // Swift's executor assertion to terminate the app. The async
+                // API resumes this task safely on MainActor instead.
+                Task { @MainActor in
+                    let granted = await AVCaptureDevice.requestAccess(for: .audio)
                     log("Microphone request: granted=\(granted)")
                 }
             }
