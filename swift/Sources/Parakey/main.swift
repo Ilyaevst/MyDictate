@@ -20934,6 +20934,39 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
 
     private var language: InterfaceLanguage { settings.interfaceLanguage }
 
+    private var usesDarkPanelAppearance: Bool {
+        let appearance = window?.effectiveAppearance ?? NSApp.effectiveAppearance
+        return appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+    }
+
+    // Layer-backed cards need resolved colours: unlike NSTextField's dynamic
+    // semantic colours, assigning `cgColor` to a CALayer freezes the current
+    // appearance. These values give the dark panel its own charcoal surfaces
+    // and preserve the existing native light appearance.
+    private var panelCardFillColor: NSColor {
+        usesDarkPanelAppearance
+            ? NSColor(srgbRed: 0.18, green: 0.185, blue: 0.20, alpha: 0.98)
+            : NSColor.controlBackgroundColor.withAlphaComponent(0.70)
+    }
+
+    private var panelCardBorderColor: NSColor {
+        usesDarkPanelAppearance
+            ? NSColor(srgbRed: 0.36, green: 0.37, blue: 0.40, alpha: 0.92)
+            : NSColor.separatorColor.withAlphaComponent(0.42)
+    }
+
+    private var panelSelectedCardFillColor: NSColor {
+        usesDarkPanelAppearance
+            ? NSColor(srgbRed: 0.055, green: 0.20, blue: 0.36, alpha: 0.96)
+            : NSColor.systemBlue.withAlphaComponent(0.11)
+    }
+
+    private var panelSelectedCardBorderColor: NSColor {
+        usesDarkPanelAppearance
+            ? NSColor(srgbRed: 0.25, green: 0.62, blue: 1.0, alpha: 0.94)
+            : NSColor.systemBlue.withAlphaComponent(0.75)
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
         settings.enableMyDictateUpdatesIfNeeded()
@@ -21106,6 +21139,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                           state?.speechModelReady == true ? "1" : "0"].joined(separator: "|")
         }
         return [language.rawValue,
+                usesDarkPanelAppearance ? "dark" : "light",
                 serviceOperation?.rawValue ?? "idle",
                 updateStateFingerprint(),
                 SuperDictateAgentService.isAgentRunning() ? "running" : "stopped",
@@ -21296,11 +21330,11 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         let card = compactCard()
         card.layer?.cornerRadius = 11
         card.layer?.backgroundColor = selected
-            ? NSColor.systemBlue.withAlphaComponent(0.11).cgColor
-            : NSColor.controlBackgroundColor.withAlphaComponent(0.72).cgColor
+            ? panelSelectedCardFillColor.cgColor
+            : panelCardFillColor.cgColor
         card.layer?.borderColor = selected
-            ? NSColor.systemBlue.withAlphaComponent(0.75).cgColor
-            : NSColor.separatorColor.withAlphaComponent(0.42).cgColor
+            ? panelSelectedCardBorderColor.cgColor
+            : panelCardBorderColor.cgColor
         card.layer?.borderWidth = selected ? 1.5 : 1
 
         let row = NSStackView()
@@ -21526,8 +21560,8 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             self?.openSavedTranscript(transcript)
         }
         card.wantsLayer = true
-        card.layer?.backgroundColor = NSColor.controlBackgroundColor.withAlphaComponent(0.70).cgColor
-        card.layer?.borderColor = NSColor.separatorColor.withAlphaComponent(0.42).cgColor
+        card.layer?.backgroundColor = panelCardFillColor.cgColor
+        card.layer?.borderColor = panelCardBorderColor.cgColor
         card.layer?.borderWidth = 1
         card.layer?.cornerRadius = 10
         let content = NSStackView()
@@ -22618,7 +22652,24 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                              enabled: Bool = true,
                              toolTip: String? = nil) -> NSButton {
         let button = NSButton(title: title, target: self, action: action)
-        button.bezelStyle = .rounded
+        if usesDarkPanelAppearance {
+            // The ordinary rounded bezel can become near-white in a vibrant
+            // dark window, while AppKit keeps its title light. Textured
+            // rounded controls provide the intended dark, legible contrast.
+            button.bezelStyle = .texturedRounded
+            let titleColor = enabled
+                ? NSColor.white.withAlphaComponent(0.92)
+                : NSColor.white.withAlphaComponent(0.38)
+            button.attributedTitle = NSAttributedString(
+                string: title,
+                attributes: [
+                    .font: NSFont.systemFont(ofSize: NSFont.systemFontSize),
+                    .foregroundColor: titleColor,
+                ]
+            )
+        } else {
+            button.bezelStyle = .rounded
+        }
         button.controlSize = .regular
         button.isEnabled = enabled
         button.toolTip = toolTip
@@ -22638,6 +22689,11 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         button.bezelStyle = .texturedRounded
         button.controlSize = .small
         button.isEnabled = enabled
+        if usesDarkPanelAppearance {
+            button.contentTintColor = enabled
+                ? NSColor.white.withAlphaComponent(0.90)
+                : NSColor.white.withAlphaComponent(0.36)
+        }
         button.toolTip = toolTip
         button.setAccessibilityLabel(accessibilityTitle)
         button.translatesAutoresizingMaskIntoConstraints = false
@@ -22652,8 +22708,8 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         let card = NSView()
         card.wantsLayer = true
         card.layer?.cornerRadius = 8
-        card.layer?.backgroundColor = NSColor.controlBackgroundColor.withAlphaComponent(0.70).cgColor
-        card.layer?.borderColor = NSColor.separatorColor.withAlphaComponent(0.42).cgColor
+        card.layer?.backgroundColor = panelCardFillColor.cgColor
+        card.layer?.borderColor = panelCardBorderColor.cgColor
         card.layer?.borderWidth = 1
         card.setContentHuggingPriority(.required, for: .vertical)
         card.setContentCompressionResistancePriority(.required, for: .vertical)

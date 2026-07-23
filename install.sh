@@ -21,7 +21,7 @@ say "Собираю локальную версию из этого проект
 "$ROOT_DIR/scripts/build-app.sh" "$BUILT_APP"
 
 [[ -x "$BUILT_APP/Contents/MacOS/MyDictate" ]] || fail "Сборка не создала MyDictate."
-[[ "$(plutil -extract CFBundleShortVersionString raw -o - "$BUILT_APP/Contents/Info.plist")" == "1.0.7" ]] \
+[[ "$(plutil -extract CFBundleShortVersionString raw -o - "$BUILT_APP/Contents/Info.plist")" == "1.0.8" ]] \
     || fail "Неожиданная версия приложения."
 codesign --verify --deep --strict "$BUILT_APP" || fail "Проверка подписи не прошла."
 
@@ -44,4 +44,4 @@ rm -rf "$BACKUP"
 if [[ "$NO_OPEN" != "1" ]]; then
     open "$APP_PATH"
 fi
-say "Готово. Установлена MyDictate 1.0.7."
+say "Готово. Установлена MyDictate 1.0.8."
