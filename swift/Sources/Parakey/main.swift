@@ -81,6 +81,18 @@ let UPDATE_HELPER_LOG_PATH = (NSHomeDirectory() as NSString)
     .appendingPathComponent("Library/Logs/MyDictate-update.log")
 let UPDATE_PROGRESS_ARGUMENT = "--update-progress"
 let UPDATE_PROGRESS_APP_PREFIX = "MyDictate-update-progress-"
+/// Internal visual QA mode. It is only enabled by an inherited process
+/// environment and never ships as a visible setting. It renders the panel
+/// without claiming the live panel, starting the agent, checking updates or
+/// changing the user's preferences.
+let DESIGN_PREVIEW_BUNDLE_IDENTIFIER = "com.local.mydictate.design-preview"
+let DESIGN_PREVIEW_MODE = ProcessInfo.processInfo.environment["MYDICTATE_DESIGN_PREVIEW"] == "1"
+    || Bundle.main.bundleIdentifier == DESIGN_PREVIEW_BUNDLE_IDENTIFIER
+    || (Bundle.main.object(forInfoDictionaryKey: "MyDictateDesignPreview") as? Bool == true)
+let DESIGN_PREVIEW_DARK_MODE = ProcessInfo.processInfo.environment["MYDICTATE_DESIGN_PREVIEW_DARK"] == "1"
+    || (Bundle.main.object(forInfoDictionaryKey: "MyDictateDesignPreviewDark") as? Bool == true)
+let DESIGN_PREVIEW_LIGHT_MODE = ProcessInfo.processInfo.environment["MYDICTATE_DESIGN_PREVIEW_LIGHT"] == "1"
+    || (Bundle.main.object(forInfoDictionaryKey: "MyDictateDesignPreviewLight") as? Bool == true)
 let MAX_SKIPPED_UPDATE_VERSIONS = 20
 let MAX_CORRECTION_SYNC_PATH_BYTES = 4096
 let MAX_INPUT_DEVICE_PREFERENCE_BYTES = 512
@@ -2377,8 +2389,14 @@ enum SuperDictateAgentService {
     static var launchService: String { "\(launchDomain)/\(AGENT_LABEL)" }
 
     static func agentExecutablePath() -> String {
-        Bundle.main.executablePath ??
-        "\(INSTALLED_APP_BUNDLE_PATH)/Contents/MacOS/MyDictate"
+        if DESIGN_PREVIEW_MODE {
+            let installedExecutable = "\(INSTALLED_APP_BUNDLE_PATH)/Contents/MacOS/MyDictate"
+            if FileManager.default.isExecutableFile(atPath: installedExecutable) {
+                return installedExecutable
+            }
+        }
+        return Bundle.main.executablePath ??
+            "\(INSTALLED_APP_BUNDLE_PATH)/Contents/MacOS/MyDictate"
     }
 
     static func installAndStart() throws {
@@ -9461,6 +9479,7 @@ private final class HistoryDeleteButton: NSButton {
         bezelStyle = .regularSquare
         focusRingType = .none
         setButtonType(.momentaryChange)
+        imageHugsTitle = true
         wantsLayer = true
         layer?.cornerRadius = 8
         layer?.cornerCurve = .continuous
@@ -21169,19 +21188,31 @@ private func savedDictationArchiveSnapshot(transcriptsDirectory: URL,
     )
 }
 
-/// A small, explicit button treatment for the control panel. AppKit's
-/// textured buttons can look like inactive labels inside a visual-effect
-/// view, so this keeps a stable border, hover state, and clear click target.
+/// The control panel has three deliberately restrained button roles. Keeping
+/// them in one place prevents a mix of AppKit's textured controls, bordered
+/// pills and plain labels across the different windows.
+private enum PanelButtonStyle {
+    case primary
+    case secondary
+    case quiet
+}
+
+/// A small, explicit button treatment for the control panel. The visual
+/// language is intentionally close to a calm dashboard: a single warm action
+/// colour, soft neutral secondary controls and quiet icon actions.
 private class PanelActionButton: NSButton {
     private let usesDarkAppearance: Bool
+    private let style: PanelButtonStyle
     private var trackingArea: NSTrackingArea?
     private var hovered = false
 
     init(title: String,
          target: AnyObject?,
          action: Selector?,
-         usesDarkAppearance: Bool) {
+         usesDarkAppearance: Bool,
+         style: PanelButtonStyle = .secondary) {
         self.usesDarkAppearance = usesDarkAppearance
+        self.style = style
         super.init(frame: .zero)
         self.title = title
         self.target = target
@@ -21191,7 +21222,7 @@ private class PanelActionButton: NSButton {
         focusRingType = .none
         setButtonType(.momentaryChange)
         wantsLayer = true
-        layer?.cornerRadius = 7
+        layer?.cornerRadius = 10
         layer?.cornerCurve = .continuous
         font = .systemFont(ofSize: NSFont.systemFontSize, weight: .medium)
         applyAppearance()
@@ -21206,8 +21237,26 @@ private class PanelActionButton: NSButton {
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
+    override var intrinsicContentSize: NSSize {
+        let size = super.intrinsicContentSize
+        // Do not turn small utility actions into oversized pills.  The
+        // standard AppKit intrinsic height already accounts for the control
+        // size, so a light two-point breathing room is enough here.
+        return NSSize(width: title.isEmpty ? max(30, size.width + 10) : size.width + 18,
+                      height: max(24, size.height + 2))
+    }
+
     override var title: String {
-        didSet { applyAppearance() }
+        didSet {
+            invalidateIntrinsicContentSize()
+            applyAppearance()
+        }
+    }
+
+    override var image: NSImage? {
+        didSet {
+            invalidateIntrinsicContentSize()
+        }
     }
 
     override func updateTrackingAreas() {
@@ -21240,37 +21289,54 @@ private class PanelActionButton: NSButton {
     }
 
     private func applyAppearance() {
-        let alpha: CGFloat
-        let borderAlpha: CGFloat
+        let lightMuted = NSColor(srgbRed: 0.91, green: 0.918, blue: 0.935, alpha: 1)
+        let lightMutedHover = NSColor(srgbRed: 0.84, green: 0.855, blue: 0.885, alpha: 1)
+        let darkMuted = NSColor(srgbRed: 0.16, green: 0.17, blue: 0.20, alpha: 1)
+        let darkMutedHover = NSColor(srgbRed: 0.23, green: 0.24, blue: 0.28, alpha: 1)
+        let orange = NSColor(srgbRed: 1.0, green: 0.40, blue: 0.10, alpha: 1)
+        let orangeHover = NSColor(srgbRed: 0.91, green: 0.31, blue: 0.055, alpha: 1)
+
+        let background: NSColor
+        let foreground: NSColor
         if !isEnabled {
-            alpha = usesDarkAppearance ? 0.05 : 0.35
-            borderAlpha = usesDarkAppearance ? 0.12 : 0.20
-        } else if hovered {
-            alpha = usesDarkAppearance ? 0.22 : 0.16
-            borderAlpha = usesDarkAppearance ? 0.42 : 0.32
+            // AppKit additionally dims a disabled NSButton's title. Use
+            // opaque neutral colours here so the final rendered control stays
+            // legible and matches the secondary buttons instead of fading
+            // into the settings background.
+            background = usesDarkAppearance
+                ? NSColor(srgbRed: 0.17, green: 0.18, blue: 0.21, alpha: 1)
+                : NSColor(srgbRed: 0.88, green: 0.89, blue: 0.91, alpha: 1)
+            foreground = usesDarkAppearance
+                ? NSColor(srgbRed: 0.78, green: 0.80, blue: 0.84, alpha: 1)
+                : NSColor(srgbRed: 0.34, green: 0.36, blue: 0.40, alpha: 1)
         } else {
-            alpha = usesDarkAppearance ? 0.12 : 0.08
-            borderAlpha = usesDarkAppearance ? 0.28 : 0.20
+            switch style {
+            case .primary:
+                background = hovered ? orangeHover : orange
+                foreground = .white
+            case .secondary:
+                background = usesDarkAppearance
+                    ? (hovered ? darkMutedHover : darkMuted)
+                    : (hovered ? lightMutedHover : lightMuted)
+                foreground = usesDarkAppearance ? .white : .labelColor
+            case .quiet:
+                background = usesDarkAppearance
+                    ? NSColor.white.withAlphaComponent(hovered ? 0.13 : 0.001)
+                    : NSColor.black.withAlphaComponent(hovered ? 0.075 : 0.001)
+                foreground = usesDarkAppearance ? .white : .labelColor
+            }
         }
-        layer?.backgroundColor = (usesDarkAppearance
-            ? NSColor.white.withAlphaComponent(alpha)
-            : NSColor.controlAccentColor.withAlphaComponent(alpha)).cgColor
-        layer?.borderColor = (usesDarkAppearance
-            ? NSColor.white.withAlphaComponent(borderAlpha)
-            : NSColor.labelColor.withAlphaComponent(borderAlpha)).cgColor
-        layer?.borderWidth = 1
-        contentTintColor = usesDarkAppearance
-            ? NSColor.white.withAlphaComponent(isEnabled ? 0.94 : 0.38)
-            : .controlTextColor
-        if usesDarkAppearance {
-            attributedTitle = NSAttributedString(
-                string: title,
-                attributes: [
-                    .font: NSFont.systemFont(ofSize: NSFont.systemFontSize, weight: .medium),
-                    .foregroundColor: NSColor.white.withAlphaComponent(isEnabled ? 0.94 : 0.38),
-                ]
-            )
-        }
+        layer?.backgroundColor = background.cgColor
+        layer?.borderColor = NSColor.clear.cgColor
+        layer?.borderWidth = 0
+        contentTintColor = foreground
+        attributedTitle = NSAttributedString(
+            string: title,
+            attributes: [
+                .font: NSFont.systemFont(ofSize: NSFont.systemFontSize, weight: .medium),
+                .foregroundColor: foreground,
+            ]
+        )
     }
 }
 
@@ -21281,9 +21347,10 @@ private final class SavedTranscriptCopyButton: PanelActionButton {
          transcriptText: String,
          target: AnyObject?,
          action: Selector?,
-         usesDarkAppearance: Bool = false) {
+         usesDarkAppearance: Bool = false,
+         style: PanelButtonStyle = .secondary) {
         self.transcriptText = transcriptText
-        super.init(title: title, target: target, action: action, usesDarkAppearance: usesDarkAppearance)
+        super.init(title: title, target: target, action: action, usesDarkAppearance: usesDarkAppearance, style: style)
         controlSize = .small
     }
 
@@ -21299,9 +21366,10 @@ private final class SavedTranscriptActionButton: PanelActionButton {
          transcript: SavedDictationTranscript,
          target: AnyObject?,
          action: Selector?,
-         usesDarkAppearance: Bool = false) {
+         usesDarkAppearance: Bool = false,
+         style: PanelButtonStyle = .secondary) {
         self.transcript = transcript
-        super.init(title: title, target: target, action: action, usesDarkAppearance: usesDarkAppearance)
+        super.init(title: title, target: target, action: action, usesDarkAppearance: usesDarkAppearance, style: style)
         controlSize = .small
     }
 
@@ -21317,9 +21385,10 @@ private final class SavedAudioActionButton: PanelActionButton {
          audioURL: URL,
          target: AnyObject?,
          action: Selector?,
-         usesDarkAppearance: Bool = false) {
+         usesDarkAppearance: Bool = false,
+         style: PanelButtonStyle = .secondary) {
         self.audioURL = audioURL
-        super.init(title: title, target: target, action: action, usesDarkAppearance: usesDarkAppearance)
+        super.init(title: title, target: target, action: action, usesDarkAppearance: usesDarkAppearance, style: style)
         controlSize = .small
     }
 
@@ -21331,12 +21400,21 @@ private final class SavedAudioActionButton: PanelActionButton {
 private final class SavedTranscriptCard: NSView {
     let transcript: SavedDictationTranscript
     var onOpen: ((SavedDictationTranscript) -> Void)?
+    private let usesDarkAppearance: Bool
+    private var trackingArea: NSTrackingArea?
+    private var hovered = false
 
     init(transcript: SavedDictationTranscript,
+         usesDarkAppearance: Bool,
          onOpen: @escaping (SavedDictationTranscript) -> Void) {
         self.transcript = transcript
+        self.usesDarkAppearance = usesDarkAppearance
         self.onOpen = onOpen
         super.init(frame: .zero)
+        wantsLayer = true
+        layer?.cornerRadius = 12
+        layer?.cornerCurve = .continuous
+        applyAppearance()
     }
 
     required init?(coder: NSCoder) {
@@ -21359,8 +21437,105 @@ private final class SavedTranscriptCard: NSView {
         onOpen?(transcript)
     }
 
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let trackingArea {
+            removeTrackingArea(trackingArea)
+        }
+        let area = NSTrackingArea(
+            rect: .zero,
+            options: [.activeInKeyWindow, .inVisibleRect, .mouseEnteredAndExited],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(area)
+        trackingArea = area
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        hovered = true
+        applyAppearance()
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        hovered = false
+        applyAppearance()
+    }
+
+    private func applyAppearance() {
+        layer?.backgroundColor = (usesDarkAppearance
+            ? NSColor.white.withAlphaComponent(hovered ? 0.085 : 0.001)
+            : NSColor.black.withAlphaComponent(hovered ? 0.045 : 0.001)).cgColor
+        layer?.borderWidth = 0
+    }
+
     override func resetCursorRects() {
         addCursorRect(bounds, cursor: .pointingHand)
+    }
+}
+
+private final class DashboardLinkCard: NSView {
+    private let usesDarkAppearance: Bool
+    private var trackingArea: NSTrackingArea?
+    private var hovered = false
+
+    init(usesDarkAppearance: Bool) {
+        self.usesDarkAppearance = usesDarkAppearance
+        super.init(frame: .zero)
+        wantsLayer = true
+        layer?.cornerRadius = 14
+        layer?.cornerCurve = .continuous
+        applyAppearance()
+    }
+
+    required init?(coder: NSCoder) {
+        nil
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let trackingArea {
+            removeTrackingArea(trackingArea)
+        }
+        let area = NSTrackingArea(
+            rect: .zero,
+            options: [.activeInKeyWindow, .inVisibleRect, .mouseEnteredAndExited],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(area)
+        trackingArea = area
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        hovered = true
+        applyAppearance()
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        hovered = false
+        applyAppearance()
+    }
+
+    override func resetCursorRects() {
+        addCursorRect(bounds, cursor: .pointingHand)
+    }
+
+    private func applyAppearance() {
+        let fill: NSColor
+        if usesDarkAppearance {
+            fill = NSColor.white.withAlphaComponent(hovered ? 0.115 : 0.07)
+        } else {
+            fill = hovered
+                ? NSColor(srgbRed: 0.975, green: 0.955, blue: 0.94, alpha: 1)
+                : .white
+        }
+        layer?.backgroundColor = fill.cgColor
+        layer?.borderWidth = 0
+        layer?.shadowColor = NSColor.black.cgColor
+        layer?.shadowOpacity = usesDarkAppearance ? 0.24 : (hovered ? 0.12 : 0.065)
+        layer?.shadowRadius = hovered ? 12 : 9
+        layer?.shadowOffset = CGSize(width: 0, height: hovered ? -3 : -2)
     }
 }
 
@@ -21375,6 +21550,8 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
     private var modelWindow: NSWindow?
     private var savedDictationsWindow: NSWindow?
     private var savedDictationDetailWindow: NSWindow?
+    private var savedDictationDetailTranscript: SavedDictationTranscript?
+    private var dictationHelpWindow: NSWindow?
     private var refreshTimer: Timer?
     private var serviceOperation: ControlPanelServiceOperation?
     private var updateTask: Task<Void, Never>?
@@ -21391,40 +21568,71 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
     private var language: InterfaceLanguage { settings.interfaceLanguage }
 
     private var usesDarkPanelAppearance: Bool {
+        // The window honours the user's per-window appearance, while the
+        // application covers the very first pass before a window exists.  A
+        // second forced pass immediately after attaching the window (below)
+        // resolves the transient launch-time mismatch for layer colours.
         let appearance = window?.effectiveAppearance ?? NSApp.effectiveAppearance
         return appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
     }
 
-    // Layer-backed cards need resolved colours: unlike NSTextField's dynamic
+    // Layer-backed views need resolved colours: unlike NSTextField's dynamic
     // semantic colours, assigning `cgColor` to a CALayer freezes the current
-    // appearance. These values give the dark panel its own charcoal surfaces
-    // and preserve the existing native light appearance.
+    // appearance. These are the compact MyDictate palette: calm neutral
+    // canvas, one surface level, a soft inset level and a single warm accent.
+    private var panelCanvasColor: NSColor {
+        usesDarkPanelAppearance
+            ? NSColor(srgbRed: 0.075, green: 0.08, blue: 0.095, alpha: 1)
+            : NSColor(srgbRed: 0.965, green: 0.968, blue: 0.975, alpha: 1)
+    }
+
     private var panelCardFillColor: NSColor {
         usesDarkPanelAppearance
-            ? NSColor(srgbRed: 0.18, green: 0.185, blue: 0.20, alpha: 0.98)
-            : NSColor.controlBackgroundColor.withAlphaComponent(0.70)
+            ? NSColor(srgbRed: 0.115, green: 0.12, blue: 0.14, alpha: 1)
+            : NSColor(srgbRed: 1, green: 1, blue: 1, alpha: 1)
     }
 
     private var panelCardBorderColor: NSColor {
         usesDarkPanelAppearance
-            ? NSColor(srgbRed: 0.36, green: 0.37, blue: 0.40, alpha: 0.92)
-            : NSColor.separatorColor.withAlphaComponent(0.42)
+            ? NSColor.white.withAlphaComponent(0.065)
+            : NSColor.black.withAlphaComponent(0.035)
+    }
+
+    private var panelInsetFillColor: NSColor {
+        usesDarkPanelAppearance
+            ? NSColor(srgbRed: 0.15, green: 0.16, blue: 0.19, alpha: 1)
+            : NSColor(srgbRed: 0.945, green: 0.95, blue: 0.96, alpha: 1)
+    }
+
+    private var panelAccentColor: NSColor {
+        NSColor(srgbRed: 1, green: 0.40, blue: 0.10, alpha: 1)
+    }
+
+    private var panelAccentSoftColor: NSColor {
+        usesDarkPanelAppearance
+            ? NSColor(srgbRed: 0.29, green: 0.16, blue: 0.085, alpha: 1)
+            : NSColor(srgbRed: 1, green: 0.93, blue: 0.885, alpha: 1)
     }
 
     private var panelSelectedCardFillColor: NSColor {
-        usesDarkPanelAppearance
-            ? NSColor(srgbRed: 0.055, green: 0.20, blue: 0.36, alpha: 0.96)
-            : NSColor.systemBlue.withAlphaComponent(0.11)
-    }
-
-    private var panelSelectedCardBorderColor: NSColor {
-        usesDarkPanelAppearance
-            ? NSColor(srgbRed: 0.25, green: 0.62, blue: 1.0, alpha: 0.94)
-            : NSColor.systemBlue.withAlphaComponent(0.75)
+        panelAccentSoftColor
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
+        if DESIGN_PREVIEW_MODE {
+            if DESIGN_PREVIEW_DARK_MODE {
+                NSApp.appearance = NSAppearance(named: .darkAqua)
+            } else if DESIGN_PREVIEW_LIGHT_MODE {
+                NSApp.appearance = NSAppearance(named: .aqua)
+            }
+            showWindow()
+            startRefreshTimer()
+            if UPDATE_FEATURE_ENABLED {
+                checkForUpdates()
+            }
+            return
+        }
         settings.enableMyDictateUpdatesIfNeeded()
         if SuperDictateControlPanelRegistry.activateExistingPanelIfPresent() {
             stopAgentWhenControlPanelTerminates = false
@@ -21457,6 +21665,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         refreshTimer = nil
         updateTask?.cancel()
         updateTask = nil
+        guard !DESIGN_PREVIEW_MODE else { return }
         if stopAgentWhenControlPanelTerminates,
            SuperDictateAgentService.isAgentRunning() {
             SuperDictateAgentService.stop()
@@ -21477,13 +21686,20 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             return
         }
         if closingWindow === savedDictationsWindow {
+            window?.removeChildWindow(closingWindow)
             savedDictationDetailWindow?.close()
             savedDictationDetailWindow = nil
             savedDictationsWindow = nil
             return
         }
         if closingWindow === savedDictationDetailWindow {
+            savedDictationsWindow?.removeChildWindow(closingWindow)
             savedDictationDetailWindow = nil
+            savedDictationDetailTranscript = nil
+            return
+        }
+        if closingWindow === dictationHelpWindow {
+            dictationHelpWindow = nil
             return
         }
         if closingWindow === window {
@@ -21495,6 +21711,9 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             savedDictationsWindow = nil
             savedDictationDetailWindow?.orderOut(nil)
             savedDictationDetailWindow = nil
+            savedDictationDetailTranscript = nil
+            dictationHelpWindow?.orderOut(nil)
+            dictationHelpWindow = nil
         }
     }
 
@@ -21510,20 +21729,34 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             return
         }
 
-        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 520, height: 332),
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 540, height: 360),
                               styleMask: [.titled, .closable, .miniaturizable],
                               backing: .buffered,
                               defer: false)
         window.title = "MyDictate"
-        window.contentMinSize = NSSize(width: 520, height: 332)
-        window.contentMaxSize = NSSize(width: 520, height: 332)
+        window.contentMinSize = NSSize(width: 540, height: 360)
+        window.contentMaxSize = NSSize(width: 540, height: 360)
         window.isReleasedWhenClosed = false
         window.delegate = self
+        if DESIGN_PREVIEW_DARK_MODE {
+            // The test copy can be launched independently in dark mode
+            // without changing the user's system appearance.
+            window.appearance = NSAppearance(named: .darkAqua)
+        } else if DESIGN_PREVIEW_LIGHT_MODE {
+            window.appearance = NSAppearance(named: .aqua)
+        }
         self.window = window
         refresh(force: true)
         window.center()
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+        // Force one more pass after AppKit has attached the window to its
+        // screen.  This is essential when macOS launches in dark mode.
+        DispatchQueue.main.async { [weak self, weak window] in
+            guard let self, self.window === window else { return }
+            self.lastRenderFingerprint = ""
+            self.refresh(force: true)
+        }
     }
 
     private func startRefreshTimer() {
@@ -21554,6 +21787,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         if let settingsWindow, settingsWindow.isVisible {
             settingsWindow.title = t("Настройки MyDictate", "MyDictate Settings")
             settingsWindow.contentView = makeSettingsContentView()
+            resizeSettingsWindow(settingsWindow)
         }
         if let modelWindow, modelWindow.isVisible {
             modelWindow.title = t("Модели распознавания", "Speech Recognition Models")
@@ -21564,16 +21798,27 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             savedDictationsWindow.contentView = makeSavedDictationsContentView()
             resizeSavedDictationsWindow(savedDictationsWindow)
         }
+        if let savedDictationDetailWindow,
+           savedDictationDetailWindow.isVisible,
+           let transcript = savedDictationDetailTranscript {
+            savedDictationDetailWindow.title = t("Сохранённая диктовка", "Saved Dictation")
+            savedDictationDetailWindow.contentView = makeSavedTranscriptDetailContentView(transcript)
+            resizeSavedTranscriptDetailWindow(savedDictationDetailWindow)
+        }
+        if let dictationHelpWindow, dictationHelpWindow.isVisible {
+            dictationHelpWindow.title = t("Как пользоваться MyDictate", "Using MyDictate")
+            dictationHelpWindow.contentView = makeDictationHelpContentView()
+        }
     }
 
     private func resizeCompactPanel(_ window: NSWindow) {
         let missingCount = Permission.allCases.filter { !Permissions.isGranted($0) }.count
         // The panel must follow its compact cards, not leave a tall empty
         // permission area while setup is still incomplete.
-        let baseHeight: CGFloat = UPDATE_FEATURE_ENABLED ? 338 : 286
+        let baseHeight: CGFloat = UPDATE_FEATURE_ENABLED ? 360 : 308
         let height = baseHeight + CGFloat(missingCount) * 26
         let oldTop = window.frame.maxY
-        let size = NSSize(width: 520, height: height)
+        let size = NSSize(width: 540, height: height)
         window.contentMinSize = size
         window.contentMaxSize = size
         window.setContentSize(size)
@@ -21660,8 +21905,8 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         let root = NSStackView()
         root.orientation = .vertical
         root.alignment = .leading
-        root.spacing = 10
-        root.edgeInsets = NSEdgeInsets(top: 18, left: 20, bottom: 16, right: 20)
+        root.spacing = 14
+        root.edgeInsets = NSEdgeInsets(top: 22, left: 22, bottom: 18, right: 22)
         root.translatesAutoresizingMaskIntoConstraints = false
 
         root.addArrangedSubview(compactHeaderView())
@@ -21673,10 +21918,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         root.addArrangedSubview(compactPermissionsCard())
         root.addArrangedSubview(compactPrivacyFooter())
 
-        let background = NSVisualEffectView()
-        background.material = .underWindowBackground
-        background.blendingMode = .behindWindow
-        background.state = .active
+        let background = panelBackgroundView()
         background.addSubview(root)
 
         NSLayoutConstraint.activate([
@@ -21708,7 +21950,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         header.alignment = .centerY
         header.spacing = 12
         header.addArrangedSubview(panelSymbol("cpu",
-                                              color: .systemBlue,
+                                              color: panelAccentColor,
                                               description: nil,
                                               pointSize: 24))
         if isSwitchingModel {
@@ -21766,10 +22008,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         ))
         root.addArrangedSubview(footer)
 
-        let background = NSVisualEffectView()
-        background.material = .underWindowBackground
-        background.blendingMode = .behindWindow
-        background.state = .active
+        let background = panelBackgroundView()
         background.addSubview(root)
         NSLayoutConstraint.activate([
             root.leadingAnchor.constraint(equalTo: background.leadingAnchor),
@@ -21787,15 +22026,14 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
     private func modelChoiceCard(_ profile: SpeechModelProfile) -> NSView {
         let selected = profile == settings.speechModelProfile
         let isSwitchingModel = serviceOperation == .switchingModel
-        let card = compactCard()
-        card.layer?.cornerRadius = 11
+        let card = compactCard(style: selected ? .inset : .elevated)
+        card.layer?.cornerRadius = 14
         card.layer?.backgroundColor = selected
             ? panelSelectedCardFillColor.cgColor
             : panelCardFillColor.cgColor
-        card.layer?.borderColor = selected
-            ? panelSelectedCardBorderColor.cgColor
-            : panelCardBorderColor.cgColor
-        card.layer?.borderWidth = selected ? 1.5 : 1
+        card.layer?.borderColor = NSColor.clear.cgColor
+        card.layer?.borderWidth = 0
+        card.layer?.shadowOpacity = selected ? 0 : (usesDarkPanelAppearance ? 0.20 : 0.055)
 
         let row = NSStackView()
         row.orientation = .horizontal
@@ -21803,7 +22041,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         row.spacing = 12
         row.translatesAutoresizingMaskIntoConstraints = false
         row.addArrangedSubview(panelSymbol(selected ? "checkmark.circle.fill" : "circle",
-                                           color: selected ? .systemBlue : .tertiaryLabelColor,
+                                           color: selected ? panelAccentColor : .tertiaryLabelColor,
                                            description: nil,
                                            pointSize: 19))
 
@@ -21831,7 +22069,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             weight: .semibold,
             color: selected && isSwitchingModel
                 ? .systemOrange
-                : (selected ? .systemBlue : .secondaryLabelColor)
+                : (selected ? panelAccentColor : .secondaryLabelColor)
         )
         badge.setContentHuggingPriority(.required, for: .horizontal)
         row.addArrangedSubview(badge)
@@ -21864,8 +22102,8 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         let root = NSStackView()
         root.orientation = .vertical
         root.alignment = .leading
-        root.spacing = 12
-        root.edgeInsets = NSEdgeInsets(top: 20, left: 20, bottom: 16, right: 20)
+        root.spacing = 14
+        root.edgeInsets = NSEdgeInsets(top: 24, left: 24, bottom: 18, right: 24)
         root.translatesAutoresizingMaskIntoConstraints = false
 
         let header = NSStackView()
@@ -21873,7 +22111,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         header.alignment = .centerY
         header.spacing = 12
         header.addArrangedSubview(panelSymbol("doc.on.doc.fill",
-                                              color: .systemPurple,
+                                              color: panelAccentColor,
                                               description: nil,
                                               pointSize: 24))
         let headerText = NSStackView()
@@ -21885,9 +22123,12 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                                                  weight: .semibold))
         let retryCount = snapshot.audioIssues.count
             + snapshot.transcripts.filter(\.needsRecognitionRetry).count
+        let totalAudioCount = snapshot.recordingAudioCount
+            + snapshot.failedAudioCount
+            + snapshot.pendingAudioCount
         let archiveSummary = panelLabel(
-            t("\(snapshot.totalTranscriptCount) текстов · \(snapshot.recordingAudioCount) аудиозаписей на 7 дней · \(retryCount) требуют внимания",
-              "\(snapshot.totalTranscriptCount) texts · \(snapshot.recordingAudioCount) recordings kept for 7 days · \(retryCount) need attention"),
+            t("\(snapshot.totalTranscriptCount) текстов · \(totalAudioCount) аудиозаписей на 7 дней · \(retryCount) требуют внимания",
+              "\(snapshot.totalTranscriptCount) texts · \(totalAudioCount) recordings kept for 7 days · \(retryCount) need attention"),
             size: 11.5,
             color: .secondaryLabelColor
         )
@@ -21909,11 +22150,15 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         scroll.horizontalScrollElasticity = .none
         scroll.drawsBackground = false
         scroll.borderType = .noBorder
+        // This scroll view is pinned with Auto Layout below.  Leaving its
+        // autoresizing mask enabled adds incompatible constraints and can
+        // collapse the entire archive window to a thin strip.
+        scroll.translatesAutoresizingMaskIntoConstraints = false
         let list = FlippedArchiveStackView()
         list.orientation = .vertical
         list.alignment = .leading
-        list.spacing = 8
-        list.edgeInsets = NSEdgeInsets(top: 2, left: 2, bottom: 6, right: 8)
+        list.spacing = 2
+        list.edgeInsets = NSEdgeInsets(top: 6, left: 8, bottom: 6, right: 12)
         list.translatesAutoresizingMaskIntoConstraints = false
         scroll.documentView = list
         NSLayoutConstraint.activate([
@@ -21929,43 +22174,46 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             empty.widthAnchor.constraint(equalTo: list.widthAnchor,
                                          constant: -(list.edgeInsets.left + list.edgeInsets.right)).isActive = true
         } else {
+            let rowCount = snapshot.transcripts.count + snapshot.audioIssues.count
+            var rowIndex = 0
             for transcript in snapshot.transcripts {
                 let row = savedTranscriptCard(transcript)
                 list.addArrangedSubview(row)
                 row.widthAnchor.constraint(equalTo: list.widthAnchor,
                                            constant: -(list.edgeInsets.left + list.edgeInsets.right)).isActive = true
+                rowIndex += 1
+                if rowIndex < rowCount {
+                    let rowSeparator = separator()
+                    list.addArrangedSubview(rowSeparator)
+                    rowSeparator.widthAnchor.constraint(equalTo: list.widthAnchor,
+                                                       constant: -(list.edgeInsets.left + list.edgeInsets.right)).isActive = true
+                }
             }
             for issue in snapshot.audioIssues {
                 let row = savedAudioIssueCard(issue)
                 list.addArrangedSubview(row)
                 row.widthAnchor.constraint(equalTo: list.widthAnchor,
                                            constant: -(list.edgeInsets.left + list.edgeInsets.right)).isActive = true
+                rowIndex += 1
+                if rowIndex < rowCount {
+                    let rowSeparator = separator()
+                    list.addArrangedSubview(rowSeparator)
+                    rowSeparator.widthAnchor.constraint(equalTo: list.widthAnchor,
+                                                       constant: -(list.edgeInsets.left + list.edgeInsets.right)).isActive = true
+                }
             }
         }
-        root.addArrangedSubview(scroll)
+
+        let listSurface = compactCard()
+        listSurface.layer?.cornerRadius = 16
+        listSurface.layer?.shadowOpacity = usesDarkPanelAppearance ? 0.20 : 0.055
+        pin(scroll, inside: listSurface, horizontal: 0, vertical: 0)
+        root.addArrangedSubview(listSurface)
 
         let footer = NSStackView()
         footer.orientation = .horizontal
         footer.alignment = .centerY
         footer.spacing = 9
-        let loadedCount = snapshot.transcripts.count
-        let footerText: String
-        if snapshot.totalTranscriptCount > loadedCount {
-            footerText = t("Показаны последние \(loadedCount) из \(snapshot.totalTranscriptCount). Все файлы доступны в папке.",
-                           "Showing the latest \(loadedCount) of \(snapshot.totalTranscriptCount). All files remain in the folder.")
-        } else {
-            footerText = t("Текст хранится без срока; исходное аудио — 7 дней (16 кГц mono, около 1,9 МБ/мин).",
-                           "Text is kept until you delete it; source audio is kept 7 days (16 kHz mono, about 1.9 MB/min).")
-        }
-        let footerLabel = panelLabel(footerText,
-                                     size: 10.5,
-                                     color: .tertiaryLabelColor)
-        footerLabel.maximumNumberOfLines = 1
-        footerLabel.lineBreakMode = .byTruncatingTail
-        footerLabel.preferredMaxLayoutWidth = 420
-        footerLabel.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        footerLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        footer.addArrangedSubview(footerLabel)
         footer.addArrangedSubview(NSView())
         let textFolder = panelButton(
             t("Тексты", "Texts"),
@@ -21973,8 +22221,6 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             toolTip: t("Открыть в Finder папку с сохранёнными текстами",
                        "Open the folder with saved transcripts in Finder")
         )
-        textFolder.image = NSImage(systemSymbolName: "doc.text", accessibilityDescription: nil)
-        textFolder.imagePosition = .imageLeading
         footer.addArrangedSubview(textFolder)
         let audioFolder = panelButton(
             t("Аудиозаписи", "Audio Recordings"),
@@ -21982,18 +22228,15 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             toolTip: t("Открыть в Finder все исходные WAV-записи за последние 7 дней",
                        "Open every source WAV recording retained for the last 7 days in Finder")
         )
-        audioFolder.image = NSImage(systemSymbolName: "waveform", accessibilityDescription: nil)
-        audioFolder.imagePosition = .imageLeading
         footer.addArrangedSubview(audioFolder)
         if retryCount > 0 {
             let retry = panelButton(
                 t("Распознать все (\(retryCount))", "Retry all (\(retryCount))"),
                 action: #selector(retryAllSavedAudioRecognitionClicked(_:)),
                 toolTip: t("Подготовить все проблемные записи к повторному распознаванию. Исходное аудио останется на месте.",
-                           "Queue all problem recordings for another recognition pass. Source audio remains in place.")
+                           "Queue all problem recordings for another recognition pass. Source audio remains in place."),
+                style: .secondary
             )
-            retry.image = NSImage(systemSymbolName: "arrow.clockwise", accessibilityDescription: nil)
-            retry.imagePosition = .imageLeading
             retry.controlSize = .small
             footer.addArrangedSubview(retry)
         }
@@ -22001,10 +22244,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                                               action: #selector(closeSavedDictationsClicked(_:))))
         root.addArrangedSubview(footer)
 
-        let background = NSVisualEffectView()
-        background.material = .underWindowBackground
-        background.blendingMode = .behindWindow
-        background.state = .active
+        let background = panelBackgroundView()
         background.addSubview(root)
         NSLayoutConstraint.activate([
             root.leadingAnchor.constraint(equalTo: background.leadingAnchor),
@@ -22013,9 +22253,9 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             root.bottomAnchor.constraint(equalTo: background.bottomAnchor),
             header.widthAnchor.constraint(equalTo: root.widthAnchor,
                                           constant: -(root.edgeInsets.left + root.edgeInsets.right)),
-            scroll.widthAnchor.constraint(equalTo: root.widthAnchor,
-                                          constant: -(root.edgeInsets.left + root.edgeInsets.right)),
-            scroll.heightAnchor.constraint(equalToConstant: 310),
+            listSurface.widthAnchor.constraint(equalTo: root.widthAnchor,
+                                                constant: -(root.edgeInsets.left + root.edgeInsets.right)),
+            listSurface.heightAnchor.constraint(equalToConstant: 300),
             footer.widthAnchor.constraint(equalTo: root.widthAnchor,
                                           constant: -(root.edgeInsets.left + root.edgeInsets.right)),
         ])
@@ -22023,14 +22263,10 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
     }
 
     private func savedTranscriptCard(_ transcript: SavedDictationTranscript) -> NSView {
-        let card = SavedTranscriptCard(transcript: transcript) { [weak self] transcript in
+        let card = SavedTranscriptCard(transcript: transcript,
+                                       usesDarkAppearance: usesDarkPanelAppearance) { [weak self] transcript in
             self?.openSavedTranscript(transcript)
         }
-        card.wantsLayer = true
-        card.layer?.backgroundColor = panelCardFillColor.cgColor
-        card.layer?.borderColor = panelCardBorderColor.cgColor
-        card.layer?.borderWidth = 1
-        card.layer?.cornerRadius = 10
         let content = NSStackView()
         content.orientation = .vertical
         content.alignment = .leading
@@ -22063,7 +22299,8 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                 audioURL: audioURL,
                 target: self,
                 action: #selector(openSavedAudioClicked(_:)),
-                usesDarkAppearance: usesDarkPanelAppearance
+                usesDarkAppearance: usesDarkPanelAppearance,
+                style: .quiet
             )
             openAudio.image = NSImage(systemSymbolName: "waveform", accessibilityDescription: nil)
             openAudio.imagePosition = .imageOnly
@@ -22077,7 +22314,8 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                 audioURL: retryURL,
                 target: self,
                 action: #selector(retrySavedAudioClicked(_:)),
-                usesDarkAppearance: usesDarkPanelAppearance
+                usesDarkAppearance: usesDarkPanelAppearance,
+                style: .quiet
             )
             retry.image = NSImage(systemSymbolName: "arrow.clockwise", accessibilityDescription: nil)
             retry.imagePosition = .imageOnly
@@ -22090,7 +22328,8 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             transcriptText: transcript.text,
             target: self,
             action: #selector(copySavedTranscriptClicked(_:)),
-            usesDarkAppearance: usesDarkPanelAppearance
+            usesDarkAppearance: usesDarkPanelAppearance,
+            style: .quiet
         )
         copy.image = NSImage(systemSymbolName: "doc.on.doc", accessibilityDescription: nil)
         copy.imagePosition = .imageOnly
@@ -22114,13 +22353,14 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         preview.toolTip = t("Нажмите на запись, чтобы открыть полный текст", "Click the record to open the full text")
         content.addArrangedSubview(preview)
         preview.widthAnchor.constraint(equalTo: content.widthAnchor).isActive = true
-        pin(content, inside: card, horizontal: 13, vertical: 10)
+        pin(content, inside: card, horizontal: 16, vertical: 12)
         return card
     }
 
     private func savedAudioIssueCard(_ issue: SavedDictationAudioIssue) -> NSView {
-        let card = compactCard()
-        card.layer?.cornerRadius = 10
+        let card = compactCard(style: .flat)
+        card.layer?.cornerRadius = 12
+        card.layer?.backgroundColor = panelAccentSoftColor.withAlphaComponent(usesDarkPanelAppearance ? 0.52 : 0.78).cgColor
         let content = NSStackView()
         content.orientation = .vertical
         content.alignment = .leading
@@ -22170,21 +22410,18 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             action: #selector(openSavedAudioClicked(_:)),
             usesDarkAppearance: usesDarkPanelAppearance
         )
-        open.image = NSImage(systemSymbolName: "play.circle", accessibilityDescription: nil)
-        open.imagePosition = .imageLeading
         actions.addArrangedSubview(open)
         let retry = SavedAudioActionButton(
             title: t("Распознать ещё раз", "Recognize Again"),
             audioURL: issue.retryAudioURL,
             target: self,
             action: #selector(retrySavedAudioClicked(_:)),
-            usesDarkAppearance: usesDarkPanelAppearance
+            usesDarkAppearance: usesDarkPanelAppearance,
+            style: .secondary
         )
-        retry.image = NSImage(systemSymbolName: "arrow.clockwise", accessibilityDescription: nil)
-        retry.imagePosition = .imageLeading
         actions.addArrangedSubview(retry)
         content.addArrangedSubview(actions)
-        pin(content, inside: card, horizontal: 13, vertical: 10)
+        pin(content, inside: card, horizontal: 16, vertical: 12)
         return card
     }
 
@@ -22193,29 +22430,57 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         root.orientation = .vertical
         root.alignment = .leading
         root.spacing = 10
-        root.edgeInsets = NSEdgeInsets(top: 18, left: 20, bottom: 16, right: 20)
+        root.edgeInsets = NSEdgeInsets(top: 20, left: 24, bottom: 16, right: 24)
         root.translatesAutoresizingMaskIntoConstraints = false
 
         let header = NSStackView()
-        header.orientation = .vertical
-        header.alignment = .leading
-        header.spacing = 2
-        header.addArrangedSubview(panelLabel(t("Сохранённая диктовка", "Saved Dictation"),
-                                             size: 17,
-                                             weight: .semibold))
-        header.addArrangedSubview(panelLabel(savedTranscriptDateText(transcript.date),
-                                             size: 11,
-                                             color: .secondaryLabelColor))
+        header.orientation = .horizontal
+        header.alignment = .centerY
+        header.spacing = 10
+
+        let heading = NSStackView()
+        heading.orientation = .vertical
+        heading.alignment = .leading
+        heading.spacing = 2
+        heading.addArrangedSubview(panelLabel(t("Сохранённая диктовка", "Saved Dictation"),
+                                              size: 17,
+                                              weight: .semibold))
+        heading.addArrangedSubview(panelLabel(savedTranscriptDateText(transcript.date),
+                                              size: 11,
+                                              color: .secondaryLabelColor))
+        header.addArrangedSubview(heading)
+        header.addArrangedSubview(NSView())
+        if transcript.needsRecognitionRetry, let retryURL = transcript.retryAudioURL {
+            let retry = SavedAudioActionButton(
+                title: t("Распознать снова", "Recognize Again"),
+                audioURL: retryURL,
+                target: self,
+                action: #selector(retrySavedAudioClicked(_:)),
+                usesDarkAppearance: usesDarkPanelAppearance,
+                style: .secondary
+            )
+            retry.toolTip = t("Повторно распознать сохранённую аудиозапись",
+                              "Recognize the saved audio recording again")
+            header.addArrangedSubview(retry)
+        }
+        root.addArrangedSubview(header)
+
         if transcript.needsRecognitionRetry {
-            header.addArrangedSubview(panelLabel(
-                t("Распознавание или вставка не завершились. Исходное аудио сохранено на 7 дней — можно повторить попытку.",
-                  "Recognition or insertion was not completed. Source audio is saved for 7 days — you can retry."),
+            let warning = panelLabel(
+                t("Распознавание не завершено. Аудио сохранено на 7 дней.",
+                  "Recognition was not completed. Audio is saved for 7 days."),
                 size: 11,
                 weight: .medium,
                 color: .systemOrange
-            ))
+            )
+            warning.maximumNumberOfLines = 2
+            warning.lineBreakMode = .byWordWrapping
+            warning.preferredMaxLayoutWidth = 440
+            warning.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+            root.addArrangedSubview(warning)
+            warning.widthAnchor.constraint(equalTo: root.widthAnchor,
+                                           constant: -(root.edgeInsets.left + root.edgeInsets.right)).isActive = true
         }
-        root.addArrangedSubview(header)
         root.addArrangedSubview(separator())
 
         let textView = NSTextView(frame: NSRect(x: 0, y: 0, width: 1, height: 280))
@@ -22238,52 +22503,44 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                                                        height: CGFloat.greatestFiniteMagnitude)
 
         let scroll = NSScrollView()
+        scroll.translatesAutoresizingMaskIntoConstraints = false
         scroll.documentView = textView
         scroll.hasVerticalScroller = true
         scroll.hasHorizontalScroller = false
         scroll.autohidesScrollers = true
-        scroll.borderType = .bezelBorder
-        root.addArrangedSubview(scroll)
+        scroll.borderType = .noBorder
+        scroll.drawsBackground = false
+        let textSurface = compactCard(style: .inset)
+        textSurface.layer?.cornerRadius = 14
+        pin(scroll, inside: textSurface, horizontal: 0, vertical: 0)
+        root.addArrangedSubview(textSurface)
 
         let footer = NSStackView()
         footer.orientation = .horizontal
         footer.alignment = .centerY
         footer.spacing = 8
         footer.addArrangedSubview(NSView())
+        let openText = SavedTranscriptActionButton(
+            title: t("Текст", "Text"),
+            transcript: transcript,
+            target: self,
+            action: #selector(openSavedTranscriptFileClicked(_:)),
+            usesDarkAppearance: usesDarkPanelAppearance
+        )
+        openText.toolTip = t("Открыть текстовый файл", "Open the text file")
+        footer.addArrangedSubview(openText)
         if let audioURL = transcript.recordingAudioURL {
             let openAudio = SavedAudioActionButton(
-                title: t("Открыть аудио", "Open Audio"),
+                title: t("Аудио", "Audio"),
                 audioURL: audioURL,
                 target: self,
                 action: #selector(openSavedAudioClicked(_:)),
                 usesDarkAppearance: usesDarkPanelAppearance
             )
-            openAudio.image = NSImage(systemSymbolName: "play.circle", accessibilityDescription: nil)
-            openAudio.imagePosition = .imageLeading
+            openAudio.toolTip = t("Открыть аудио в отдельном окне", "Open audio in a separate window")
+            openAudio.setAccessibilityLabel(t("Открыть аудио", "Open audio"))
             footer.addArrangedSubview(openAudio)
         }
-        if transcript.needsRecognitionRetry, let retryURL = transcript.retryAudioURL {
-            let retry = SavedAudioActionButton(
-                title: t("Распознать ещё раз", "Recognize Again"),
-                audioURL: retryURL,
-                target: self,
-                action: #selector(retrySavedAudioClicked(_:)),
-                usesDarkAppearance: usesDarkPanelAppearance
-            )
-            retry.image = NSImage(systemSymbolName: "arrow.clockwise", accessibilityDescription: nil)
-            retry.imagePosition = .imageLeading
-            footer.addArrangedSubview(retry)
-        }
-        let reveal = SavedTranscriptActionButton(
-            title: t("Показать в Finder", "Show in Finder"),
-            transcript: transcript,
-            target: self,
-            action: #selector(revealSavedTranscriptInFinderClicked(_:)),
-            usesDarkAppearance: usesDarkPanelAppearance
-        )
-        reveal.image = NSImage(systemSymbolName: "folder", accessibilityDescription: nil)
-        reveal.imagePosition = .imageLeading
-        footer.addArrangedSubview(reveal)
         let copy = SavedTranscriptCopyButton(
             title: t("Копировать", "Copy"),
             transcriptText: transcript.text,
@@ -22291,17 +22548,12 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             action: #selector(copySavedTranscriptClicked(_:)),
             usesDarkAppearance: usesDarkPanelAppearance
         )
-        copy.image = NSImage(systemSymbolName: "doc.on.doc", accessibilityDescription: nil)
-        copy.imagePosition = .imageLeading
         footer.addArrangedSubview(copy)
         footer.addArrangedSubview(panelButton(t("Закрыть", "Close"),
                                               action: #selector(closeSavedTranscriptDetailClicked(_:))))
         root.addArrangedSubview(footer)
 
-        let background = NSVisualEffectView()
-        background.material = .underWindowBackground
-        background.blendingMode = .behindWindow
-        background.state = .active
+        let background = panelBackgroundView()
         background.addSubview(root)
         NSLayoutConstraint.activate([
             root.leadingAnchor.constraint(equalTo: background.leadingAnchor),
@@ -22310,9 +22562,10 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             root.bottomAnchor.constraint(equalTo: background.bottomAnchor),
             header.widthAnchor.constraint(equalTo: root.widthAnchor,
                                           constant: -(root.edgeInsets.left + root.edgeInsets.right)),
-            scroll.widthAnchor.constraint(equalTo: root.widthAnchor,
-                                         constant: -(root.edgeInsets.left + root.edgeInsets.right)),
-            scroll.heightAnchor.constraint(equalToConstant: 280),
+            textSurface.widthAnchor.constraint(equalTo: root.widthAnchor,
+                                               constant: -(root.edgeInsets.left + root.edgeInsets.right)),
+            textSurface.heightAnchor.constraint(equalToConstant:
+                transcript.needsRecognitionRetry ? 210 : 240),
             footer.widthAnchor.constraint(equalTo: root.widthAnchor,
                                           constant: -(root.edgeInsets.left + root.edgeInsets.right)),
         ])
@@ -22360,26 +22613,31 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         let root = NSStackView()
         root.orientation = .vertical
         root.alignment = .leading
-        root.spacing = 14
-        root.edgeInsets = NSEdgeInsets(top: 22, left: 24, bottom: 22, right: 24)
+        root.spacing = 10
+        root.edgeInsets = NSEdgeInsets(top: 16, left: 18, bottom: 16, right: 18)
         root.translatesAutoresizingMaskIntoConstraints = false
 
+        let form = NSStackView()
+        form.orientation = .vertical
+        form.alignment = .leading
+        form.spacing = 10
+        form.translatesAutoresizingMaskIntoConstraints = false
+
         root.addArrangedSubview(settingsHeaderView())
-        root.addArrangedSubview(separator())
-        root.addArrangedSubview(popupRow(
+        form.addArrangedSubview(popupRow(
             title: t("Модель распознавания", "Speech recognition model"),
             detail: t("Локальная модель. При первом выборе она загрузится; затем работает без облака.",
                       "Local model. It downloads on first use, then runs without the cloud."),
             selectedValue: draft.speechModelProfile.rawValue,
             options: SpeechModelProfile.allCases
                 .filter(\.isProductionSupported)
-                .map { (localizedSpeechModelName($0), $0.rawValue) },
+                .map { ($0.shortName, $0.rawValue) },
             action: #selector(selectSpeechModelProfile(_:)),
             toolTip: t("Выберите модель и нажмите «Сохранить и перезапустить».",
                        "Choose a model, then click Save & Restart.")
         ))
-        root.addArrangedSubview(separator())
-        root.addArrangedSubview(statusRow(
+        form.addArrangedSubview(separator())
+        form.addArrangedSubview(statusRow(
             title: t("Диктовка без Enter", "Dictation without Enter"),
             detail: t("Запускает запись; повторное нажатие вставляет текст без Enter: ",
                       "Starts recording; press again to insert without Enter: ")
@@ -22393,7 +22651,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             toolTip: t("Назначить клавишу или сочетание для запуска и завершения без Enter.",
                        "Assign a key or shortcut that starts dictation and finishes without Enter.")
         ))
-        root.addArrangedSubview(statusRow(
+        form.addArrangedSubview(statusRow(
             title: t("Завершить с Enter", "Finish with Enter"),
             detail: t("Во время записи вставляет весь текст, затем нажимает Enter: ",
                       "While recording, inserts all text and then presses Enter: ")
@@ -22407,8 +22665,8 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             toolTip: t("Назначить отдельное сочетание для завершения диктовки с Enter.",
                        "Assign a separate shortcut that finishes dictation and sends Enter.")
         ))
-        root.addArrangedSubview(separator())
-        root.addArrangedSubview(popupRow(
+        form.addArrangedSubview(separator())
+        form.addArrangedSubview(popupRow(
             title: t("Размер капсулы", "Capsule size"),
             detail: t("Размер плавающего индикатора записи.",
                       "Size of the floating recording indicator."),
@@ -22418,7 +22676,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             toolTip: t("Выбрать компактную, обычную или крупную капсулу.",
                        "Choose a compact, standard, or large capsule.")
         ))
-        root.addArrangedSubview(popupRow(
+        form.addArrangedSubview(popupRow(
             title: t("Цвет записи", "Recording color"),
             detail: t("Цвет аудиоволн, пока микрофон слушает.",
                       "Color used while the microphone is listening."),
@@ -22427,7 +22685,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             action: #selector(selectRecordingHUDRecordingColor(_:)),
             toolTip: t("Цвет индикатора во время записи.", "Indicator color while recording.")
         ))
-        root.addArrangedSubview(popupRow(
+        form.addArrangedSubview(popupRow(
             title: t("Цвет транскрибации", "Transcribing color"),
             detail: t("Цвет анимации во время распознавания речи.",
                       "Color used while speech is being converted to text."),
@@ -22437,7 +22695,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             toolTip: t("Цвет индикатора во время распознавания речи.",
                        "Indicator color while speech is being transcribed.")
         ))
-        root.addArrangedSubview(popupRow(
+        form.addArrangedSubview(popupRow(
             title: t("Фон капсулы", "HUD background"),
             detail: t("Системная тема или постоянный светлый/тёмный фон.",
                       "Follow the system appearance or use a fixed background."),
@@ -22447,20 +22705,44 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             toolTip: t("Выбрать фон плавающего индикатора диктовки.",
                        "Choose the floating dictation indicator background.")
         ))
+        let formSurface = compactCard()
+        formSurface.layer?.cornerRadius = 16
+        pin(form, inside: formSurface, horizontal: 14, vertical: 12)
+
+        let formScroll = NSScrollView()
+        formScroll.translatesAutoresizingMaskIntoConstraints = false
+        formScroll.hasVerticalScroller = true
+        formScroll.hasHorizontalScroller = false
+        formScroll.autohidesScrollers = true
+        formScroll.horizontalScrollElasticity = .none
+        formScroll.drawsBackground = false
+        formScroll.borderType = .noBorder
+        formSurface.translatesAutoresizingMaskIntoConstraints = false
+        formScroll.documentView = formSurface
+        NSLayoutConstraint.activate([
+            formSurface.leadingAnchor.constraint(equalTo: formScroll.contentView.leadingAnchor),
+            formSurface.trailingAnchor.constraint(equalTo: formScroll.contentView.trailingAnchor),
+            formSurface.topAnchor.constraint(equalTo: formScroll.contentView.topAnchor),
+            formSurface.bottomAnchor.constraint(equalTo: formScroll.contentView.bottomAnchor),
+            formSurface.widthAnchor.constraint(equalTo: formScroll.contentView.widthAnchor),
+            formScroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 320),
+        ])
+        root.addArrangedSubview(formScroll)
         root.addArrangedSubview(settingsActionsRow(draft: draft))
         root.addArrangedSubview(privacyInfoView())
 
-        let background = NSVisualEffectView()
-        background.material = .underWindowBackground
-        background.blendingMode = .behindWindow
-        background.state = .active
+        for view in form.arrangedSubviews {
+            view.widthAnchor.constraint(equalTo: form.widthAnchor).isActive = true
+        }
+
+        let background = panelBackgroundView()
         background.addSubview(root)
 
         NSLayoutConstraint.activate([
             root.leadingAnchor.constraint(equalTo: background.leadingAnchor),
             root.trailingAnchor.constraint(equalTo: background.trailingAnchor),
             root.topAnchor.constraint(equalTo: background.topAnchor),
-            root.bottomAnchor.constraint(lessThanOrEqualTo: background.bottomAnchor),
+            root.bottomAnchor.constraint(equalTo: background.bottomAnchor),
         ])
 
         let innerWidthInset = -(root.edgeInsets.left + root.edgeInsets.right)
@@ -22498,6 +22780,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                                                  action: #selector(selectInterfaceLanguage(_:)))
         languageControl.selectedSegment = language == .russian ? 0 : 1
         languageControl.controlSize = .small
+        languageControl.isEnabled = true
         languageControl.toolTip = t("Язык панели и настроек", "Panel and settings language")
         languageControl.setContentHuggingPriority(.required, for: .horizontal)
 
@@ -22568,7 +22851,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         text.spacing = 2
         text.setContentHuggingPriority(.defaultLow, for: .horizontal)
         text.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        let status = panelLabel(presentation.status, size: 14, weight: .semibold)
+        let status = panelLabel(presentation.status, size: 14.5, weight: .semibold)
         status.maximumNumberOfLines = 1
         status.lineBreakMode = .byTruncatingTail
         status.preferredMaxLayoutWidth = 330
@@ -22577,9 +22860,13 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         text.addArrangedSubview(status)
         let serviceDetail: String
         if running, state?.status == "ready" {
+            let dictateHotkey = localizedHotkeyName(settings.configuredHotkey,
+                                                    language: language)
+            let sendHotkey = localizedHotkeyName(settings.configuredEnterHotkey,
+                                                 language: language)
             serviceDetail = t(
-                "Правый Command — распознать · Option + Правый Command — отправить",
-                "Right Command — dictate · Option + Right Command — send"
+                "\(dictateHotkey) — распознать · \(sendHotkey) — отправить",
+                "\(dictateHotkey) — dictate · \(sendHotkey) — send"
             )
         } else {
             serviceDetail = presentation.detail
@@ -22644,7 +22931,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
 
         let modelCard = dashboardLinkCard(
             symbol: "cpu",
-            symbolColor: .systemBlue,
+            symbolColor: panelAccentColor,
             title: t("Модель распознавания", "Recognition model"),
             detail: settings.speechModelProfile.shortName,
             accessibilityTitle: t("Выбрать модель распознавания",
@@ -22660,7 +22947,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         )
         let archiveCard = dashboardLinkCard(
             symbol: "doc.on.doc.fill",
-            symbolColor: .systemPurple,
+            symbolColor: panelAccentColor,
             title: t("Сохранённые диктовки", "Saved dictations"),
             detail: archiveDetail,
             accessibilityTitle: t("Открыть сохранённые диктовки",
@@ -22730,7 +23017,8 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                                  action: #selector(grantPermissionClicked(_:)),
                                  enabled: serviceOperation == nil,
                                  toolTip: t("Открыть системное разрешение: \(permissionTitle(permission))",
-                                            "Open the system permission: \(permissionTitle(permission))"))
+                                            "Open the system permission: \(permissionTitle(permission))"),
+                                 style: .secondary)
         button.controlSize = .small
         button.tag = Permission.allCases.firstIndex(of: permission) ?? -1
         row.addArrangedSubview(title)
@@ -22766,10 +23054,17 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         row.addArrangedSubview(NSView())
         if let buttonTitle = presentation.buttonTitle,
            let action = presentation.action {
+            let buttonStyle: PanelButtonStyle
+            if case .available = updateState {
+                buttonStyle = .primary
+            } else {
+                buttonStyle = .secondary
+            }
             let button = panelButton(buttonTitle,
                                      action: action,
                                      enabled: presentation.buttonEnabled,
-                                     toolTip: presentation.buttonToolTip)
+                                     toolTip: presentation.buttonToolTip,
+                                     style: buttonStyle)
             button.controlSize = .small
             row.addArrangedSubview(button)
         }
@@ -22799,6 +23094,14 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                     t("Проверить", "Check"), #selector(updateButtonClicked(_:)), true,
                     t("Проверить GitHub Releases ещё раз", "Check GitHub Releases again"))
         case .available(let release):
+            if DESIGN_PREVIEW_MODE {
+                return ("arrow.down.circle.fill", .systemBlue,
+                        t("Доступна версия v\(release.version)", "Version v\(release.version) is available"),
+                        t("Тестовая копия только проверяет обновление; установка выполняется из основной MyDictate",
+                          "The test copy only checks updates; install from the main MyDictate app"),
+                        t("Проверить", "Check"), #selector(updateButtonClicked(_:)), true,
+                        t("Повторно проверить GitHub Releases", "Check GitHub Releases again"))
+            }
             return ("arrow.down.circle.fill", .systemBlue,
                     t("Доступна версия v\(release.version)", "Version v\(release.version) is available"),
                     t("Скачается, проверится и установится автоматически",
@@ -23135,6 +23438,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         let popup = NSPopUpButton()
         popup.target = self
         popup.action = action
+        popup.isEnabled = true
         popup.toolTip = toolTip
         for option in options {
             popup.addItem(withTitle: option.title)
@@ -23144,6 +23448,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             popup.select(item)
         }
         popup.setContentHuggingPriority(.required, for: .horizontal)
+        popup.widthAnchor.constraint(lessThanOrEqualToConstant: 210).isActive = true
         row.addArrangedSubview(text)
         row.addArrangedSubview(NSView())
         row.addArrangedSubview(popup)
@@ -23175,14 +23480,16 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             t("Отменить", "Discard"),
             action: #selector(discardSettingsClicked(_:)),
             enabled: hasChanges && serviceOperation == nil,
-            toolTip: t("Отменить несохранённые изменения.", "Discard unsaved changes.")
+            toolTip: t("Отменить несохранённые изменения.", "Discard unsaved changes."),
+            style: .quiet
         ))
         let save = panelButton(
             t("Сохранить и перезапустить", "Save & Restart"),
             action: #selector(saveSettingsClicked(_:)),
             enabled: hasChanges && validation == nil && serviceOperation == nil,
             toolTip: t("Сохранить настройки и перезапустить фоновую службу.",
-                       "Save settings and restart the background service.")
+                       "Save settings and restart the background service."),
+            style: .primary
         )
         save.keyEquivalent = "\r"
         row.addArrangedSubview(save)
@@ -23235,14 +23542,23 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         return label
     }
 
+    private func panelBackgroundView() -> NSView {
+        let view = NSView()
+        view.wantsLayer = true
+        view.layer?.backgroundColor = panelCanvasColor.cgColor
+        return view
+    }
+
     private func panelButton(_ title: String,
                              action: Selector,
                              enabled: Bool = true,
-                             toolTip: String? = nil) -> NSButton {
+                             toolTip: String? = nil,
+                             style: PanelButtonStyle = .secondary) -> NSButton {
         let button = PanelActionButton(title: title,
                                        target: self,
                                        action: action,
-                                       usesDarkAppearance: usesDarkPanelAppearance)
+                                       usesDarkAppearance: usesDarkPanelAppearance,
+                                       style: style)
         button.controlSize = .regular
         button.isEnabled = enabled
         button.toolTip = toolTip
@@ -23259,14 +23575,21 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                                              accessibilityDescription: accessibilityTitle) ?? NSImage(),
                               target: self,
                               action: action)
-        button.bezelStyle = .texturedRounded
+        button.isBordered = false
+        button.bezelStyle = .regularSquare
+        button.focusRingType = .none
+        button.wantsLayer = true
+        button.layer?.cornerRadius = 13
+        button.layer?.cornerCurve = .continuous
+        button.layer?.backgroundColor = (usesDarkPanelAppearance
+            ? NSColor.white.withAlphaComponent(0.09)
+            : NSColor.black.withAlphaComponent(0.045)).cgColor
+        button.contentTintColor = usesDarkPanelAppearance
+            ? NSColor.white.withAlphaComponent(0.90)
+            : .secondaryLabelColor
+        button.imageScaling = .scaleProportionallyDown
         button.controlSize = .small
         button.isEnabled = enabled
-        if usesDarkPanelAppearance {
-            button.contentTintColor = enabled
-                ? NSColor.white.withAlphaComponent(0.90)
-                : NSColor.white.withAlphaComponent(0.36)
-        }
         button.toolTip = toolTip
         button.setAccessibilityLabel(accessibilityTitle)
         button.translatesAutoresizingMaskIntoConstraints = false
@@ -23277,13 +23600,38 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         return button
     }
 
-    private func compactCard() -> NSView {
+    private enum PanelCardStyle {
+        case elevated
+        case inset
+        case flat
+    }
+
+    private func compactCard(style: PanelCardStyle = .elevated) -> NSView {
         let card = NSView()
         card.wantsLayer = true
-        card.layer?.cornerRadius = 8
-        card.layer?.backgroundColor = panelCardFillColor.cgColor
-        card.layer?.borderColor = panelCardBorderColor.cgColor
-        card.layer?.borderWidth = 1
+        card.layer?.cornerRadius = 14
+        card.layer?.cornerCurve = .continuous
+        switch style {
+        case .elevated:
+            card.layer?.backgroundColor = panelCardFillColor.cgColor
+            card.layer?.borderColor = panelCardBorderColor.cgColor
+            card.layer?.borderWidth = 1
+            card.layer?.shadowColor = NSColor.black.cgColor
+            card.layer?.shadowOpacity = usesDarkPanelAppearance ? 0.24 : 0.075
+            card.layer?.shadowRadius = 10
+            card.layer?.shadowOffset = CGSize(width: 0, height: -2)
+            card.layer?.masksToBounds = false
+        case .inset:
+            card.layer?.backgroundColor = panelInsetFillColor.cgColor
+            card.layer?.borderColor = NSColor.clear.cgColor
+            card.layer?.borderWidth = 0
+            card.layer?.shadowOpacity = 0
+        case .flat:
+            card.layer?.backgroundColor = NSColor.clear.cgColor
+            card.layer?.borderColor = NSColor.clear.cgColor
+            card.layer?.borderWidth = 0
+            card.layer?.shadowOpacity = 0
+        }
         card.setContentHuggingPriority(.required, for: .vertical)
         card.setContentCompressionResistancePriority(.required, for: .vertical)
         return card
@@ -23295,7 +23643,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                                    detail: String,
                                    accessibilityTitle: String,
                                    action: Selector) -> NSView {
-        let card = compactCard()
+        let card = DashboardLinkCard(usesDarkAppearance: usesDarkPanelAppearance)
         let row = NSStackView()
         row.orientation = .horizontal
         row.alignment = .centerY
@@ -23579,6 +23927,11 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
     }
 
     @objc private func updateButtonClicked(_ sender: NSButton) {
+        if DESIGN_PREVIEW_MODE {
+            if case .checking = updateState { return }
+            checkForUpdates()
+            return
+        }
         switch updateState {
         case .available(let release):
             beginInAppUpdate(for: release)
@@ -23625,14 +23978,15 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         }
 
         let modelWindow = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 620, height: 350),
+            contentRect: NSRect(x: 0, y: 0, width: 640, height: 430),
             styleMask: [.titled, .closable, .miniaturizable],
             backing: .buffered,
             defer: false
         )
+        configureSecondaryWindowAppearance(modelWindow)
         modelWindow.title = t("Модели распознавания", "Speech Recognition Models")
-        modelWindow.contentMinSize = NSSize(width: 620, height: 350)
-        modelWindow.contentMaxSize = NSSize(width: 620, height: 350)
+        modelWindow.contentMinSize = NSSize(width: 640, height: 430)
+        modelWindow.contentMaxSize = NSSize(width: 640, height: 430)
         modelWindow.isReleasedWhenClosed = false
         modelWindow.delegate = self
         modelWindow.contentView = makeModelSelectionContentView()
@@ -23675,24 +24029,42 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         }
 
         let savedDictationsWindow = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 650, height: 470),
+            contentRect: NSRect(x: 0, y: 0, width: 560, height: 480),
             styleMask: [.titled, .closable, .miniaturizable],
             backing: .buffered,
             defer: false
         )
+        configureSecondaryWindowAppearance(savedDictationsWindow)
         savedDictationsWindow.title = t("Сохранённые диктовки", "Saved Dictations")
+        // This is a secondary work window: keep it above the control panel
+        // while it is open so the archive is never visually covered.
+        savedDictationsWindow.level = .floating
         savedDictationsWindow.isReleasedWhenClosed = false
         savedDictationsWindow.delegate = self
         savedDictationsWindow.contentView = makeSavedDictationsContentView()
         resizeSavedDictationsWindow(savedDictationsWindow)
-        positionSecondaryWindow(savedDictationsWindow)
+        placeArchiveWindowOverControlPanel(savedDictationsWindow)
+        // Keep the archive above the frequently refreshing control panel.
+        // Without a child-window relationship the main panel can be ordered
+        // above it again, leaving only the narrow exposed edge visible.
+        window?.addChildWindow(savedDictationsWindow, ordered: .above)
         self.savedDictationsWindow = savedDictationsWindow
         savedDictationsWindow.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+        // AppKit can perform one last fitting pass while a newly created
+        // window is attached to its screen.  Reapply the fixed archive size
+        // afterwards so that pass can never collapse the history window.
+        DispatchQueue.main.async { [weak self, weak savedDictationsWindow] in
+            guard let self, let savedDictationsWindow,
+                  self.savedDictationsWindow === savedDictationsWindow else { return }
+            self.resizeSavedDictationsWindow(savedDictationsWindow)
+            self.placeArchiveWindowOverControlPanel(savedDictationsWindow)
+            savedDictationsWindow.orderFrontRegardless()
+        }
     }
 
     private func resizeSavedDictationsWindow(_ savedDictationsWindow: NSWindow) {
-        let size = NSSize(width: 650, height: 470)
+        let size = fittedSecondarySize(NSSize(width: 560, height: 480))
         savedDictationsWindow.contentMinSize = size
         savedDictationsWindow.contentMaxSize = size
         savedDictationsWindow.setContentSize(size)
@@ -23702,13 +24074,18 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         let pasteboard = NSPasteboard.general
         pasteboard.clearContents()
         pasteboard.setString(sender.transcriptText, forType: .string)
-        sender.title = t("Скопировано", "Copied")
-        sender.image = NSImage(systemSymbolName: "checkmark", accessibilityDescription: nil)
+        let iconOnly = sender.imagePosition == .imageOnly
+        sender.title = iconOnly ? "" : t("Скопировано", "Copied")
+        sender.image = iconOnly
+            ? NSImage(systemSymbolName: "checkmark", accessibilityDescription: nil)
+            : nil
         log("saved transcript copied from archive window (\(sender.transcriptText.count) chars)")
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.4) { [weak self, weak sender] in
             guard let self, let sender, sender.window != nil else { return }
-            sender.title = self.t("Копировать", "Copy")
-            sender.image = NSImage(systemSymbolName: "doc.on.doc", accessibilityDescription: nil)
+            sender.title = iconOnly ? "" : self.t("Копировать", "Copy")
+            sender.image = iconOnly
+                ? NSImage(systemSymbolName: "doc.on.doc", accessibilityDescription: nil)
+                : nil
         }
     }
 
@@ -23717,6 +24094,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
     }
 
     private func openSavedTranscript(_ transcript: SavedDictationTranscript) {
+        savedDictationDetailTranscript = transcript
         if let savedDictationDetailWindow {
             savedDictationDetailWindow.title = t("Сохранённая диктовка", "Saved Dictation")
             savedDictationDetailWindow.contentView = makeSavedTranscriptDetailContentView(transcript)
@@ -23727,36 +24105,44 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         }
 
         let detailWindow = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 650, height: 420),
+            contentRect: NSRect(x: 0, y: 0, width: 520, height: 380),
             styleMask: [.titled, .closable, .miniaturizable],
             backing: .buffered,
             defer: false
         )
+        configureSecondaryWindowAppearance(detailWindow)
         detailWindow.title = t("Сохранённая диктовка", "Saved Dictation")
         detailWindow.isReleasedWhenClosed = false
         detailWindow.delegate = self
         detailWindow.contentView = makeSavedTranscriptDetailContentView(transcript)
         resizeSavedTranscriptDetailWindow(detailWindow)
-        if let archiveWindow = savedDictationsWindow {
-            let frame = archiveWindow.frame
-            detailWindow.setFrameOrigin(NSPoint(x: frame.minX + 22, y: frame.maxY - detailWindow.frame.height - 22))
-        } else {
-            detailWindow.center()
-        }
+        positionSecondaryWindow(detailWindow)
         savedDictationDetailWindow = detailWindow
+        savedDictationsWindow?.addChildWindow(detailWindow, ordered: .above)
         detailWindow.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+        DispatchQueue.main.async { [weak self, weak detailWindow] in
+            guard let self, let detailWindow,
+                  self.savedDictationDetailWindow === detailWindow else { return }
+            self.resizeSavedTranscriptDetailWindow(detailWindow)
+            self.positionSecondaryWindow(detailWindow)
+            detailWindow.orderFrontRegardless()
+        }
     }
 
     private func resizeSavedTranscriptDetailWindow(_ detailWindow: NSWindow) {
-        let size = NSSize(width: 650, height: 420)
+        let size = fittedSecondarySize(NSSize(width: 520, height: 380))
+        let oldTop = detailWindow.frame.maxY
         detailWindow.contentMinSize = size
         detailWindow.contentMaxSize = size
         detailWindow.setContentSize(size)
+        var frame = detailWindow.frame
+        frame.origin.y = oldTop - frame.height
+        detailWindow.setFrame(frame, display: true)
     }
 
-    @objc private func revealSavedTranscriptInFinderClicked(_ sender: SavedTranscriptActionButton) {
-        NSWorkspace.shared.activateFileViewerSelecting([sender.transcript.url])
+    @objc private func openSavedTranscriptFileClicked(_ sender: SavedTranscriptActionButton) {
+        NSWorkspace.shared.open(sender.transcript.url)
     }
 
     @objc private func openSavedDictationsFolderClicked(_ sender: NSButton) {
@@ -23861,26 +24247,57 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
     }
 
     private func positionSecondaryWindow(_ secondary: NSWindow) {
-        guard let mainWindow = window,
-              let visibleFrame = mainWindow.screen?.visibleFrame else {
+        guard let visibleFrame = (window?.screen ?? NSScreen.main)?.visibleFrame else {
             secondary.center()
             return
         }
-        let mainFrame = mainWindow.frame
-        let preferredRight = mainFrame.maxX + 14
-        let preferredLeft = mainFrame.minX - secondary.frame.width - 14
-        let x = preferredRight + secondary.frame.width <= visibleFrame.maxX
-            ? preferredRight
-            : max(visibleFrame.minX, preferredLeft)
-        let y = min(max(visibleFrame.minY,
-                        mainFrame.maxY - secondary.frame.height),
-                    visibleFrame.maxY - secondary.frame.height)
+        // Secondary windows should never be partially off-screen.  The old
+        // side-by-side placement could leave only a thin vertical strip of
+        // Saved Dictations visible when there was not enough room beside the
+        // control panel.  A centred sheet-like panel is clearer and reliable.
+        let x = max(visibleFrame.minX + 16,
+                    visibleFrame.midX - secondary.frame.width / 2)
+        let y = max(visibleFrame.minY + 24,
+                    min(visibleFrame.maxY - secondary.frame.height - 24,
+                        visibleFrame.midY - secondary.frame.height / 2))
         secondary.setFrameOrigin(NSPoint(x: x, y: y))
+    }
+
+    private func fittedSecondarySize(_ preferred: NSSize) -> NSSize {
+        guard let visibleFrame = (window?.screen ?? NSScreen.main)?.visibleFrame else {
+            return preferred
+        }
+        return NSSize(
+            width: min(preferred.width, max(320, visibleFrame.width - 32)),
+            height: min(preferred.height, max(280, visibleFrame.height - 64))
+        )
+    }
+
+    private func configureSecondaryWindowAppearance(_ secondaryWindow: NSWindow) {
+        if DESIGN_PREVIEW_DARK_MODE {
+            secondaryWindow.appearance = NSAppearance(named: .darkAqua)
+        } else if DESIGN_PREVIEW_LIGHT_MODE {
+            secondaryWindow.appearance = NSAppearance(named: .aqua)
+        }
+    }
+
+    private func placeArchiveWindowOverControlPanel(_ archiveWindow: NSWindow) {
+        guard let controlPanel = window else {
+            archiveWindow.center()
+            return
+        }
+        let panelFrame = controlPanel.frame
+        let archiveFrame = archiveWindow.frame
+        archiveWindow.setFrameOrigin(NSPoint(
+            x: panelFrame.midX - archiveFrame.width / 2,
+            y: panelFrame.midY - archiveFrame.height / 2
+        ))
     }
 
     @objc private func openSettingsClicked(_ sender: NSButton) {
         if let settingsWindow {
             settingsWindow.contentView = makeSettingsContentView()
+            resizeSettingsWindow(settingsWindow)
             settingsWindow.makeKeyAndOrderFront(nil)
             NSApp.activate(ignoringOtherApps: true)
             return
@@ -23889,17 +24306,17 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         settingsDraft = ControlPanelSettingsDraft(settings: settings)
 
         let settingsWindow = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 620, height: 620),
+            contentRect: NSRect(x: 0, y: 0, width: 500, height: 460),
             styleMask: [.titled, .closable, .miniaturizable],
             backing: .buffered,
             defer: false
         )
+        configureSecondaryWindowAppearance(settingsWindow)
         settingsWindow.title = t("Настройки MyDictate", "MyDictate Settings")
-        settingsWindow.contentMinSize = NSSize(width: 620, height: 620)
-        settingsWindow.contentMaxSize = NSSize(width: 620, height: 620)
         settingsWindow.isReleasedWhenClosed = false
         settingsWindow.delegate = self
         settingsWindow.contentView = makeSettingsContentView()
+        resizeSettingsWindow(settingsWindow)
         if let mainWindow = window, let visibleFrame = mainWindow.screen?.visibleFrame {
             let mainFrame = mainWindow.frame
             let preferredRight = mainFrame.maxX + 14
@@ -23917,18 +24334,186 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         self.settingsWindow = settingsWindow
         settingsWindow.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+        DispatchQueue.main.async { [weak self, weak settingsWindow] in
+            guard let self, let settingsWindow,
+                  self.settingsWindow === settingsWindow else { return }
+            self.resizeSettingsWindow(settingsWindow)
+        }
+    }
+
+    private func resizeSettingsWindow(_ settingsWindow: NSWindow) {
+        let size = fittedSecondarySize(NSSize(width: 500, height: 460))
+        let oldTop = settingsWindow.frame.maxY
+        settingsWindow.contentMinSize = size
+        settingsWindow.contentMaxSize = size
+        settingsWindow.setContentSize(size)
+        var frame = settingsWindow.frame
+        frame.origin.y = oldTop - frame.height
+        settingsWindow.setFrame(frame, display: true)
+    }
+
+    private func makeDictationHelpContentView() -> NSView {
+        let root = NSStackView()
+        root.orientation = .vertical
+        root.alignment = .leading
+        root.spacing = 9
+        root.edgeInsets = NSEdgeInsets(top: 16, left: 18, bottom: 14, right: 18)
+        root.translatesAutoresizingMaskIntoConstraints = false
+
+        let header = NSStackView()
+        header.orientation = .horizontal
+        header.alignment = .centerY
+        header.spacing = 11
+        header.addArrangedSubview(panelSymbol("questionmark.circle.fill",
+                                              color: panelAccentColor,
+                                              description: nil,
+                                              pointSize: 20))
+        let titleStack = NSStackView()
+        titleStack.orientation = .vertical
+        titleStack.alignment = .leading
+        titleStack.spacing = 2
+        titleStack.addArrangedSubview(panelLabel(t("Горячие клавиши", "Keyboard shortcuts"),
+                                                  size: 17,
+                                                  weight: .semibold))
+        titleStack.addArrangedSubview(panelLabel(
+            t("Управляйте диктовкой, не открывая панель.",
+              "Control dictation without opening the panel."),
+            size: 11.5,
+            color: .secondaryLabelColor
+        ))
+        header.addArrangedSubview(titleStack)
+        root.addArrangedSubview(header)
+        root.addArrangedSubview(separator())
+
+        let shortcutStack = NSStackView()
+        shortcutStack.orientation = .vertical
+        shortcutStack.alignment = .leading
+        shortcutStack.spacing = 7
+        shortcutStack.addArrangedSubview(dictationHelpShortcutRow(
+            hotkey: localizedHotkeyName(settings.configuredHotkey, language: language),
+            description: t("Начать или завершить диктовку · вставить текст без Enter",
+                           "Start or finish dictation · insert text without Enter")
+        ))
+        shortcutStack.addArrangedSubview(dictationHelpShortcutRow(
+            hotkey: localizedHotkeyName(settings.configuredEnterHotkey, language: language),
+            description: t("Завершить диктовку · вставить текст и отправить Enter",
+                           "Finish dictation · insert text and send Enter")
+        ))
+        root.addArrangedSubview(shortcutStack)
+
+        let insertionCard = compactCard(style: .inset)
+        insertionCard.layer?.cornerRadius = 12
+        let insertionRow = NSStackView()
+        insertionRow.orientation = .horizontal
+        insertionRow.alignment = .centerY
+        insertionRow.spacing = 9
+        insertionRow.translatesAutoresizingMaskIntoConstraints = false
+        insertionRow.addArrangedSubview(panelSymbol("text.cursor",
+                                                    color: panelAccentColor,
+                                                    description: nil,
+                                                    pointSize: 15))
+        let insertionInfo = panelLabel(
+            t("Текст попадёт туда, где стоит курсор при завершении. Копия всегда остаётся в «Сохранённых диктовках».",
+              "Text goes where the cursor is active when you finish. A copy always remains in Saved Dictations."),
+            size: 11,
+            color: .secondaryLabelColor
+        )
+        insertionInfo.maximumNumberOfLines = 2
+        insertionInfo.lineBreakMode = .byWordWrapping
+        insertionRow.addArrangedSubview(insertionInfo)
+        pin(insertionRow, inside: insertionCard, horizontal: 12, vertical: 8)
+        root.addArrangedSubview(insertionCard)
+
+        let footer = NSStackView()
+        footer.orientation = .horizontal
+        footer.alignment = .centerY
+        footer.addArrangedSubview(NSView())
+        footer.addArrangedSubview(panelButton(t("Закрыть", "Close"),
+                                              action: #selector(closeDictationHelpClicked(_:))))
+        root.addArrangedSubview(footer)
+
+        let background = panelBackgroundView()
+        background.addSubview(root)
+        NSLayoutConstraint.activate([
+            root.leadingAnchor.constraint(equalTo: background.leadingAnchor),
+            root.trailingAnchor.constraint(equalTo: background.trailingAnchor),
+            root.topAnchor.constraint(equalTo: background.topAnchor),
+            root.bottomAnchor.constraint(equalTo: background.bottomAnchor),
+            header.widthAnchor.constraint(equalTo: root.widthAnchor,
+                                          constant: -(root.edgeInsets.left + root.edgeInsets.right)),
+            shortcutStack.widthAnchor.constraint(equalTo: root.widthAnchor,
+                                                 constant: -(root.edgeInsets.left + root.edgeInsets.right)),
+            insertionCard.widthAnchor.constraint(equalTo: root.widthAnchor,
+                                                 constant: -(root.edgeInsets.left + root.edgeInsets.right)),
+            footer.widthAnchor.constraint(equalTo: root.widthAnchor,
+                                          constant: -(root.edgeInsets.left + root.edgeInsets.right)),
+        ])
+        return background
+    }
+
+    private func dictationHelpShortcutRow(hotkey: String, description: String) -> NSView {
+        let card = compactCard(style: .inset)
+        card.layer?.cornerRadius = 12
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 10
+        row.translatesAutoresizingMaskIntoConstraints = false
+        let keyLabel = panelLabel(hotkey, size: 12, weight: .semibold, color: panelAccentColor)
+        keyLabel.lineBreakMode = .byTruncatingTail
+        keyLabel.setContentHuggingPriority(.required, for: .horizontal)
+        row.addArrangedSubview(keyLabel)
+        let detail = panelLabel(description, size: 11.5, color: .secondaryLabelColor)
+        detail.maximumNumberOfLines = 2
+        detail.lineBreakMode = .byWordWrapping
+        detail.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        detail.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        row.addArrangedSubview(detail)
+        pin(row, inside: card, horizontal: 12, vertical: 7)
+        return card
     }
 
     @objc private func showDictationHelpClicked(_ sender: NSButton) {
-        let alert = NSAlert()
-        alert.alertStyle = .informational
-        alert.messageText = t("Куда вставляется диктовка", "Where dictation is inserted")
-        alert.informativeText = t(
-            "После распознавания MyDictate вставляет текст туда, где в этот момент стоит текстовый курсор. Перед завершением диктовки перейдите в нужное поле. Полный текст всегда сохраняется в «Сохранённых диктовках», откуда его можно скопировать или открыть в Finder.",
-            "After transcription, MyDictate inserts text where the text cursor is at that moment. Before finishing dictation, switch to the field you want. The complete text is always saved in Saved Dictations, where you can copy it or reveal it in Finder."
+        if let dictationHelpWindow {
+            dictationHelpWindow.title = t("Как пользоваться MyDictate", "Using MyDictate")
+            dictationHelpWindow.contentView = makeDictationHelpContentView()
+            dictationHelpWindow.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            return
+        }
+
+        let helpWindow = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 460, height: 235),
+            styleMask: [.titled, .closable, .miniaturizable],
+            backing: .buffered,
+            defer: false
         )
-        alert.addButton(withTitle: t("Понятно", "OK"))
-        alert.runModal()
+        configureSecondaryWindowAppearance(helpWindow)
+        helpWindow.title = t("Как пользоваться MyDictate", "Using MyDictate")
+        let size = fittedSecondarySize(NSSize(width: 460, height: 235))
+        helpWindow.contentMinSize = size
+        helpWindow.contentMaxSize = size
+        helpWindow.setContentSize(size)
+        helpWindow.isReleasedWhenClosed = false
+        helpWindow.delegate = self
+        helpWindow.contentView = makeDictationHelpContentView()
+        helpWindow.center()
+        dictationHelpWindow = helpWindow
+        helpWindow.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        DispatchQueue.main.async { [weak self, weak helpWindow] in
+            guard let self, let helpWindow,
+                  self.dictationHelpWindow === helpWindow else { return }
+            let size = self.fittedSecondarySize(NSSize(width: 460, height: 235))
+            helpWindow.contentMinSize = size
+            helpWindow.contentMaxSize = size
+            helpWindow.setContentSize(size)
+            helpWindow.center()
+        }
+    }
+
+    @objc private func closeDictationHelpClicked(_ sender: NSButton) {
+        dictationHelpWindow?.close()
     }
 
     @objc private func recordDictationShortcutClicked(_ sender: NSButton) {
@@ -24061,6 +24646,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
     private func refreshSettingsWindow() {
         guard let settingsWindow else { return }
         settingsWindow.contentView = makeSettingsContentView()
+        resizeSettingsWindow(settingsWindow)
     }
 
     @objc private func grantPermissionClicked(_ sender: NSButton) {
