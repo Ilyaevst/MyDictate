@@ -93,6 +93,7 @@ let RECORDING_HUD_ANIMATE_IN_SECONDS: TimeInterval = 0.32
 let RECORDING_HUD_ANIMATE_OUT_SECONDS: TimeInterval = 0.23
 let RECORDING_HUD_TRANSCRIBING_RESOLVE_SECONDS: TimeInterval = 0.20
 let RECORDING_HUD_TRANSCRIBING_MIN_VISIBLE_SECONDS: TimeInterval = 0.24
+let RECORDING_HUD_PROGRESS_MINIMUM_RECORDING_SECONDS: TimeInterval = 5 * 60
 let RECORDING_HUD_TARGET_REFRESH_INTERVAL: TimeInterval = 0.16
 let RECORDING_HUD_TARGET_FOLLOW_RESPONSE: CGFloat = 22
 let RECORDING_HUD_TARGET_CACHE_MAX_AGE: TimeInterval = 10 * 60
@@ -4495,8 +4496,10 @@ private struct CapturedRecording {
 private enum DictationArchive {
     private static let rootDirectoryName = "Saved Dictations"
     private static let transcriptsDirectoryName = "Transcripts"
+    private static let recordingsDirectoryName = "Audio Recordings"
     private static let failedAudioDirectoryName = "Failed Audio"
     private static let pendingAudioDirectoryName = "Pending Audio"
+    static let audioRetentionDays = 7
 
     static func rootDirectoryURL() throws -> URL {
         let url = try superDictateApplicationSupportDirectory()
@@ -4508,6 +4511,17 @@ private enum DictationArchive {
     static func transcriptsDirectoryURL() throws -> URL {
         let url = try rootDirectoryURL()
             .appendingPathComponent(transcriptsDirectoryName, isDirectory: true)
+        try createPrivateDirectory(url)
+        return url
+    }
+
+    /// A listenable, compact source copy of *every* completed recording.
+    /// It is deliberately PCM WAV rather than a lossy format: 16 kHz / mono /
+    /// 16-bit is exactly the format fed to the recognizers, remains easy to
+    /// open in Finder, and costs only about 1.9 MB per minute.
+    static func audioRecordingsDirectoryURL() throws -> URL {
+        let url = try rootDirectoryURL()
+            .appendingPathComponent(recordingsDirectoryName, isDirectory: true)
         try createPrivateDirectory(url)
         return url
     }
@@ -4547,6 +4561,31 @@ private enum DictationArchive {
         }
     }
 
+    /// Archives the source recording before any recognition or paste attempt.
+    /// Returning nil means the crash-recovery journal must remain in place.
+    @discardableResult
+    static func saveRecordingAudio(_ samples: [Float],
+                                   sourceAudioURL: URL?,
+                                   at date: Date = Date(),
+                                   directoryOverride: URL? = nil) -> URL? {
+        guard !samples.isEmpty else { return nil }
+        do {
+            let directory = try directoryOverride ?? audioRecordingsDirectoryURL()
+            let url = directory
+                .appendingPathComponent(archiveBaseName(sourceAudioURL: sourceAudioURL,
+                                                        fallbackDate: date))
+                .appendingPathExtension("wav")
+            if !FileManager.default.fileExists(atPath: url.path) {
+                try writePCM16WAV(samples, to: url)
+                log("dictation source audio archived: \(privacySafeLogPath(url))")
+            }
+            return url
+        } catch {
+            log("dictation source audio archive failed: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
     static func preserveFailedAudio(_ samples: [Float],
                                     sourceAudioURL: URL?,
                                     errorDescription: String,
@@ -4569,12 +4608,37 @@ private enum DictationArchive {
                 Ошибка: \(errorDescription)
 
                 MyDictate could not recognize this recording.
-                The original pending recording is retained for Retry.
+                The original source audio is retained for Retry.
                 """
             try writePrivateFile(Data((message + "\n").utf8), to: errorURL)
             log("failed dictation audio archived: \(privacySafeLogPath(wavURL))")
         } catch {
             log("failed dictation audio archive failed: \(error.localizedDescription)")
+        }
+    }
+
+    /// Removes the legacy failure marker after a retry for the same source
+    /// recording succeeds.  The normal source WAV is deliberately retained
+    /// in Audio Recordings until its seven-day expiry.
+    static func clearFailedAudioArtifacts(sourceAudioURL: URL?) {
+        guard let sourceAudioURL else { return }
+        do {
+            let directory = try failedAudioDirectoryURL()
+            let baseName = archiveBaseName(sourceAudioURL: sourceAudioURL,
+                                           fallbackDate: Date())
+            for suffix in ["wav", "txt"] {
+                let url: URL
+                if suffix == "wav" {
+                    url = directory.appendingPathComponent(baseName).appendingPathExtension(suffix)
+                } else {
+                    url = directory.appendingPathComponent(baseName + " — error").appendingPathExtension(suffix)
+                }
+                if FileManager.default.fileExists(atPath: url.path) {
+                    try FileManager.default.removeItem(at: url)
+                }
+            }
+        } catch {
+            log("failed dictation artifact cleanup failed: \(error.localizedDescription)")
         }
     }
 
@@ -4588,14 +4652,63 @@ private enum DictationArchive {
         }
     }
 
-    /// Failed and not-yet-retried recordings are intentionally temporary.
-    /// Text transcripts remain permanent; only source audio and its sidecar
-    /// error note are removed after a week to avoid silently filling the disk.
+    /// Reads only the WAV format written by `writePCM16WAV`: mono, 16 kHz,
+    /// 16-bit PCM.  Keeping retry support deliberately narrow avoids treating
+    /// arbitrary files dropped into Application Support as dictation audio.
+    static func loadRecordingAudio(from url: URL) throws -> [Float] {
+        let values = try url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey])
+        guard values.isRegularFile == true,
+              values.isSymbolicLink != true,
+              let byteCount = values.fileSize,
+              byteCount >= 44,
+              byteCount <= PENDING_DICTATION_MAX_BYTES else {
+            throw posixError(EINVAL)
+        }
+        let data = try Data(contentsOf: url, options: [.mappedIfSafe])
+        guard data.count >= 44,
+              data.prefix(4) == Data("RIFF".utf8),
+              data.subdata(in: 8..<12) == Data("WAVE".utf8),
+              data.subdata(in: 12..<16) == Data("fmt ".utf8),
+              readUInt32LE(data, offset: 16) == 16,
+              readUInt16LE(data, offset: 20) == 1,
+              readUInt16LE(data, offset: 22) == 1,
+              readUInt32LE(data, offset: 24) == UInt32(SAMPLE_RATE),
+              readUInt16LE(data, offset: 34) == 16,
+              data.subdata(in: 36..<40) == Data("data".utf8) else {
+            throw posixError(EINVAL)
+        }
+        let payloadBytes = Int(readUInt32LE(data, offset: 40))
+        guard payloadBytes >= 0,
+              payloadBytes.isMultiple(of: MemoryLayout<Int16>.size),
+              payloadBytes == data.count - 44 else {
+            throw posixError(EINVAL)
+        }
+        var samples: [Float] = []
+        samples.reserveCapacity(payloadBytes / MemoryLayout<Int16>.size)
+        var offset = 44
+        while offset < data.count {
+            let raw = readUInt16LE(data, offset: offset)
+            let sample = Int16(bitPattern: raw)
+            samples.append(sample < 0
+                ? Float(sample) / 32_768
+                : Float(sample) / Float(Int16.max))
+            offset += MemoryLayout<Int16>.size
+        }
+        return samples
+    }
+
+    /// Source audio is intentionally temporary. Text transcripts remain
+    /// permanent; every WAV and its error note are removed after a week so
+    /// MyDictate does not silently fill the disk.
     static func removeExpiredRecoverableAudio(now: Date = Date(),
-                                              maximumAge: TimeInterval = 7 * 24 * 60 * 60) {
+                                              maximumAge: TimeInterval = TimeInterval(audioRetentionDays * 24 * 60 * 60)) {
         let fm = FileManager.default
         let cutoff = now.addingTimeInterval(-maximumAge)
-        let directories = [try? failedAudioDirectoryURL(), try? pendingAudioDirectoryURL()]
+        let directories = [
+            try? audioRecordingsDirectoryURL(),
+            try? failedAudioDirectoryURL(),
+            try? pendingAudioDirectoryURL(),
+        ]
             .compactMap { $0 }
         for directory in directories {
             guard let urls = try? fm.contentsOfDirectory(
@@ -4639,6 +4752,13 @@ private enum DictationArchive {
             .deletingPathExtension()
             .lastPathComponent
             .replacingOccurrences(of: "pending-", with: "")
+        // A retry journal carries the already-created archive base name.  Do
+        // not prepend a second date: the recovered text must replace the
+        // failed entry and clear its corresponding error marker.
+        if let sourceStem,
+           sourceStem.contains("__") {
+            return sourceStem
+        }
         let identifier = sourceStem.flatMap { $0.isEmpty ? nil : $0 } ?? UUID().uuidString
         return "\(formatter.string(from: sourceDate))__\(identifier)"
     }
@@ -4745,6 +4865,19 @@ private enum DictationArchive {
         var value = value.littleEndian
         withUnsafeBytes(of: &value) { data.append(contentsOf: $0) }
     }
+
+    private static func readUInt16LE(_ data: Data, offset: Int) -> UInt16 {
+        guard offset >= 0, offset + 2 <= data.count else { return 0 }
+        return UInt16(data[offset]) | (UInt16(data[offset + 1]) << 8)
+    }
+
+    private static func readUInt32LE(_ data: Data, offset: Int) -> UInt32 {
+        guard offset >= 0, offset + 4 <= data.count else { return 0 }
+        return UInt32(data[offset])
+            | (UInt32(data[offset + 1]) << 8)
+            | (UInt32(data[offset + 2]) << 16)
+            | (UInt32(data[offset + 3]) << 24)
+    }
 }
 
 private enum PendingDictationRecovery {
@@ -4756,10 +4889,23 @@ private enum PendingDictationRecovery {
         try DictationArchive.pendingAudioDirectoryURL()
     }
 
-    static func createJournal() throws -> PendingDictationJournal {
-        try PendingDictationJournal(url: directoryURL()
-            .appendingPathComponent("pending-\(UUID().uuidString)")
+    static func createJournal(identifier: String? = nil) throws -> PendingDictationJournal {
+        let safeIdentifier = identifier?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let identifier = (safeIdentifier?.isEmpty == false ? safeIdentifier : nil) ?? UUID().uuidString
+        return try PendingDictationJournal(url: directoryURL()
+            .appendingPathComponent("pending-\(identifier)")
             .appendingPathExtension(fileExtension))
+    }
+
+    /// Turns a selected archived WAV back into the same crash-safe journal
+    /// used for live recordings.  The agent then performs the normal recovery
+    /// path, while the original listenable WAV remains untouched.
+    static func createRetryJournal(samples: [Float], archiveBaseName: String) throws -> URL {
+        guard !samples.isEmpty else { throw posixError(EINVAL) }
+        let journal = try createJournal(identifier: archiveBaseName)
+        journal.append(samples)
+        journal.finish()
+        return journal.url
     }
 
     static func pendingURLs() -> [URL] {
@@ -5388,6 +5534,28 @@ private enum LoadedSpeechEngine {
     case whisperLargeV3Turbo(WhisperSpeechEngine)
 }
 
+private final class WhisperProgressReporter: @unchecked Sendable {
+    private let handler: @Sendable (Int) -> Void
+    private let lock = NSLock()
+    private var lastReported = -1
+
+    init(handler: @escaping @Sendable (Int) -> Void) {
+        self.handler = handler
+    }
+
+    func report(_ rawProgress: Int) {
+        let progress = min(100, max(0, rawProgress))
+        lock.lock()
+        guard progress > lastReported else {
+            lock.unlock()
+            return
+        }
+        lastReported = progress
+        lock.unlock()
+        handler(progress)
+    }
+}
+
 private final class WhisperSpeechEngine: @unchecked Sendable {
     private let context: OpaquePointer
 
@@ -5413,7 +5581,9 @@ private final class WhisperSpeechEngine: @unchecked Sendable {
         whisper_free(context)
     }
 
-    func transcribe(samples: [Float], language: DictationLanguage) throws -> String {
+    func transcribe(samples: [Float],
+                    language: DictationLanguage,
+                    progressHandler: (@Sendable (Int) -> Void)? = nil) throws -> String {
         guard samples.count <= Int(Int32.max) else {
             throw NSError(
                 domain: "SuperDictate.Whisper",
@@ -5437,6 +5607,20 @@ private final class WhisperSpeechEngine: @unchecked Sendable {
         params.suppress_nst = true
         params.temperature = 0
         params.carry_initial_prompt = true
+        let progressReporter = progressHandler.map(WhisperProgressReporter.init)
+        if let progressReporter {
+            progressReporter.report(0)
+            params.progress_callback = { _, _, progress, userData in
+                guard let userData else { return }
+                Unmanaged<WhisperProgressReporter>
+                    .fromOpaque(userData)
+                    .takeUnretainedValue()
+                    .report(Int(progress))
+            }
+            params.progress_callback_user_data = Unmanaged
+                .passUnretained(progressReporter)
+                .toOpaque()
+        }
 
         let resultCode = WHISPER_TECHNICAL_PROMPT.withCString { promptPointer in
             language.whisperLanguageCode.withCString { languagePointer in
@@ -5458,6 +5642,7 @@ private final class WhisperSpeechEngine: @unchecked Sendable {
                 userInfo: [NSLocalizedDescriptionKey: "Whisper failed to transcribe the recording (code (resultCode))."]
             )
         }
+        progressReporter?.report(100)
 
         let segmentCount = whisper_full_n_segments(context)
         var text = ""
@@ -5654,7 +5839,8 @@ actor TranscriptionWorker {
 
     fileprivate func transcribe(samples: [Float],
                                language: DictationLanguage = .auto,
-                               requestedAt: TimeInterval) async throws -> TranscriptionWorkerResult {
+                               requestedAt: TimeInterval,
+                               progressHandler: (@Sendable (Int) -> Void)? = nil) async throws -> TranscriptionWorkerResult {
         let workerEnteredAt = ProcessInfo.processInfo.systemUptime
         guard let engine else { throw NSError(domain: "Parakey", code: -2) }
         guard !inFlight else {
@@ -5682,7 +5868,9 @@ actor TranscriptionWorker {
             )
         case .whisperLargeV3Turbo(let whisperEngine):
             let whisperStartedAt = ProcessInfo.processInfo.systemUptime
-            let text = try whisperEngine.transcribe(samples: samples, language: language)
+            let text = try whisperEngine.transcribe(samples: samples,
+                                                     language: language,
+                                                     progressHandler: progressHandler)
             let whisperCompletedAt = ProcessInfo.processInfo.systemUptime
             let elapsed = whisperCompletedAt - whisperStartedAt
             return TranscriptionWorkerResult(
@@ -8524,6 +8712,19 @@ private final class RecordingHUDView: NSView {
         didSet { needsDisplay = true }
     }
 
+    /// A real decoder percentage from Whisper. It is intentionally nil for
+    /// short recordings and engines without an exact progress callback.
+    var transcriptionProgress: Int? {
+        didSet {
+            let normalized = transcriptionProgress.map { min(100, max(0, $0)) }
+            if normalized != transcriptionProgress {
+                transcriptionProgress = normalized
+                return
+            }
+            if oldValue != transcriptionProgress { needsDisplay = true }
+        }
+    }
+
     var revealProgress: CGFloat = 1 {
         didSet {
             if oldValue != revealProgress { needsDisplay = true }
@@ -8618,6 +8819,9 @@ private final class RecordingHUDView: NSView {
 
         if mode == .transcribing {
             drawTranscribingWave(in: capsuleRect, alpha: 1)
+            if let transcriptionProgress {
+                drawTranscriptionProgress(transcriptionProgress, in: capsuleRect)
+            }
             return
         }
 
@@ -8681,6 +8885,7 @@ private final class RecordingHUDView: NSView {
         let totalWidth = CGFloat(barCount) * barWidth + CGFloat(barCount - 1) * barGap
         let startX = capsuleRect.midX - (totalWidth / 2)
         let centerY = capsuleRect.midY
+            + (transcriptionProgress == nil ? 0 : 3.2 * visualScale)
         let centerIndex = CGFloat(barCount - 1) / 2
         let centerDenominator = max(centerIndex, 1)
         let age = transcribingElapsedOverride
@@ -8730,6 +8935,22 @@ private final class RecordingHUDView: NSView {
             fillColor.withAlphaComponent((0.58 + (0.26 * front) + (0.20 * reversePulse) + (0.14 * conversion)) * alpha).setFill()
             path.fill()
         }
+    }
+
+    private func drawTranscriptionProgress(_ progress: Int, in capsuleRect: NSRect) {
+        let text = "\(progress)%"
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.monospacedDigitSystemFont(ofSize: 8.5 * visualScale, weight: .semibold),
+            .foregroundColor: transcribingColor.withAlphaComponent(0.95),
+        ]
+        let size = (text as NSString).size(withAttributes: attributes)
+        (text as NSString).draw(
+            in: NSRect(x: capsuleRect.midX - (size.width / 2),
+                       y: capsuleRect.minY + 2.0 * visualScale,
+                       width: size.width,
+                       height: size.height),
+            withAttributes: attributes
+        )
     }
 
     private func smoothstep(_ edge0: CGFloat, _ edge1: CGFloat, _ value: CGFloat) -> CGFloat {
@@ -10498,6 +10719,13 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     PendingDictationRecovery.remove(url)
                     continue
                 }
+                let archivedAudioURL = DictationArchive.saveRecordingAudio(
+                    samples,
+                    sourceAudioURL: url
+                )
+                if archivedAudioURL == nil {
+                    log("pending dictation recovery: source WAV archive unavailable; keeping journal")
+                }
                 let duration = Double(samples.count) / SAMPLE_RATE
                 let requestedAt = ProcessInfo.processInfo.systemUptime
                 let transcription = try await asr.transcribe(
@@ -10535,10 +10763,11 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 recordDictationUsage(text: processed.text,
                                      audioSeconds: duration,
                                      asrSeconds: timing.totalSeconds)
-                if archivedURL != nil {
+                if archivedURL != nil, archivedAudioURL != nil {
                     PendingDictationRecovery.remove(url)
+                    DictationArchive.clearFailedAudioArtifacts(sourceAudioURL: url)
                 } else {
-                    log("pending dictation retained because its transcript could not be archived")
+                    log("pending dictation retained because its transcript or source WAV could not be archived")
                 }
                 log("pending dictation recovered: \(String(format: "%.2f", duration)) s audio → \(String(format: "%.2f", timing.totalSeconds)) s → \(processed.text.count) chars")
             } catch {
@@ -11167,7 +11396,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
     }
 
-    private func showTranscribingHUD() {
+    private func showTranscribingHUD(showsProgress: Bool = false) {
         guard settings.showRecordingWaveform else { return }
         recordingHUDTranscribingStartedAt = ProcessInfo.processInfo.systemUptime
         if recordingHUDPanel?.isVisible == true {
@@ -11175,7 +11404,13 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         } else {
             showRecordingHUD(mode: .transcribing, level: 0)
         }
+        recordingHUDView?.transcriptionProgress = showsProgress ? 0 : nil
         startRecordingHUDMotion()
+    }
+
+    private func updateTranscribingHUDProgress(_ progress: Int) {
+        guard isBusy, !isRecording else { return }
+        recordingHUDView?.transcriptionProgress = min(100, max(0, progress))
     }
 
     private func hideRecordingHUD() {
@@ -11198,6 +11433,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             panel.setFrame(recordingHUDFrame(size: recordingHUDExpandedSize), display: false)
             recordingHUDView?.mode = .recording
             recordingHUDView?.level = 0
+            recordingHUDView?.transcriptionProgress = nil
             recordingHUDView?.phase = 0
             recordingHUDView?.revealProgress = 1
             recordingHUDInsertionTargetFrame = nil
@@ -11223,6 +11459,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                            display: false)
             self.recordingHUDView?.mode = .recording
             self.recordingHUDView?.level = 0
+            self.recordingHUDView?.transcriptionProgress = nil
             self.recordingHUDView?.phase = 0
             self.recordingHUDView?.revealProgress = 1
             self.recordingHUDInsertionTargetFrame = nil
@@ -11912,6 +12149,16 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         case .transcribe(let duration):
             dur = duration
         }
+        // Keep a user-playable 16 kHz WAV before inference starts.  The
+        // journal is still retained until this archive and the text file are
+        // both safely on disk, so a full disk can never turn into lost audio.
+        let archivedAudioURL = DictationArchive.saveRecordingAudio(
+            samples,
+            sourceAudioURL: captured.recoveryURL
+        )
+        if archivedAudioURL == nil {
+            log("release: source WAV archive unavailable; keeping recovery journal")
+        }
         isBusy = true
 
         // Start CoreML before AppKit/menu work. The UI still transitions
@@ -11919,11 +12166,27 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let asrRequestedAt = ProcessInfo.processInfo.systemUptime
         let transcriptionWorker = asr
         let language = settings.dictationLanguage
+        let selectedProfile = settings.speechModelProfile.productionProfile
+        let showDecoderProgress = dur >= RECORDING_HUD_PROGRESS_MINIMUM_RECORDING_SECONDS
+            && (selectedProfile == .whisperSmall
+                || selectedProfile == .whisperMedium
+                || selectedProfile == .whisperLargeV3Turbo)
+        let hudProgressHandler: (@Sendable (Int) -> Void)?
+        if showDecoderProgress {
+            hudProgressHandler = { @Sendable [weak self] progress in
+                DispatchQueue.main.async { [weak self] in
+                    self?.updateTranscribingHUDProgress(progress)
+                }
+            }
+        } else {
+            hudProgressHandler = nil
+        }
         let transcriptionTask = Task.detached(priority: .userInitiated) {
             let transcription = try await transcriptionWorker.transcribe(
                 samples: samples,
                 language: language,
-                requestedAt: asrRequestedAt
+                requestedAt: asrRequestedAt,
+                progressHandler: hudProgressHandler
             )
             return CompletedTranscriptionWorkerResult(
                 transcription: transcription,
@@ -11933,7 +12196,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         let transcribingUIStartedAt = ProcessInfo.processInfo.systemUptime
         setMenuBarState(.busy)
-        showTranscribingHUD()
+        showTranscribingHUD(showsProgress: showDecoderProgress)
         rebuildMenu()
         let transcribingUICompletedAt = ProcessInfo.processInfo.systemUptime
         log("release: \(String(format: "%.2f", dur)) s captured, transcribing")
@@ -12008,10 +12271,10 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                         var enterDelaySeconds: Double?
                         let journalCleanupStartedAt = ProcessInfo.processInfo.systemUptime
                         if inserted {
-                            if archivedURL != nil {
+                            if archivedURL != nil, archivedAudioURL != nil {
                                 PendingDictationRecovery.remove(captured.recoveryURL)
                             } else {
-                                log("pending dictation retained because its transcript could not be archived")
+                                log("pending dictation retained because its transcript or source WAV could not be archived")
                             }
                             if shouldPressEnterAfterInsertion {
                                 let enterDelayStartedAt = ProcessInfo.processInfo.systemUptime
@@ -12136,6 +12399,14 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             return
         }
 
+        let archivedAudioURL = DictationArchive.saveRecordingAudio(
+            captured.samples,
+            sourceAudioURL: captured.recoveryURL
+        )
+        if archivedAudioURL == nil {
+            log("dictation recovery: source WAV archive unavailable; keeping recovery journal")
+        }
+
         isBusy = true
         setMenuBarState(.busy)
         showTranscribingHUD()
@@ -12170,7 +12441,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                         recordDictationUsage(text: processed.text,
                                              audioSeconds: duration,
                                              asrSeconds: timing.totalSeconds)
-                        if archivedURL != nil {
+                        if archivedURL != nil, archivedAudioURL != nil {
                             DictationArchive.preserveFailedAudio(
                                 captured.samples,
                                 sourceAudioURL: captured.recoveryURL,
@@ -12179,7 +12450,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                             PendingDictationRecovery.remove(captured.recoveryURL)
                         } else {
                             recoveryFailed = true
-                            log("pending dictation retained because its transcript could not be archived")
+                            log("pending dictation retained because its transcript or source WAV could not be archived")
                         }
                     } else {
                         recoveryFailed = true
@@ -19844,11 +20115,27 @@ private enum ParakeySelfTest {
             "failed dictation error note should explain why audio was retained"
         )
 
+        let recordingsDirectory = archiveRoot.appendingPathComponent("Audio Recordings", isDirectory: true)
+        guard let archivedRecordingURL = DictationArchive.saveRecordingAudio(
+            expectedSamples,
+            sourceAudioURL: archiveSource,
+            directoryOverride: recordingsDirectory
+        ) else {
+            throw SelfTestFailure.failed("every completed dictation should archive a source WAV")
+        }
+        let restoredSamples = try DictationArchive.loadRecordingAudio(from: archivedRecordingURL)
+        try expect(
+            restoredSamples.count,
+            equals: expectedSamples.count,
+            "archived source WAV should retain every captured sample"
+        )
+
         let pendingAudioDirectory = archiveRoot.appendingPathComponent("Pending Audio", isDirectory: true)
         try FileManager.default.createDirectory(at: pendingAudioDirectory,
                                                 withIntermediateDirectories: false)
         let archiveSnapshot = savedDictationArchiveSnapshot(
             transcriptsDirectory: transcriptDirectory,
+            recordingsDirectory: recordingsDirectory,
             failedAudioDirectory: failedAudioDirectory,
             pendingAudioDirectory: pendingAudioDirectory
         )
@@ -19866,6 +20153,11 @@ private enum ParakeySelfTest {
             archiveSnapshot.failedAudioCount,
             equals: 1,
             "saved dictation browser should count failed WAV recordings"
+        )
+        try expect(
+            archiveSnapshot.recordingAudioCount,
+            equals: 1,
+            "saved dictation browser should count all retained source recordings"
         )
         try expect(
             archiveSnapshot.pendingAudioCount,
@@ -20725,21 +21017,32 @@ private struct SavedDictationTranscript {
     let url: URL
     let text: String
     let date: Date
-    /// A matching WAV means the text was not safe to use as-is (or could not
-    /// be inserted).  A matching pending journal can be retried by restarting
-    /// the service from the archive window.
-    let recoveryAudioURL: URL?
-    let retryPending: Bool
+    /// Every completed dictation has a standard WAV in Audio Recordings.
+    let recordingAudioURL: URL?
+    /// A matching failed WAV or pending journal means that recognition or
+    /// insertion was not completed safely and can be run again.
+    let retryAudioURL: URL?
+    let needsRecognitionRetry: Bool
+}
+
+private struct SavedDictationAudioIssue {
+    let audioURL: URL
+    let retryAudioURL: URL
+    let date: Date
+    let isPendingJournal: Bool
 }
 
 private struct SavedDictationArchiveSnapshot {
     let transcripts: [SavedDictationTranscript]
+    let audioIssues: [SavedDictationAudioIssue]
     let totalTranscriptCount: Int
+    let recordingAudioCount: Int
     let failedAudioCount: Int
     let pendingAudioCount: Int
 }
 
 private func savedDictationArchiveSnapshot(transcriptsDirectory: URL,
+                                           recordingsDirectory: URL,
                                            failedAudioDirectory: URL,
                                            pendingAudioDirectory: URL,
                                            maximumLoadedTranscripts: Int = 200) -> SavedDictationArchiveSnapshot {
@@ -20786,6 +21089,11 @@ private func savedDictationArchiveSnapshot(transcriptsDirectory: URL,
             return left > right
         }
 
+    let recordingAudioByStem = Dictionary(
+        uniqueKeysWithValues: regularFiles(in: recordingsDirectory, extension: "wav").map {
+            ($0.deletingPathExtension().lastPathComponent, $0)
+        }
+    )
     let failedAudioByStem = Dictionary(
         uniqueKeysWithValues: regularFiles(in: failedAudioDirectory, extension: "wav").map {
             ($0.deletingPathExtension().lastPathComponent, $0)
@@ -20796,6 +21104,11 @@ private func savedDictationArchiveSnapshot(transcriptsDirectory: URL,
             ($0.deletingPathExtension().lastPathComponent.replacingOccurrences(of: "pending-", with: ""), $0)
         }
     )
+
+    func archiveDate(_ url: URL) -> Date {
+        let values = try? url.resourceValues(forKeys: [.contentModificationDateKey, .creationDateKey])
+        return values?.contentModificationDate ?? values?.creationDate ?? .distantPast
+    }
 
     let loadLimit = max(0, maximumLoadedTranscripts)
     let transcripts = transcriptURLs.prefix(loadLimit).compactMap { url -> SavedDictationTranscript? in
@@ -20810,39 +21123,168 @@ private func savedDictationArchiveSnapshot(transcriptsDirectory: URL,
         let text = try? String(contentsOf: url, encoding: .utf8) else { return nil }
         let cleaned = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !cleaned.isEmpty else { return nil }
+        let stem = url.deletingPathExtension().lastPathComponent
+        let failedAudio = failedAudioByStem[stem]
+        let pendingAudio = pendingAudioByStem[stem]
+        let recordingAudio = recordingAudioByStem[stem] ?? failedAudio
         return SavedDictationTranscript(
             url: url,
             text: cleaned,
             date: values.contentModificationDate ?? values.creationDate ?? .distantPast,
-            recoveryAudioURL: failedAudioByStem[url.deletingPathExtension().lastPathComponent]
-                ?? pendingAudioByStem[url.deletingPathExtension().lastPathComponent],
-            retryPending: pendingAudioByStem[url.deletingPathExtension().lastPathComponent] != nil
+            recordingAudioURL: recordingAudio,
+            retryAudioURL: pendingAudio ?? recordingAudio ?? failedAudio,
+            needsRecognitionRetry: pendingAudio != nil || failedAudio != nil
         )
     }
 
+    let transcriptStems = Set(transcriptURLs.map { $0.deletingPathExtension().lastPathComponent })
+    var audioIssues: [SavedDictationAudioIssue] = []
+    let issueStems = Set(failedAudioByStem.keys).union(pendingAudioByStem.keys)
+    for stem in issueStems where !transcriptStems.contains(stem) {
+        if let pending = pendingAudioByStem[stem] {
+            audioIssues.append(SavedDictationAudioIssue(
+                audioURL: recordingAudioByStem[stem] ?? failedAudioByStem[stem] ?? pending,
+                retryAudioURL: pending,
+                date: archiveDate(pending),
+                isPendingJournal: true
+            ))
+        } else if let failed = failedAudioByStem[stem] {
+            audioIssues.append(SavedDictationAudioIssue(
+                audioURL: recordingAudioByStem[stem] ?? failed,
+                retryAudioURL: recordingAudioByStem[stem] ?? failed,
+                date: archiveDate(failed),
+                isPendingJournal: false
+            ))
+        }
+    }
+    audioIssues.sort { $0.date > $1.date }
+
     return SavedDictationArchiveSnapshot(
         transcripts: transcripts,
+        audioIssues: Array(audioIssues.prefix(loadLimit)),
         totalTranscriptCount: transcriptURLs.count,
+        recordingAudioCount: recordingAudioByStem.count,
         failedAudioCount: regularFiles(in: failedAudioDirectory, extension: "wav").count,
         pendingAudioCount: regularFiles(in: pendingAudioDirectory, extension: "sdaudio").count
     )
 }
 
-private final class SavedTranscriptCopyButton: NSButton {
+/// A small, explicit button treatment for the control panel. AppKit's
+/// textured buttons can look like inactive labels inside a visual-effect
+/// view, so this keeps a stable border, hover state, and clear click target.
+private class PanelActionButton: NSButton {
+    private let usesDarkAppearance: Bool
+    private var trackingArea: NSTrackingArea?
+    private var hovered = false
+
+    init(title: String,
+         target: AnyObject?,
+         action: Selector?,
+         usesDarkAppearance: Bool) {
+        self.usesDarkAppearance = usesDarkAppearance
+        super.init(frame: .zero)
+        self.title = title
+        self.target = target
+        self.action = action
+        isBordered = false
+        bezelStyle = .regularSquare
+        focusRingType = .none
+        setButtonType(.momentaryChange)
+        wantsLayer = true
+        layer?.cornerRadius = 7
+        layer?.cornerCurve = .continuous
+        font = .systemFont(ofSize: NSFont.systemFontSize, weight: .medium)
+        applyAppearance()
+        setContentHuggingPriority(.required, for: .horizontal)
+    }
+
+    required init?(coder: NSCoder) {
+        nil
+    }
+
+    override var acceptsFirstResponder: Bool { false }
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override var title: String {
+        didSet { applyAppearance() }
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let trackingArea {
+            removeTrackingArea(trackingArea)
+        }
+        let area = NSTrackingArea(
+            rect: .zero,
+            options: [.activeInKeyWindow, .inVisibleRect, .mouseEnteredAndExited],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(area)
+        trackingArea = area
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        hovered = true
+        applyAppearance()
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        hovered = false
+        applyAppearance()
+    }
+
+    override var isEnabled: Bool {
+        didSet { applyAppearance() }
+    }
+
+    private func applyAppearance() {
+        let alpha: CGFloat
+        let borderAlpha: CGFloat
+        if !isEnabled {
+            alpha = usesDarkAppearance ? 0.05 : 0.35
+            borderAlpha = usesDarkAppearance ? 0.12 : 0.20
+        } else if hovered {
+            alpha = usesDarkAppearance ? 0.22 : 0.16
+            borderAlpha = usesDarkAppearance ? 0.42 : 0.32
+        } else {
+            alpha = usesDarkAppearance ? 0.12 : 0.08
+            borderAlpha = usesDarkAppearance ? 0.28 : 0.20
+        }
+        layer?.backgroundColor = (usesDarkAppearance
+            ? NSColor.white.withAlphaComponent(alpha)
+            : NSColor.controlAccentColor.withAlphaComponent(alpha)).cgColor
+        layer?.borderColor = (usesDarkAppearance
+            ? NSColor.white.withAlphaComponent(borderAlpha)
+            : NSColor.labelColor.withAlphaComponent(borderAlpha)).cgColor
+        layer?.borderWidth = 1
+        contentTintColor = usesDarkAppearance
+            ? NSColor.white.withAlphaComponent(isEnabled ? 0.94 : 0.38)
+            : .controlTextColor
+        if usesDarkAppearance {
+            attributedTitle = NSAttributedString(
+                string: title,
+                attributes: [
+                    .font: NSFont.systemFont(ofSize: NSFont.systemFontSize, weight: .medium),
+                    .foregroundColor: NSColor.white.withAlphaComponent(isEnabled ? 0.94 : 0.38),
+                ]
+            )
+        }
+    }
+}
+
+private final class SavedTranscriptCopyButton: PanelActionButton {
     let transcriptText: String
 
     init(title: String,
          transcriptText: String,
          target: AnyObject?,
-         action: Selector?) {
+         action: Selector?,
+         usesDarkAppearance: Bool = false) {
         self.transcriptText = transcriptText
-        super.init(frame: .zero)
-        self.title = title
-        self.target = target
-        self.action = action
-        bezelStyle = .rounded
+        super.init(title: title, target: target, action: action, usesDarkAppearance: usesDarkAppearance)
         controlSize = .small
-        setContentHuggingPriority(.required, for: .horizontal)
     }
 
     required init?(coder: NSCoder) {
@@ -20850,21 +21292,35 @@ private final class SavedTranscriptCopyButton: NSButton {
     }
 }
 
-private final class SavedTranscriptActionButton: NSButton {
+private final class SavedTranscriptActionButton: PanelActionButton {
     let transcript: SavedDictationTranscript
 
     init(title: String,
          transcript: SavedDictationTranscript,
          target: AnyObject?,
-         action: Selector?) {
+         action: Selector?,
+         usesDarkAppearance: Bool = false) {
         self.transcript = transcript
-        super.init(frame: .zero)
-        self.title = title
-        self.target = target
-        self.action = action
-        bezelStyle = .rounded
+        super.init(title: title, target: target, action: action, usesDarkAppearance: usesDarkAppearance)
         controlSize = .small
-        setContentHuggingPriority(.required, for: .horizontal)
+    }
+
+    required init?(coder: NSCoder) {
+        nil
+    }
+}
+
+private final class SavedAudioActionButton: PanelActionButton {
+    let audioURL: URL
+
+    init(title: String,
+         audioURL: URL,
+         target: AnyObject?,
+         action: Selector?,
+         usesDarkAppearance: Bool = false) {
+        self.audioURL = audioURL
+        super.init(title: title, target: target, action: action, usesDarkAppearance: usesDarkAppearance)
+        controlSize = .small
     }
 
     required init?(coder: NSCoder) {
@@ -21174,17 +21630,21 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
 
     private func currentSavedDictationSnapshot(maximumLoadedTranscripts: Int = 200) -> SavedDictationArchiveSnapshot {
         guard let transcripts = try? DictationArchive.transcriptsDirectoryURL(),
+              let recordings = try? DictationArchive.audioRecordingsDirectoryURL(),
               let failedAudio = try? DictationArchive.failedAudioDirectoryURL(),
               let pendingAudio = try? DictationArchive.pendingAudioDirectoryURL() else {
             return SavedDictationArchiveSnapshot(
                 transcripts: [],
+                audioIssues: [],
                 totalTranscriptCount: 0,
+                recordingAudioCount: 0,
                 failedAudioCount: 0,
                 pendingAudioCount: 0
             )
         }
         return savedDictationArchiveSnapshot(
             transcriptsDirectory: transcripts,
+            recordingsDirectory: recordings,
             failedAudioDirectory: failedAudio,
             pendingAudioDirectory: pendingAudio,
             maximumLoadedTranscripts: maximumLoadedTranscripts
@@ -21193,7 +21653,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
 
     private func savedDictationArchiveFingerprint() -> String {
         let snapshot = currentSavedDictationSnapshot(maximumLoadedTranscripts: 0)
-        return "\(snapshot.totalTranscriptCount):\(snapshot.failedAudioCount):\(snapshot.pendingAudioCount)"
+        return "\(snapshot.totalTranscriptCount):\(snapshot.recordingAudioCount):\(snapshot.failedAudioCount):\(snapshot.pendingAudioCount)"
     }
 
     private func makeContentView() -> NSView {
@@ -21423,9 +21883,11 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         headerText.addArrangedSubview(panelLabel(t("Сохранённые диктовки", "Saved dictations"),
                                                  size: 20,
                                                  weight: .semibold))
+        let retryCount = snapshot.audioIssues.count
+            + snapshot.transcripts.filter(\.needsRecognitionRetry).count
         let archiveSummary = panelLabel(
-            t("\(snapshot.totalTranscriptCount) текстов · \(snapshot.failedAudioCount) аудио после ошибок · \(snapshot.pendingAudioCount) ожидают повтора",
-              "\(snapshot.totalTranscriptCount) texts · \(snapshot.failedAudioCount) failed audio · \(snapshot.pendingAudioCount) awaiting retry"),
+            t("\(snapshot.totalTranscriptCount) текстов · \(snapshot.recordingAudioCount) аудиозаписей на 7 дней · \(retryCount) требуют внимания",
+              "\(snapshot.totalTranscriptCount) texts · \(snapshot.recordingAudioCount) recordings kept for 7 days · \(retryCount) need attention"),
             size: 11.5,
             color: .secondaryLabelColor
         )
@@ -21437,15 +21899,6 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         headerText.addArrangedSubview(archiveSummary)
         header.addArrangedSubview(headerText)
         header.addArrangedSubview(NSView())
-        let openFolder = panelButton(t("Папка с текстами", "Text Folder"),
-                                     action: #selector(openSavedDictationsFolderClicked(_:)),
-                                     toolTip: t("Открыть в Finder папку с сохранёнными текстами",
-                                                "Open the folder with saved transcripts in Finder"))
-        openFolder.controlSize = .small
-        openFolder.image = NSImage(systemSymbolName: "folder",
-                                   accessibilityDescription: nil)
-        openFolder.imagePosition = .imageLeading
-        header.addArrangedSubview(openFolder)
         root.addArrangedSubview(header)
         root.addArrangedSubview(separator())
 
@@ -21470,7 +21923,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             list.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor),
         ])
 
-        if snapshot.transcripts.isEmpty {
+        if snapshot.transcripts.isEmpty && snapshot.audioIssues.isEmpty {
             let empty = savedDictationsEmptyView()
             list.addArrangedSubview(empty)
             empty.widthAnchor.constraint(equalTo: list.widthAnchor,
@@ -21478,6 +21931,12 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         } else {
             for transcript in snapshot.transcripts {
                 let row = savedTranscriptCard(transcript)
+                list.addArrangedSubview(row)
+                row.widthAnchor.constraint(equalTo: list.widthAnchor,
+                                           constant: -(list.edgeInsets.left + list.edgeInsets.right)).isActive = true
+            }
+            for issue in snapshot.audioIssues {
+                let row = savedAudioIssueCard(issue)
                 list.addArrangedSubview(row)
                 row.widthAnchor.constraint(equalTo: list.widthAnchor,
                                            constant: -(list.edgeInsets.left + list.edgeInsets.right)).isActive = true
@@ -21495,8 +21954,8 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             footerText = t("Показаны последние \(loadedCount) из \(snapshot.totalTranscriptCount). Все файлы доступны в папке.",
                            "Showing the latest \(loadedCount) of \(snapshot.totalTranscriptCount). All files remain in the folder.")
         } else {
-            footerText = t("Текст сохраняется до вставки и остаётся здесь без ограничения срока.",
-                           "Text is saved before pasting and remains here until you delete it.")
+            footerText = t("Текст хранится без срока; исходное аудио — 7 дней (16 кГц mono, около 1,9 МБ/мин).",
+                           "Text is kept until you delete it; source audio is kept 7 days (16 kHz mono, about 1.9 MB/min).")
         }
         let footerLabel = panelLabel(footerText,
                                      size: 10.5,
@@ -21508,22 +21967,30 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         footerLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         footer.addArrangedSubview(footerLabel)
         footer.addArrangedSubview(NSView())
-        if snapshot.failedAudioCount + snapshot.pendingAudioCount > 0 {
-            let audio = panelButton(
-                t("Аудио после ошибок", "Error Audio"),
-                action: #selector(openFailedAudioFolderClicked(_:)),
-                toolTip: t("Открыть WAV и ожидающие повторного распознавания записи",
-                           "Open WAV files and recordings awaiting another recognition attempt")
-            )
-            audio.controlSize = .small
-            footer.addArrangedSubview(audio)
-        }
-        if snapshot.pendingAudioCount > 0 {
+        let textFolder = panelButton(
+            t("Тексты", "Texts"),
+            action: #selector(openSavedDictationsFolderClicked(_:)),
+            toolTip: t("Открыть в Finder папку с сохранёнными текстами",
+                       "Open the folder with saved transcripts in Finder")
+        )
+        textFolder.image = NSImage(systemSymbolName: "doc.text", accessibilityDescription: nil)
+        textFolder.imagePosition = .imageLeading
+        footer.addArrangedSubview(textFolder)
+        let audioFolder = panelButton(
+            t("Аудиозаписи", "Audio Recordings"),
+            action: #selector(openAudioRecordingsFolderClicked(_:)),
+            toolTip: t("Открыть в Finder все исходные WAV-записи за последние 7 дней",
+                       "Open every source WAV recording retained for the last 7 days in Finder")
+        )
+        audioFolder.image = NSImage(systemSymbolName: "waveform", accessibilityDescription: nil)
+        audioFolder.imagePosition = .imageLeading
+        footer.addArrangedSubview(audioFolder)
+        if retryCount > 0 {
             let retry = panelButton(
-                t("Распознать ещё раз (\(snapshot.pendingAudioCount))", "Retry recognition (\(snapshot.pendingAudioCount))"),
-                action: #selector(retrySavedAudioRecognitionClicked(_:)),
-                toolTip: t("Перезапустить службу и повторить распознавание сохранённого аудио. Текст и аудио не удаляются до успешного результата.",
-                           "Restart the service and retry saved audio. Text and audio remain until recognition succeeds.")
+                t("Распознать все (\(retryCount))", "Retry all (\(retryCount))"),
+                action: #selector(retryAllSavedAudioRecognitionClicked(_:)),
+                toolTip: t("Подготовить все проблемные записи к повторному распознаванию. Исходное аудио останется на месте.",
+                           "Queue all problem recordings for another recognition pass. Source audio remains in place.")
             )
             retry.image = NSImage(systemSymbolName: "arrow.clockwise", accessibilityDescription: nil)
             retry.imagePosition = .imageLeading
@@ -21579,11 +22046,9 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                               weight: .medium,
                               color: .secondaryLabelColor)
         top.addArrangedSubview(date)
-        if transcript.recoveryAudioURL != nil {
+        if transcript.needsRecognitionRetry {
             let status = panelLabel(
-                transcript.retryPending
-                    ? t("Нужно повторить распознавание", "Recognition needs retry")
-                    : t("Аудио сохранено после ошибки", "Audio retained after an error"),
+                t("Нужно повторить распознавание", "Recognition needs retry"),
                 size: 10.5,
                 weight: .medium,
                 color: .systemOrange
@@ -21592,15 +22057,43 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             top.addArrangedSubview(status)
         }
         top.addArrangedSubview(NSView())
+        if let audioURL = transcript.recordingAudioURL {
+            let openAudio = SavedAudioActionButton(
+                title: "",
+                audioURL: audioURL,
+                target: self,
+                action: #selector(openSavedAudioClicked(_:)),
+                usesDarkAppearance: usesDarkPanelAppearance
+            )
+            openAudio.image = NSImage(systemSymbolName: "waveform", accessibilityDescription: nil)
+            openAudio.imagePosition = .imageOnly
+            openAudio.toolTip = t("Открыть исходное аудио", "Open source audio")
+            openAudio.setAccessibilityLabel(t("Открыть аудио", "Open audio"))
+            top.addArrangedSubview(openAudio)
+        }
+        if transcript.needsRecognitionRetry, let retryURL = transcript.retryAudioURL {
+            let retry = SavedAudioActionButton(
+                title: "",
+                audioURL: retryURL,
+                target: self,
+                action: #selector(retrySavedAudioClicked(_:)),
+                usesDarkAppearance: usesDarkPanelAppearance
+            )
+            retry.image = NSImage(systemSymbolName: "arrow.clockwise", accessibilityDescription: nil)
+            retry.imagePosition = .imageOnly
+            retry.toolTip = t("Распознать эту запись ещё раз", "Recognize this recording again")
+            retry.setAccessibilityLabel(t("Распознать ещё раз", "Recognize again"))
+            top.addArrangedSubview(retry)
+        }
         let copy = SavedTranscriptCopyButton(
             title: "",
             transcriptText: transcript.text,
             target: self,
-            action: #selector(copySavedTranscriptClicked(_:))
+            action: #selector(copySavedTranscriptClicked(_:)),
+            usesDarkAppearance: usesDarkPanelAppearance
         )
         copy.image = NSImage(systemSymbolName: "doc.on.doc", accessibilityDescription: nil)
         copy.imagePosition = .imageOnly
-        copy.bezelStyle = .texturedRounded
         copy.toolTip = t("Скопировать весь текст, а не только предпросмотр",
                          "Copy the complete text, not only the preview")
         copy.setAccessibilityLabel(t("Копировать текст", "Copy text"))
@@ -21625,6 +22118,76 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         return card
     }
 
+    private func savedAudioIssueCard(_ issue: SavedDictationAudioIssue) -> NSView {
+        let card = compactCard()
+        card.layer?.cornerRadius = 10
+        let content = NSStackView()
+        content.orientation = .vertical
+        content.alignment = .leading
+        content.spacing = 7
+        content.translatesAutoresizingMaskIntoConstraints = false
+
+        let title = NSStackView()
+        title.orientation = .horizontal
+        title.alignment = .centerY
+        title.spacing = 8
+        title.addArrangedSubview(panelSymbol("exclamationmark.triangle.fill",
+                                             color: .systemOrange,
+                                             description: nil,
+                                             pointSize: 15))
+        title.addArrangedSubview(panelLabel(
+            issue.isPendingJournal
+                ? t("Запись ожидает распознавания", "Recording awaits recognition")
+                : t("Распознавание не завершено", "Recognition was not completed"),
+            size: 12.5,
+            weight: .semibold
+        ))
+        title.addArrangedSubview(NSView())
+        title.addArrangedSubview(panelLabel(savedTranscriptDateText(issue.date),
+                                            size: 10.5,
+                                            color: .secondaryLabelColor))
+        content.addArrangedSubview(title)
+        title.widthAnchor.constraint(equalTo: content.widthAnchor).isActive = true
+
+        let description = panelLabel(
+            t("Исходное аудио сохранено. Его можно открыть или запустить повторное распознавание.",
+              "The source audio is saved. You can open it or run recognition again."),
+            size: 11,
+            color: .secondaryLabelColor
+        )
+        description.maximumNumberOfLines = 2
+        content.addArrangedSubview(description)
+        description.widthAnchor.constraint(equalTo: content.widthAnchor).isActive = true
+
+        let actions = NSStackView()
+        actions.orientation = .horizontal
+        actions.alignment = .centerY
+        actions.spacing = 7
+        let open = SavedAudioActionButton(
+            title: t("Открыть аудио", "Open Audio"),
+            audioURL: issue.audioURL,
+            target: self,
+            action: #selector(openSavedAudioClicked(_:)),
+            usesDarkAppearance: usesDarkPanelAppearance
+        )
+        open.image = NSImage(systemSymbolName: "play.circle", accessibilityDescription: nil)
+        open.imagePosition = .imageLeading
+        actions.addArrangedSubview(open)
+        let retry = SavedAudioActionButton(
+            title: t("Распознать ещё раз", "Recognize Again"),
+            audioURL: issue.retryAudioURL,
+            target: self,
+            action: #selector(retrySavedAudioClicked(_:)),
+            usesDarkAppearance: usesDarkPanelAppearance
+        )
+        retry.image = NSImage(systemSymbolName: "arrow.clockwise", accessibilityDescription: nil)
+        retry.imagePosition = .imageLeading
+        actions.addArrangedSubview(retry)
+        content.addArrangedSubview(actions)
+        pin(content, inside: card, horizontal: 13, vertical: 10)
+        return card
+    }
+
     private func makeSavedTranscriptDetailContentView(_ transcript: SavedDictationTranscript) -> NSView {
         let root = NSStackView()
         root.orientation = .vertical
@@ -21643,11 +22206,10 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         header.addArrangedSubview(panelLabel(savedTranscriptDateText(transcript.date),
                                              size: 11,
                                              color: .secondaryLabelColor))
-        if transcript.recoveryAudioURL != nil {
+        if transcript.needsRecognitionRetry {
             header.addArrangedSubview(panelLabel(
-                transcript.retryPending
-                    ? t("Распознано не полностью — исходное аудио сохранено; можно повторить распознавание.", "Recognition is incomplete — source audio is saved; you can retry.")
-                    : t("Текст не был вставлен — исходное аудио сохранено на 7 дней.", "Text was not inserted — source audio is saved for 7 days."),
+                t("Распознавание или вставка не завершились. Исходное аудио сохранено на 7 дней — можно повторить попытку.",
+                  "Recognition or insertion was not completed. Source audio is saved for 7 days — you can retry."),
                 size: 11,
                 weight: .medium,
                 color: .systemOrange
@@ -21688,11 +22250,36 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         footer.alignment = .centerY
         footer.spacing = 8
         footer.addArrangedSubview(NSView())
+        if let audioURL = transcript.recordingAudioURL {
+            let openAudio = SavedAudioActionButton(
+                title: t("Открыть аудио", "Open Audio"),
+                audioURL: audioURL,
+                target: self,
+                action: #selector(openSavedAudioClicked(_:)),
+                usesDarkAppearance: usesDarkPanelAppearance
+            )
+            openAudio.image = NSImage(systemSymbolName: "play.circle", accessibilityDescription: nil)
+            openAudio.imagePosition = .imageLeading
+            footer.addArrangedSubview(openAudio)
+        }
+        if transcript.needsRecognitionRetry, let retryURL = transcript.retryAudioURL {
+            let retry = SavedAudioActionButton(
+                title: t("Распознать ещё раз", "Recognize Again"),
+                audioURL: retryURL,
+                target: self,
+                action: #selector(retrySavedAudioClicked(_:)),
+                usesDarkAppearance: usesDarkPanelAppearance
+            )
+            retry.image = NSImage(systemSymbolName: "arrow.clockwise", accessibilityDescription: nil)
+            retry.imagePosition = .imageLeading
+            footer.addArrangedSubview(retry)
+        }
         let reveal = SavedTranscriptActionButton(
             title: t("Показать в Finder", "Show in Finder"),
             transcript: transcript,
             target: self,
-            action: #selector(revealSavedTranscriptInFinderClicked(_:))
+            action: #selector(revealSavedTranscriptInFinderClicked(_:)),
+            usesDarkAppearance: usesDarkPanelAppearance
         )
         reveal.image = NSImage(systemSymbolName: "folder", accessibilityDescription: nil)
         reveal.imagePosition = .imageLeading
@@ -21701,7 +22288,8 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             title: t("Копировать", "Copy"),
             transcriptText: transcript.text,
             target: self,
-            action: #selector(copySavedTranscriptClicked(_:))
+            action: #selector(copySavedTranscriptClicked(_:)),
+            usesDarkAppearance: usesDarkPanelAppearance
         )
         copy.image = NSImage(systemSymbolName: "doc.on.doc", accessibilityDescription: nil)
         copy.imagePosition = .imageLeading
@@ -22651,25 +23239,10 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                              action: Selector,
                              enabled: Bool = true,
                              toolTip: String? = nil) -> NSButton {
-        let button = NSButton(title: title, target: self, action: action)
-        if usesDarkPanelAppearance {
-            // The ordinary rounded bezel can become near-white in a vibrant
-            // dark window, while AppKit keeps its title light. Textured
-            // rounded controls provide the intended dark, legible contrast.
-            button.bezelStyle = .texturedRounded
-            let titleColor = enabled
-                ? NSColor.white.withAlphaComponent(0.92)
-                : NSColor.white.withAlphaComponent(0.38)
-            button.attributedTitle = NSAttributedString(
-                string: title,
-                attributes: [
-                    .font: NSFont.systemFont(ofSize: NSFont.systemFontSize),
-                    .foregroundColor: titleColor,
-                ]
-            )
-        } else {
-            button.bezelStyle = .rounded
-        }
+        let button = PanelActionButton(title: title,
+                                       target: self,
+                                       action: action,
+                                       usesDarkAppearance: usesDarkPanelAppearance)
         button.controlSize = .regular
         button.isEnabled = enabled
         button.toolTip = toolTip
@@ -23195,9 +23768,9 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         }
     }
 
-    @objc private func openFailedAudioFolderClicked(_ sender: NSButton) {
+    @objc private func openAudioRecordingsFolderClicked(_ sender: NSButton) {
         do {
-            NSWorkspace.shared.open(try DictationArchive.rootDirectoryURL())
+            NSWorkspace.shared.open(try DictationArchive.audioRecordingsDirectoryURL())
         } catch {
             showError(title: t("Не удалось открыть папку с аудио",
                                "Could Not Open Audio Folder"),
@@ -23205,19 +23778,78 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         }
     }
 
-    @objc private func retrySavedAudioRecognitionClicked(_ sender: NSButton) {
-        guard serviceOperation == nil else { return }
-        guard !PendingDictationRecovery.pendingURLs().isEmpty else {
-            refresh(force: true)
-            return
+    private func playableAudioURL(for audioURL: URL) throws -> URL {
+        guard audioURL.pathExtension.lowercased() == "sdaudio" else { return audioURL }
+        let samples = try PendingDictationRecovery.loadSamples(from: audioURL)
+        guard let wavURL = DictationArchive.saveRecordingAudio(samples,
+                                                               sourceAudioURL: audioURL) else {
+            throw NSError(domain: "MyDictate.Archive", code: -1,
+                          userInfo: [NSLocalizedDescriptionKey: t("Не удалось сохранить WAV для открытия.",
+                                                                  "Could not save a WAV for opening.")])
         }
-        // The agent owns the loaded ASR engine.  Restarting it invokes its
-        // existing recovery queue, which processes the retained .sdaudio
-        // journal without ever deleting the original WAV first.
+        return wavURL
+    }
+
+    @objc private func openSavedAudioClicked(_ sender: SavedAudioActionButton) {
+        do {
+            let url = try playableAudioURL(for: sender.audioURL)
+            NSWorkspace.shared.open(url)
+        } catch {
+            showError(title: t("Не удалось открыть аудио", "Could Not Open Audio"),
+                      detail: error.localizedDescription)
+        }
+    }
+
+    private func queueAudioForRetry(_ audioURL: URL) throws {
+        if audioURL.pathExtension.lowercased() == "sdaudio" {
+            return // The existing journal is already in the agent's queue.
+        }
+        let samples = try DictationArchive.loadRecordingAudio(from: audioURL)
+        _ = try PendingDictationRecovery.createRetryJournal(
+            samples: samples,
+            archiveBaseName: audioURL.deletingPathExtension().lastPathComponent
+        )
+    }
+
+    private func restartServiceForQueuedAudioRetry() {
         settings.agentEnabled = true
         _ = settings.refreshFromDisk()
         beginServiceOperation(.restarting)
         log("saved audio retry requested from archive window")
+    }
+
+    @objc private func retrySavedAudioClicked(_ sender: SavedAudioActionButton) {
+        guard serviceOperation == nil else { return }
+        do {
+            try queueAudioForRetry(sender.audioURL)
+            restartServiceForQueuedAudioRetry()
+        } catch {
+            showError(title: t("Не удалось подготовить аудио", "Could Not Prepare Audio"),
+                      detail: error.localizedDescription)
+        }
+    }
+
+    @objc private func retryAllSavedAudioRecognitionClicked(_ sender: NSButton) {
+        guard serviceOperation == nil else { return }
+        let snapshot = currentSavedDictationSnapshot()
+        let urls = snapshot.transcripts.compactMap(\.retryAudioURL)
+            + snapshot.audioIssues.map(\.retryAudioURL)
+        let uniqueURLs = Dictionary(uniqueKeysWithValues: urls.map {
+            ($0.standardizedFileURL.path, $0)
+        }).values
+        guard !uniqueURLs.isEmpty else {
+            refresh(force: true)
+            return
+        }
+        do {
+            for url in uniqueURLs {
+                try queueAudioForRetry(url)
+            }
+            restartServiceForQueuedAudioRetry()
+        } catch {
+            showError(title: t("Не удалось подготовить аудио", "Could Not Prepare Audio"),
+                      detail: error.localizedDescription)
+        }
     }
 
     @objc private func closeSavedDictationsClicked(_ sender: NSButton) {
