@@ -2622,6 +2622,8 @@ final class Settings: @unchecked Sendable {
     private static let keyEnterHotkeyModifiers = "enter_hotkey_modifiers"
     private static let keyClipboardHotkeyKeycode = "clipboard_hotkey_keycode"
     private static let keyClipboardHotkeyModifiers = "clipboard_hotkey_modifiers"
+    private static let keyCancelHotkeyKeycode = "cancel_hotkey_keycode"
+    private static let keyCancelHotkeyModifiers = "cancel_hotkey_modifiers"
     private static let keyInterfaceLanguage = "interface_language"
     private static let keyTriggerMode = "trigger_mode"
     private static let keyPasteSuffix = "paste_suffix"
@@ -2771,6 +2773,40 @@ final class Settings: @unchecked Sendable {
     func setConfiguredClipboardHotkey(_ choice: HotkeyChoice) {
         clipboardHotkeyKeycode = choice.keycode
         clipboardHotkeyModifiers = choice.requiredModifiers
+    }
+
+    var cancelHotkeyKeycode: CGKeyCode {
+        get {
+            normalizedHotkeyKeycode(storedValue: defaults.object(forKey: Self.keyCancelHotkeyKeycode))
+                ?? RIGHT_COMMAND_KEYCODE
+        }
+        set {
+            let normalized = normalizedHotkeyKeycode(storedValue: NSNumber(value: Int(newValue)))
+                ?? RIGHT_COMMAND_KEYCODE
+            defaults.set(Int(normalized), forKey: Self.keyCancelHotkeyKeycode)
+        }
+    }
+
+    var cancelHotkeyModifiers: CGEventFlags {
+        get {
+            let raw = defaults.object(forKey: Self.keyCancelHotkeyModifiers) as? NSNumber
+            if raw == nil { return .maskControl }
+            return CGEventFlags(rawValue: raw?.uint64Value ?? 0)
+                .intersection(HOTKEY_SHORTCUT_MODIFIER_MASK)
+        }
+        set {
+            defaults.set(NSNumber(value: newValue.intersection(HOTKEY_SHORTCUT_MODIFIER_MASK).rawValue),
+                         forKey: Self.keyCancelHotkeyModifiers)
+        }
+    }
+
+    var configuredCancelHotkey: HotkeyChoice {
+        hotkeyChoice(forKeycode: cancelHotkeyKeycode, modifiers: cancelHotkeyModifiers)
+    }
+
+    func setConfiguredCancelHotkey(_ choice: HotkeyChoice) {
+        cancelHotkeyKeycode = choice.keycode
+        cancelHotkeyModifiers = choice.requiredModifiers
     }
 
     var interfaceLanguage: InterfaceLanguage {
@@ -3821,7 +3857,7 @@ private func hotkeyRecordingDecision(for event: HotkeyEventSnapshot) -> HotkeyRe
         modifiers: event.flags.intersection(HOTKEY_SHORTCUT_MODIFIER_MASK)
     ),
           !choice.isModifier else {
-        return .reject("Escape is reserved for canceling dictation. Choose another key or shortcut.")
+        return .reject("Escape remains available to other apps and cannot be assigned. Choose another key or shortcut.")
     }
     return .accept(choice)
 }
@@ -4151,15 +4187,15 @@ private struct HotkeyTransitionState {
     private var standardShortcutState = HotkeyShortcutState()
     private var enterShortcutState = HotkeyShortcutState()
     private var clipboardShortcutState = HotkeyShortcutState()
+    private var cancelShortcutState = HotkeyShortcutState()
     private var toggleActive = false
-    private var suppressEscapeKeyUp = false
 
     mutating func resetAll() {
         standardShortcutState.reset()
         enterShortcutState.reset()
         clipboardShortcutState.reset()
+        cancelShortcutState.reset()
         toggleActive = false
-        suppressEscapeKeyUp = false
     }
 
     mutating func resetToggleState() {
@@ -4178,12 +4214,16 @@ private struct HotkeyTransitionState {
                                                  modifiers: .maskAlternate),
         clipboardHotkey: HotkeyChoice = hotkeyChoice(forKeycode: RIGHT_COMMAND_KEYCODE,
                                                      modifiers: .maskShift),
+        cancelHotkey: HotkeyChoice = hotkeyChoice(forKeycode: RIGHT_COMMAND_KEYCODE,
+                                                  modifiers: .maskControl),
         triggerMode: TriggerMode,
         isRecording: Bool,
         canStartRecording: Bool = true
     ) -> HotkeyTransitionResult {
-        if event.keycode == ESCAPE_KEYCODE {
-            return transitionEscape(for: event, isRecording: isRecording)
+        if let cancellation = transitionCancelShortcut(for: event,
+                                                       isRecording: isRecording,
+                                                       cancelHotkey: cancelHotkey) {
+            return cancellation
         }
 
         if !hotkeyIsModifierPrefix(hotkey, of: enterHotkey) {
@@ -4225,8 +4265,8 @@ private struct HotkeyTransitionState {
             // toggle. Otherwise the rejected press strands
             // toggleActive at true, the NEXT press emits a .release
             // the app discards, and only the third press records —
-            // with zero feedback in between. Same gate-callback
-            // pattern Escape uses via isRecording.
+            // with zero feedback in between. The gate callback mirrors
+            // the app-side recording-start guard.
             guard canStartRecording else { return .suppressOnly }
             toggleActive = true
             return HotkeyTransitionResult(suppress: true, actions: [.press])
@@ -4243,6 +4283,7 @@ private struct HotkeyTransitionState {
         case .press where isRecording:
             standardShortcutState.reset()
             clipboardShortcutState.reset()
+            cancelShortcutState.reset()
             toggleActive = false
             return HotkeyTransitionResult(suppress: true, actions: [.releaseAlternate])
         case .press, .release, .suppress:
@@ -4262,6 +4303,7 @@ private struct HotkeyTransitionState {
         case .press where isRecording:
             standardShortcutState.reset()
             enterShortcutState.reset()
+            cancelShortcutState.reset()
             toggleActive = false
             return HotkeyTransitionResult(suppress: true, actions: [.releaseClipboard])
         case .press, .release, .suppress:
@@ -4271,28 +4313,26 @@ private struct HotkeyTransitionState {
         }
     }
 
-    private mutating func transitionEscape(
+    private mutating func transitionCancelShortcut(
         for event: HotkeyEventSnapshot,
-        isRecording: Bool
-    ) -> HotkeyTransitionResult {
-        if event.typeRawValue == CGEventType.keyDown.rawValue {
-            if event.isAutoRepeat, suppressEscapeKeyUp {
-                return .suppressOnly
-            }
-            guard isRecording else { return .pass }
-            suppressEscapeKeyUp = true
-            return event.isAutoRepeat
-                ? .suppressOnly
-                : HotkeyTransitionResult(suppress: true, actions: [.cancel])
-        }
-
-        if event.typeRawValue == CGEventType.keyUp.rawValue, suppressEscapeKeyUp {
-            suppressEscapeKeyUp = false
+        isRecording: Bool,
+        cancelHotkey: HotkeyChoice
+    ) -> HotkeyTransitionResult? {
+        guard isRecording || cancelShortcutState.isEngaged else { return nil }
+        switch cancelShortcutState.consume(event, shortcut: cancelHotkey) {
+        case .press where isRecording:
+            standardShortcutState.reset()
+            enterShortcutState.reset()
+            clipboardShortcutState.reset()
+            toggleActive = false
+            return HotkeyTransitionResult(suppress: true, actions: [.cancel])
+        case .press, .release, .suppress:
             return .suppressOnly
+        case .pass:
+            return nil
         }
-
-        return .pass
     }
+
 }
 
 @MainActor
@@ -4308,12 +4348,13 @@ final class HotkeyListener {
                                                  modifiers: .maskAlternate)
     var clipboardHotkey: HotkeyChoice = hotkeyChoice(forKeycode: RIGHT_COMMAND_KEYCODE,
                                                      modifiers: .maskShift)
+    var cancelHotkey: HotkeyChoice = hotkeyChoice(forKeycode: RIGHT_COMMAND_KEYCODE,
+                                                  modifiers: .maskControl)
     var triggerMode: TriggerMode = .hold
 
     /// onPress fires when a recording should start (press in hold mode,
     /// or first press in toggle mode). onRelease fires when it should
     /// stop (release in hold mode, or second press in toggle mode).
-    /// onCancel fires for Escape while a recording is active.
     var onPress: (() -> Void)?
     var onRelease: ((TimeInterval) -> Void)?
     var onReleaseAlternate: ((TimeInterval) -> Void)?
@@ -4406,6 +4447,12 @@ final class HotkeyListener {
         log("HotkeyListener: clipboard hotkey changed → \(choice.name)")
     }
 
+    func setCancelHotkey(_ choice: HotkeyChoice) {
+        cancelHotkey = choice
+        transitionState.resetAll()
+        log("HotkeyListener: cancel hotkey changed → \(choice.name)")
+    }
+
     func setTriggerMode(_ mode: TriggerMode) {
         // Reset toggle state when switching modes so we don't get
         // stuck in mid-toggle from a previous session.
@@ -4428,6 +4475,7 @@ final class HotkeyListener {
                                                 hotkey: hotkey,
                                                 enterHotkey: enterHotkey,
                                                 clipboardHotkey: clipboardHotkey,
+                                                cancelHotkey: cancelHotkey,
                                                 triggerMode: triggerMode,
                                                 isRecording: isRecordingActive?() ?? false,
                                                 canStartRecording: canStartRecording?() ?? true)
@@ -10323,7 +10371,9 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         hotkey.onReleaseClipboard = { [weak self] detectedAt in
             self?.handleRelease(shortcut: .clipboardOnly, hotkeyDetectedAt: detectedAt)
         }
-        hotkey.onCancel = { [weak self] in self?.cancelActiveRecording(reason: "escape") }
+        hotkey.onCancel = { [weak self] in
+            self?.discardActiveRecording(reason: "cancel hotkey")
+        }
         hotkey.isRecordingActive = { [weak self] in self?.isRecording == true }
         // Mirrors the first guard in handlePress — if this returns
         // false the press would be silently discarded, so toggle mode
@@ -10413,6 +10463,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         hotkey.setHotkey(settings.configuredHotkey)
         hotkey.setEnterHotkey(settings.configuredEnterHotkey)
         hotkey.setClipboardHotkey(settings.configuredClipboardHotkey)
+        hotkey.setCancelHotkey(settings.configuredCancelHotkey)
         hotkey.setTriggerMode(settings.triggerMode)
         startStartup(reason: "launch")
     }
@@ -11437,16 +11488,34 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         startRecordingHUDMotion()
     }
 
-    private func showCompletedHUD() {
+    private func showCompletedHUD(text: String? = nil) {
         guard settings.showRecordingWaveform else { return }
         recordingHUDView?.transcriptionProgress = nil
-        recordingHUDView?.completionText = settings.interfaceLanguage == .english ? "Done" : "Готово"
+        recordingHUDView?.completionText = text
+            ?? (settings.interfaceLanguage == .english ? "Done" : "Готово")
         if recordingHUDPanel?.isVisible == true {
             updateRecordingHUD(mode: .completed, level: 0)
         } else {
             showRecordingHUD(mode: .completed, level: 0)
         }
         stopRecordingHUDMotion()
+    }
+
+    private func showTransientHUDCompletion(_ text: String? = nil) {
+        guard settings.showRecordingWaveform else {
+            hideRecordingHUD()
+            return
+        }
+        showCompletedHUD(text: text)
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self, !self.isRecording, !self.isBusy else { return }
+            self.recordingHUDCompletionWorkItem = nil
+            self.hideRecordingHUD()
+        }
+        recordingHUDCompletionWorkItem?.cancel()
+        recordingHUDCompletionWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + RECORDING_HUD_COMPLETED_VISIBLE_SECONDS,
+                                      execute: workItem)
     }
 
     private func updateTranscribingHUDProgress(_ progress: Int) {
@@ -12015,16 +12084,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             hideRecordingHUD()
             return
         }
-        showCompletedHUD()
-        let workItem = DispatchWorkItem { [weak self] in
-            guard let self, !self.isRecording, !self.isBusy else { return }
-            self.recordingHUDCompletionWorkItem = nil
-            self.hideRecordingHUD()
-        }
-        recordingHUDCompletionWorkItem?.cancel()
-        recordingHUDCompletionWorkItem = workItem
-        DispatchQueue.main.asyncAfter(deadline: .now() + RECORDING_HUD_COMPLETED_VISIBLE_SECONDS,
-                                      execute: workItem)
+        showTransientHUDCompletion()
     }
 
     // Visible + audible cue that a press produced no pasted text — the
@@ -12568,6 +12628,37 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         recoverActiveRecordingToHistory(reason: reason,
                                         runDeferredRefresh: runDeferredRefresh)
+    }
+
+    /// A deliberate user cancellation is different from recovery after sleep,
+    /// permission loss or termination. It discards the in-flight journal and
+    /// never creates a WAV, transcript, history entry or clipboard value.
+    private func discardActiveRecording(reason: String) {
+        guard isRecording || audio.isRunning else {
+            hotkey.resetToggleState()
+            return
+        }
+
+        cancelMaxDurationAutoRelease()
+        let captured = audio.endRecording()
+        isRecording = false
+        recordingStartApplicationDescription = nil
+        stopRecordingLevelMeter(hideHUD: false)
+        hotkey.resetToggleState()
+        unmuteIfWeMuted()
+        PendingDictationRecovery.remove(captured.recoveryURL)
+
+        setMenuBarState(.idle)
+        rebuildMenu()
+        showTransientHUDCompletion(
+            settings.interfaceLanguage == .english ? "Canceled" : "Отменено"
+        )
+        log("recording canceled deliberately (\(reason)); \(captured.samples.count) samples discarded")
+
+        let didRestartAudio = runDeferredAudioRouteRefreshIfNeeded()
+        if !didRestartAudio {
+            scheduleAudioIdleStop(reason: reason)
+        }
     }
 
     // Termination cannot await transcription, so it only flushes the
@@ -13564,7 +13655,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     @objc private func cancelRecordingClicked(_ sender: NSMenuItem) {
-        cancelActiveRecording(reason: "menu")
+        discardActiveRecording(reason: "menu")
     }
 
     @objc private func copyDiagnosticsClicked(_ sender: NSMenuItem) {
@@ -14083,6 +14174,9 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             permissionLines: permissionLines,
             settingLines: [
                 "Hotkey: \(hotkey.hotkey.name)",
+                "Enter hotkey: \(hotkey.enterHotkey.name)",
+                "Clipboard hotkey: \(hotkey.clipboardHotkey.name)",
+                "Cancel hotkey: \(hotkey.cancelHotkey.name)",
                 "Trigger mode: \(TRIGGER_DISPLAY[settings.triggerMode] ?? settings.triggerMode.rawValue)",
                 "Speech model: \(speechModelProfile.displayName)",
                 "Language: \(languageSettingText)",
@@ -17110,6 +17204,7 @@ private enum ParakeySelfTest {
         try testModifierOnlyChordMatching()
         try testConfigurableEnterShortcut()
         try testConfigurableClipboardShortcut()
+        try testConfigurableCancelShortcut()
         try testFKeyAutoRepeatSuppressesWithoutAction()
         try testRightModifierReleaseWithLeftFlagStillSet()
         try testShiftCommandClipboardChord()
@@ -17118,7 +17213,7 @@ private enum ParakeySelfTest {
         try testTogglePressFlipsOnceAndReleaseIsNoOp()
         try testToggleGatedPressDoesNotFlipToggleState()
         try testEscapePassesThroughWhenNotRecording()
-        try testEscapeSuppressesCancelRepeatAndKeyUpWhileRecording()
+        try testEscapePassesThroughWhileRecording()
     }
 
     private static func testHotkeyPreferenceNormalization() throws {
@@ -17147,6 +17242,15 @@ private enum ParakeySelfTest {
                                 language: .russian),
             equals: "Правый Command",
             "Russian UI should localize a modifier-only shortcut"
+        )
+        try expect(
+            localizedHotkeyName(
+                hotkeyChoice(forKeycode: RIGHT_COMMAND_KEYCODE,
+                             modifiers: .maskControl),
+                language: .russian
+            ),
+            equals: "Control + Правый Command",
+            "Russian UI should display the default cancel shortcut clearly"
         )
         try expect(
             localizedHotkeyName(hotkeyChoice(forKeycode: 49, modifiers: .maskAlternate),
@@ -20106,6 +20210,19 @@ private enum ParakeySelfTest {
             "pending dictation journal should be private"
         )
 
+        let canceledRecoveryURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mydictate-cancel-test-\(UUID().uuidString)")
+            .appendingPathExtension("sdaudio")
+        let canceledJournal = try PendingDictationJournal(url: canceledRecoveryURL)
+        canceledJournal.append(expectedSamples)
+        canceledJournal.finish()
+        PendingDictationRecovery.remove(canceledRecoveryURL)
+        try expect(
+            FileManager.default.fileExists(atPath: canceledRecoveryURL.path),
+            equals: false,
+            "deliberate cancellation should remove the in-flight audio journal"
+        )
+
         let archiveRoot = FileManager.default.temporaryDirectory
             .appendingPathComponent("mydictate-archive-test-\(UUID().uuidString)", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: archiveRoot) }
@@ -20690,6 +20807,61 @@ private enum ParakeySelfTest {
         )
     }
 
+    private static func testConfigurableCancelShortcut() throws {
+        let standard = hotkeyChoice(forKeycode: RIGHT_COMMAND_KEYCODE)
+        let enterShortcut = hotkeyChoice(forKeycode: RIGHT_COMMAND_KEYCODE,
+                                         modifiers: .maskAlternate)
+        let clipboardShortcut = hotkeyChoice(forKeycode: RIGHT_COMMAND_KEYCODE,
+                                             modifiers: .maskShift)
+        let cancelShortcut = hotkeyChoice(forKeycode: RIGHT_COMMAND_KEYCODE,
+                                          modifiers: .maskControl)
+        let control = CGEventFlags.maskControl.rawValue
+        let commandControl = control | CGEventFlags.maskCommand.rawValue
+
+        var state = HotkeyTransitionState()
+        try expect(
+            state.transition(for: event(.flagsChanged,
+                                        keycode: CGKeyCode(59),
+                                        flags: control),
+                             hotkey: standard,
+                             enterHotkey: enterShortcut,
+                             clipboardHotkey: clipboardShortcut,
+                             cancelHotkey: cancelShortcut,
+                             triggerMode: .toggle,
+                             isRecording: true),
+            equals: .suppressOnly,
+            "Control should be reserved while a cancel chord is forming"
+        )
+        try expect(
+            state.transition(for: event(.flagsChanged,
+                                        keycode: RIGHT_COMMAND_KEYCODE,
+                                        flags: commandControl),
+                             hotkey: standard,
+                             enterHotkey: enterShortcut,
+                             clipboardHotkey: clipboardShortcut,
+                             cancelHotkey: cancelShortcut,
+                             triggerMode: .toggle,
+                             isRecording: true),
+            equals: HotkeyTransitionResult(suppress: true, actions: [.cancel]),
+            "Control + Right Command should cancel an active recording"
+        )
+
+        var idleState = HotkeyTransitionState()
+        try expect(
+            idleState.transition(for: event(.flagsChanged,
+                                            keycode: RIGHT_COMMAND_KEYCODE,
+                                            flags: commandControl),
+                                 hotkey: standard,
+                                 enterHotkey: enterShortcut,
+                                 clipboardHotkey: clipboardShortcut,
+                                 cancelHotkey: cancelShortcut,
+                                 triggerMode: .toggle,
+                                 isRecording: false),
+            equals: .pass,
+            "the cancel shortcut should never start a recording while idle"
+        )
+    }
+
     private static func testFKeyAutoRepeatSuppressesWithoutAction() throws {
         var state = HotkeyTransitionState()
         let f5 = hotkeyChoice(forKeycode: 96)
@@ -20953,29 +21125,24 @@ private enum ParakeySelfTest {
         )
     }
 
-    private static func testEscapeSuppressesCancelRepeatAndKeyUpWhileRecording() throws {
+    private static func testEscapePassesThroughWhileRecording() throws {
         var state = HotkeyTransitionState()
         let f5 = hotkeyChoice(forKeycode: 96)
 
         try expect(
             state.transition(for: event(.keyDown, keycode: ESCAPE_KEYCODE), hotkey: f5, triggerMode: .hold, isRecording: true),
-            equals: HotkeyTransitionResult(suppress: true, actions: [.cancel]),
-            "Escape keyDown should suppress and cancel while recording"
-        )
-        try expect(
-            state.transition(for: event(.keyDown, keycode: ESCAPE_KEYCODE, isAutoRepeat: true), hotkey: f5, triggerMode: .hold, isRecording: false),
-            equals: .suppressOnly,
-            "Escape autorepeat from a canceled press should stay suppressed"
-        )
-        try expect(
-            state.transition(for: event(.keyUp, keycode: ESCAPE_KEYCODE), hotkey: f5, triggerMode: .hold, isRecording: false),
-            equals: .suppressOnly,
-            "paired Escape keyUp should stay suppressed after cancel"
-        )
-        try expect(
-            state.transition(for: event(.keyUp, keycode: ESCAPE_KEYCODE), hotkey: f5, triggerMode: .hold, isRecording: false),
             equals: .pass,
-            "later Escape keyUp should pass through once the canceled press is complete"
+            "Escape keyDown should pass through while recording"
+        )
+        try expect(
+            state.transition(for: event(.keyDown, keycode: ESCAPE_KEYCODE, isAutoRepeat: true), hotkey: f5, triggerMode: .hold, isRecording: true),
+            equals: .pass,
+            "Escape autorepeat should pass through while recording"
+        )
+        try expect(
+            state.transition(for: event(.keyUp, keycode: ESCAPE_KEYCODE), hotkey: f5, triggerMode: .hold, isRecording: true),
+            equals: .pass,
+            "Escape keyUp should pass through while recording"
         )
     }
 
@@ -21021,12 +21188,14 @@ private enum ControlPanelShortcutKind: Int {
     case withoutEnter = 0
     case withEnter = 1
     case clipboardOnly = 2
+    case cancel = 3
 }
 
 private struct ControlPanelSettingsDraft: Equatable {
     var hotkeyWithoutEnter: HotkeyChoice
     var hotkeyWithEnter: HotkeyChoice
     var hotkeyClipboardOnly: HotkeyChoice
+    var hotkeyCancel: HotkeyChoice
     var speechModelProfile: SpeechModelProfile
     var recordingColor: RecordingHUDAccentColor
     var transcribingColor: RecordingHUDAccentColor
@@ -21037,6 +21206,7 @@ private struct ControlPanelSettingsDraft: Equatable {
         hotkeyWithoutEnter = settings.configuredHotkey
         hotkeyWithEnter = settings.configuredEnterHotkey
         hotkeyClipboardOnly = settings.configuredClipboardHotkey
+        hotkeyCancel = settings.configuredCancelHotkey
         speechModelProfile = settings.speechModelProfile
         recordingColor = settings.recordingHUDRecordingColor
         transcribingColor = settings.recordingHUDTranscribingColor
@@ -21885,6 +22055,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                 settings.configuredHotkey.name,
                 settings.configuredEnterHotkey.name,
                 settings.configuredClipboardHotkey.name,
+                settings.configuredCancelHotkey.name,
                 settings.speechModelProfile.rawValue,
                 settings.triggerMode.rawValue,
                 settings.recordingHUDRecordingColor.rawValue,
@@ -22715,6 +22886,20 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             buttonEnabled: serviceOperation == nil,
             toolTip: t("Назначить сочетание для сохранения результата только в буфере обмена.",
                        "Assign a shortcut that leaves the result in the clipboard without inserting it.")
+        ))
+        form.addArrangedSubview(statusRow(
+            title: t("Отменить диктовку", "Cancel dictation"),
+            detail: t("Немедленно удаляет текущую запись без распознавания и сохранения: ",
+                      "Immediately deletes the current recording without recognition or saving: ")
+                + localizedHotkeyName(draft.hotkeyCancel, language: language),
+            status: "",
+            statusColor: .secondaryLabelColor,
+            buttonTitle: t("Изменить…", "Change…"),
+            action: #selector(recordDictationShortcutClicked(_:)),
+            tag: ControlPanelShortcutKind.cancel.rawValue,
+            buttonEnabled: serviceOperation == nil,
+            toolTip: t("Назначить отдельное сочетание для полной безвозвратной отмены.",
+                       "Assign a separate shortcut that permanently cancels the current recording.")
         ))
         form.addArrangedSubview(separator())
         form.addArrangedSubview(popupRow(
@@ -23554,12 +23739,13 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             draft.hotkeyWithoutEnter,
             draft.hotkeyWithEnter,
             draft.hotkeyClipboardOnly,
+            draft.hotkeyCancel,
         ]
         for lhsIndex in shortcuts.indices {
             for rhsIndex in shortcuts.indices where lhsIndex < rhsIndex {
                 if hotkeysConflict(shortcuts[lhsIndex], shortcuts[rhsIndex]) {
-                    return t("Все три сочетания должны отличаться.",
-                             "All three shortcuts must be different.")
+                    return t("Все четыре сочетания должны отличаться.",
+                             "All four shortcuts must be different.")
                 }
             }
         }
@@ -24368,7 +24554,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         settingsDraft = ControlPanelSettingsDraft(settings: settings)
 
         let settingsWindow = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 500, height: 520),
+            contentRect: NSRect(x: 0, y: 0, width: 500, height: 580),
             styleMask: [.titled, .closable, .miniaturizable],
             backing: .buffered,
             defer: false
@@ -24404,7 +24590,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
     }
 
     private func resizeSettingsWindow(_ settingsWindow: NSWindow) {
-        let size = fittedSecondarySize(NSSize(width: 500, height: 520))
+        let size = fittedSecondarySize(NSSize(width: 500, height: 580))
         let oldTop = settingsWindow.frame.maxY
         settingsWindow.contentMinSize = size
         settingsWindow.contentMaxSize = size
@@ -24466,6 +24652,11 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             description: t("Завершить диктовку · сохранить только в буфер обмена",
                            "Finish dictation · save only to the clipboard")
         ))
+        shortcutStack.addArrangedSubview(dictationHelpShortcutRow(
+            hotkey: localizedHotkeyName(settings.configuredCancelHotkey, language: language),
+            description: t("Полностью отменить · удалить текущую запись без сохранения",
+                           "Cancel completely · delete the current recording without saving")
+        ))
         root.addArrangedSubview(shortcutStack)
 
         let insertionCard = compactCard(style: .inset)
@@ -24480,8 +24671,8 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                                                     description: nil,
                                                     pointSize: 15))
         let insertionInfo = panelLabel(
-            t("Результат всегда остаётся в буфере и «Сохранённых диктовках». Обычный режим дополнительно вставляет текст туда, где стоит курсор при завершении.",
-              "The result always remains in the clipboard and Saved Dictations. Normal mode also inserts it where the cursor is active when you finish."),
+            t("После обычного завершения результат остаётся в буфере и «Сохранённых диктовках». Команда отмены безвозвратно удаляет текущую запись.",
+              "After a normal finish, the result remains in the clipboard and Saved Dictations. Cancel permanently deletes the current recording."),
             size: 11,
             color: .secondaryLabelColor
         )
@@ -24550,14 +24741,14 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         }
 
         let helpWindow = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 460, height: 235),
+            contentRect: NSRect(x: 0, y: 0, width: 460, height: 315),
             styleMask: [.titled, .closable, .miniaturizable],
             backing: .buffered,
             defer: false
         )
         configureSecondaryWindowAppearance(helpWindow)
         helpWindow.title = t("Как пользоваться MyDictate", "Using MyDictate")
-        let size = fittedSecondarySize(NSSize(width: 460, height: 270))
+        let size = fittedSecondarySize(NSSize(width: 460, height: 315))
         helpWindow.contentMinSize = size
         helpWindow.contentMaxSize = size
         helpWindow.setContentSize(size)
@@ -24571,7 +24762,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         DispatchQueue.main.async { [weak self, weak helpWindow] in
             guard let self, let helpWindow,
                   self.dictationHelpWindow === helpWindow else { return }
-            let size = self.fittedSecondarySize(NSSize(width: 460, height: 270))
+            let size = self.fittedSecondarySize(NSSize(width: 460, height: 315))
             helpWindow.contentMinSize = size
             helpWindow.contentMaxSize = size
             helpWindow.setContentSize(size)
@@ -24619,6 +24810,8 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             recorderTitle = t("Новое сочетание с Enter", "Shortcut With Enter")
         case .clipboardOnly:
             recorderTitle = t("Новое сочетание для буфера", "Clipboard-Only Shortcut")
+        case .cancel:
+            recorderTitle = t("Новое сочетание для отмены", "Cancel Dictation Shortcut")
         }
         let selected = presentHotkeyRecorder(language: language,
                                              titleOverride: recorderTitle)
@@ -24634,6 +24827,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         case .withoutEnter: draft.hotkeyWithoutEnter = selected
         case .withEnter: draft.hotkeyWithEnter = selected
         case .clipboardOnly: draft.hotkeyClipboardOnly = selected
+        case .cancel: draft.hotkeyCancel = selected
         }
         settingsDraft = draft
         refreshSettingsWindow()
@@ -24703,6 +24897,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         settings.setConfiguredHotkey(draft.hotkeyWithoutEnter)
         settings.setConfiguredEnterHotkey(draft.hotkeyWithEnter)
         settings.setConfiguredClipboardHotkey(draft.hotkeyClipboardOnly)
+        settings.setConfiguredCancelHotkey(draft.hotkeyCancel)
         settings.speechModelProfile = draft.speechModelProfile
         settings.recordingHUDRecordingColor = draft.recordingColor
         settings.recordingHUDTranscribingColor = draft.transcribingColor
