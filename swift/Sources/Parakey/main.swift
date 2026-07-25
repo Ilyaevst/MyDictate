@@ -105,6 +105,7 @@ let RECORDING_HUD_ANIMATE_IN_SECONDS: TimeInterval = 0.32
 let RECORDING_HUD_ANIMATE_OUT_SECONDS: TimeInterval = 0.23
 let RECORDING_HUD_TRANSCRIBING_RESOLVE_SECONDS: TimeInterval = 0.20
 let RECORDING_HUD_TRANSCRIBING_MIN_VISIBLE_SECONDS: TimeInterval = 0.24
+let RECORDING_HUD_COMPLETED_VISIBLE_SECONDS: TimeInterval = 1.8
 let RECORDING_HUD_PROGRESS_MINIMUM_RECORDING_SECONDS: TimeInterval = 60
 let RECORDING_HUD_TARGET_REFRESH_INTERVAL: TimeInterval = 0.16
 let RECORDING_HUD_TARGET_FOLLOW_RESPONSE: CGFloat = 22
@@ -147,6 +148,7 @@ enum MenuBarState {
 enum RecordingHUDMode {
     case recording
     case transcribing
+    case completed
 }
 
 /// A global dictation shortcut: either one modifier key or a regular
@@ -1998,6 +2000,9 @@ func visibleRecordingLevel(rawLevel: Float) -> Float {
 }
 
 func recordingHUDPhaseSpeed(mode: RecordingHUDMode, level: Float) -> CGFloat {
+    if mode == .completed {
+        return 0
+    }
     guard mode == .recording else {
         return RECORDING_HUD_TRANSCRIBING_PHASE_SPEED
     }
@@ -2615,6 +2620,8 @@ final class Settings: @unchecked Sendable {
     private static let keyHotkeyModifiers = "hotkey_modifiers"
     private static let keyEnterHotkeyKeycode = "enter_hotkey_keycode"
     private static let keyEnterHotkeyModifiers = "enter_hotkey_modifiers"
+    private static let keyClipboardHotkeyKeycode = "clipboard_hotkey_keycode"
+    private static let keyClipboardHotkeyModifiers = "clipboard_hotkey_modifiers"
     private static let keyInterfaceLanguage = "interface_language"
     private static let keyTriggerMode = "trigger_mode"
     private static let keyPasteSuffix = "paste_suffix"
@@ -2730,6 +2737,40 @@ final class Settings: @unchecked Sendable {
     func setConfiguredEnterHotkey(_ choice: HotkeyChoice) {
         enterHotkeyKeycode = choice.keycode
         enterHotkeyModifiers = choice.requiredModifiers
+    }
+
+    var clipboardHotkeyKeycode: CGKeyCode {
+        get {
+            normalizedHotkeyKeycode(storedValue: defaults.object(forKey: Self.keyClipboardHotkeyKeycode))
+                ?? RIGHT_COMMAND_KEYCODE
+        }
+        set {
+            let normalized = normalizedHotkeyKeycode(storedValue: NSNumber(value: Int(newValue)))
+                ?? RIGHT_COMMAND_KEYCODE
+            defaults.set(Int(normalized), forKey: Self.keyClipboardHotkeyKeycode)
+        }
+    }
+
+    var clipboardHotkeyModifiers: CGEventFlags {
+        get {
+            let raw = defaults.object(forKey: Self.keyClipboardHotkeyModifiers) as? NSNumber
+            if raw == nil { return .maskShift }
+            return CGEventFlags(rawValue: raw?.uint64Value ?? 0)
+                .intersection(HOTKEY_SHORTCUT_MODIFIER_MASK)
+        }
+        set {
+            defaults.set(NSNumber(value: newValue.intersection(HOTKEY_SHORTCUT_MODIFIER_MASK).rawValue),
+                         forKey: Self.keyClipboardHotkeyModifiers)
+        }
+    }
+
+    var configuredClipboardHotkey: HotkeyChoice {
+        hotkeyChoice(forKeycode: clipboardHotkeyKeycode, modifiers: clipboardHotkeyModifiers)
+    }
+
+    func setConfiguredClipboardHotkey(_ choice: HotkeyChoice) {
+        clipboardHotkeyKeycode = choice.keycode
+        clipboardHotkeyModifiers = choice.requiredModifiers
     }
 
     var interfaceLanguage: InterfaceLanguage {
@@ -4008,8 +4049,8 @@ private enum HotkeyTransitionAction: Equatable, Sendable {
     case press
     case release
     case releaseAlternate
+    case releaseClipboard
     case cancel
-    case showHistory
 }
 
 private struct HotkeyTransitionResult: Equatable, Sendable {
@@ -4109,33 +4150,20 @@ private struct HotkeyShortcutState {
 private struct HotkeyTransitionState {
     private var standardShortcutState = HotkeyShortcutState()
     private var enterShortcutState = HotkeyShortcutState()
+    private var clipboardShortcutState = HotkeyShortcutState()
     private var toggleActive = false
     private var suppressEscapeKeyUp = false
-    private var historyChordRightCommandDown = false
-    private var historyChordRightShiftDown = false
-    private var historyChordActive = false
-    private var historyChordPassedRightShiftDown = false
 
     mutating func resetAll() {
         standardShortcutState.reset()
         enterShortcutState.reset()
+        clipboardShortcutState.reset()
         toggleActive = false
         suppressEscapeKeyUp = false
-        historyChordRightCommandDown = false
-        historyChordRightShiftDown = false
-        historyChordActive = false
-        historyChordPassedRightShiftDown = false
     }
 
     mutating func resetToggleState() {
         toggleActive = false
-    }
-
-    mutating func resetHistoryChordState() {
-        historyChordRightCommandDown = false
-        historyChordRightShiftDown = false
-        historyChordActive = false
-        historyChordPassedRightShiftDown = false
     }
 
     /// `canStartRecording` mirrors the app-side guard on handlePress
@@ -4148,6 +4176,8 @@ private struct HotkeyTransitionState {
         hotkey: HotkeyChoice,
         enterHotkey: HotkeyChoice = hotkeyChoice(forKeycode: RIGHT_COMMAND_KEYCODE,
                                                  modifiers: .maskAlternate),
+        clipboardHotkey: HotkeyChoice = hotkeyChoice(forKeycode: RIGHT_COMMAND_KEYCODE,
+                                                     modifiers: .maskShift),
         triggerMode: TriggerMode,
         isRecording: Bool,
         canStartRecording: Bool = true
@@ -4156,14 +4186,18 @@ private struct HotkeyTransitionState {
             return transitionEscape(for: event, isRecording: isRecording)
         }
 
-        if let chord = transitionHistoryChord(for: event, isRecording: isRecording) {
-            return chord
-        }
-
         if !hotkeyIsModifierPrefix(hotkey, of: enterHotkey) {
             if let completion = transitionEnterShortcut(for: event,
                                                          isRecording: isRecording,
                                                          enterHotkey: enterHotkey) {
+                return completion
+            }
+        }
+
+        if !hotkeyIsModifierPrefix(hotkey, of: clipboardHotkey) {
+            if let completion = transitionClipboardShortcut(for: event,
+                                                             isRecording: isRecording,
+                                                             clipboardHotkey: clipboardHotkey) {
                 return completion
             }
         }
@@ -4199,55 +4233,6 @@ private struct HotkeyTransitionState {
         }
     }
 
-    private mutating func transitionHistoryChord(
-        for event: HotkeyEventSnapshot,
-        isRecording: Bool
-    ) -> HotkeyTransitionResult? {
-        guard event.typeRawValue == CGEventType.flagsChanged.rawValue,
-              event.keycode == RIGHT_COMMAND_KEYCODE || event.keycode == RIGHT_SHIFT_KEYCODE else {
-            return nil
-        }
-
-        let previousRightShiftDown = historyChordRightShiftDown
-
-        if event.keycode == RIGHT_COMMAND_KEYCODE {
-            if historyChordRightCommandDown {
-                historyChordRightCommandDown = false
-            } else if event.flags.contains(.maskCommand) {
-                historyChordRightCommandDown = true
-            }
-        } else if event.keycode == RIGHT_SHIFT_KEYCODE {
-            if historyChordRightShiftDown {
-                historyChordRightShiftDown = false
-            } else if event.flags.contains(.maskShift) {
-                historyChordRightShiftDown = true
-            }
-        }
-
-        let bothDown = historyChordRightCommandDown && historyChordRightShiftDown
-        if bothDown {
-            guard !historyChordActive else { return .suppressOnly }
-            historyChordActive = true
-            historyChordPassedRightShiftDown = previousRightShiftDown && event.keycode == RIGHT_COMMAND_KEYCODE
-            standardShortcutState.reset()
-            if !isRecording {
-                toggleActive = false
-            }
-            return HotkeyTransitionResult(suppress: true, actions: [.showHistory])
-        }
-
-        if historyChordActive {
-            let shouldSuppress = event.keycode != RIGHT_SHIFT_KEYCODE || !historyChordPassedRightShiftDown
-            if !historyChordRightCommandDown && !historyChordRightShiftDown {
-                historyChordActive = false
-                historyChordPassedRightShiftDown = false
-            }
-            return shouldSuppress ? .suppressOnly : .pass
-        }
-
-        return nil
-    }
-
     private mutating func transitionEnterShortcut(
         for event: HotkeyEventSnapshot,
         isRecording: Bool,
@@ -4257,8 +4242,28 @@ private struct HotkeyTransitionState {
         switch enterShortcutState.consume(event, shortcut: enterHotkey) {
         case .press where isRecording:
             standardShortcutState.reset()
+            clipboardShortcutState.reset()
             toggleActive = false
             return HotkeyTransitionResult(suppress: true, actions: [.releaseAlternate])
+        case .press, .release, .suppress:
+            return .suppressOnly
+        case .pass:
+            return nil
+        }
+    }
+
+    private mutating func transitionClipboardShortcut(
+        for event: HotkeyEventSnapshot,
+        isRecording: Bool,
+        clipboardHotkey: HotkeyChoice
+    ) -> HotkeyTransitionResult? {
+        guard isRecording || clipboardShortcutState.isEngaged else { return nil }
+        switch clipboardShortcutState.consume(event, shortcut: clipboardHotkey) {
+        case .press where isRecording:
+            standardShortcutState.reset()
+            enterShortcutState.reset()
+            toggleActive = false
+            return HotkeyTransitionResult(suppress: true, actions: [.releaseClipboard])
         case .press, .release, .suppress:
             return .suppressOnly
         case .pass:
@@ -4301,6 +4306,8 @@ final class HotkeyListener {
     var hotkey: HotkeyChoice = hotkeyChoice(forKeycode: DEFAULT_HOTKEY_KEYCODE)
     var enterHotkey: HotkeyChoice = hotkeyChoice(forKeycode: RIGHT_COMMAND_KEYCODE,
                                                  modifiers: .maskAlternate)
+    var clipboardHotkey: HotkeyChoice = hotkeyChoice(forKeycode: RIGHT_COMMAND_KEYCODE,
+                                                     modifiers: .maskShift)
     var triggerMode: TriggerMode = .hold
 
     /// onPress fires when a recording should start (press in hold mode,
@@ -4310,8 +4317,8 @@ final class HotkeyListener {
     var onPress: (() -> Void)?
     var onRelease: ((TimeInterval) -> Void)?
     var onReleaseAlternate: ((TimeInterval) -> Void)?
+    var onReleaseClipboard: ((TimeInterval) -> Void)?
     var onCancel: (() -> Void)?
-    var onShowHistory: (() -> Void)?
     var isRecordingActive: (() -> Bool)?
     /// Asks the app whether a new recording would actually start if
     /// onPress fired right now (ready, idle, not transcribing, not
@@ -4393,6 +4400,12 @@ final class HotkeyListener {
         log("HotkeyListener: Enter hotkey changed → \(choice.name)")
     }
 
+    func setClipboardHotkey(_ choice: HotkeyChoice) {
+        clipboardHotkey = choice
+        transitionState.resetAll()
+        log("HotkeyListener: clipboard hotkey changed → \(choice.name)")
+    }
+
     func setTriggerMode(_ mode: TriggerMode) {
         // Reset toggle state when switching modes so we don't get
         // stuck in mid-toggle from a previous session.
@@ -4414,6 +4427,7 @@ final class HotkeyListener {
         let result = transitionState.transition(for: event,
                                                 hotkey: hotkey,
                                                 enterHotkey: enterHotkey,
+                                                clipboardHotkey: clipboardHotkey,
                                                 triggerMode: triggerMode,
                                                 isRecording: isRecordingActive?() ?? false,
                                                 canStartRecording: canStartRecording?() ?? true)
@@ -4436,10 +4450,8 @@ final class HotkeyListener {
             case .press: onPress?()
             case .release: onRelease?(detectedAt)
             case .releaseAlternate: onReleaseAlternate?(detectedAt)
+            case .releaseClipboard: onReleaseClipboard?(detectedAt)
             case .cancel: onCancel?()
-            case .showHistory:
-                transitionState.resetHistoryChordState()
-                onShowHistory?()
             }
         }
     }
@@ -7046,47 +7058,32 @@ enum TextInserter {
 private enum ClipboardPasteInserter {
     private static let virtualKeyCommand: CGKeyCode = 0x37  // left Command
     private static let virtualKeyV: CGKeyCode = 0x09  // ANSI 'v'
-    private static let restoreDelay: TimeInterval = 0.35
 
     static func write(_ text: String, to pb: NSPasteboard) -> Bool {
         pb.clearContents()
         return pb.setString(text, forType: .string)
     }
 
-    static func insert(_ text: String) -> Bool {
-        let pasteboard = NSPasteboard.general
-        let previous = PasteboardSnapshot.capture(from: pasteboard)
-        guard write(text, to: pasteboard) else {
+    static func writePersistent(_ text: String) -> Bool {
+        let wrote = write(text, to: .general)
+        if wrote {
+            log("dictation copied to clipboard (\(text.count) chars)")
+        } else {
             log("pasteboard write failed")
-            return false
         }
-        let transientChangeCount = pasteboard.changeCount
+        return wrote
+    }
+
+    static func insert(_ text: String) -> Bool {
+        guard writePersistent(text) else { return false }
 
         let steps = clipboardPasteKeyboardEventSteps(commandKey: virtualKeyCommand,
                                                      pasteKey: virtualKeyV)
         guard post(steps) else {
             log("paste event creation failed")
-            previous.restore(to: pasteboard)
             return false
         }
-        restorePasteboard(previous,
-                          ifStillTemporaryText: text,
-                          changeCount: transientChangeCount,
-                          pasteboard: pasteboard)
         return true
-    }
-
-    private static func restorePasteboard(_ snapshot: PasteboardSnapshot,
-                                          ifStillTemporaryText text: String,
-                                          changeCount: Int,
-                                          pasteboard: NSPasteboard) {
-        DispatchQueue.main.asyncAfter(deadline: .now() + restoreDelay) {
-            guard pasteboard.changeCount == changeCount,
-                  pasteboard.string(forType: .string) == text else {
-                return
-            }
-            snapshot.restore(to: pasteboard)
-        }
     }
 
     private static func post(_ steps: [KeyboardEventStep]) -> Bool {
@@ -7094,39 +7091,6 @@ private enum ClipboardPasteInserter {
         // events with .maskCommand. Sleep/wake can leave session modifier
         // state unreliable for flag-only synthetic shortcuts.
         return postKeyboardEventSteps(steps)
-    }
-}
-
-@MainActor
-private struct PasteboardSnapshot {
-    private struct Item {
-        let values: [(type: NSPasteboard.PasteboardType, data: Data)]
-    }
-
-    private let items: [Item]
-
-    static func capture(from pasteboard: NSPasteboard) -> PasteboardSnapshot {
-        let items = (pasteboard.pasteboardItems ?? []).map { item in
-            Item(values: item.types.compactMap { type in
-                guard let data = item.data(forType: type) else { return nil }
-                return (type, data)
-            })
-        }
-        return PasteboardSnapshot(items: items)
-    }
-
-    func restore(to pasteboard: NSPasteboard) {
-        pasteboard.clearContents()
-        let restoredItems = items.map { item -> NSPasteboardItem in
-            let restored = NSPasteboardItem()
-            for value in item.values {
-                restored.setData(value.data, forType: value.type)
-            }
-            return restored
-        }
-        if !restoredItems.isEmpty {
-            pasteboard.writeObjects(restoredItems)
-        }
     }
 }
 
@@ -8643,15 +8607,20 @@ private func openPrivateOutputFileDescriptor(atPath path: String,
 private enum DictationReleaseShortcut: Equatable {
     case standard
     case alternate
+    case clipboardOnly
 }
 
 private func shouldPressEnterAfterDictation(shortcut: DictationReleaseShortcut) -> Bool {
     switch shortcut {
-    case .standard:
+    case .standard, .clipboardOnly:
         return false
     case .alternate:
         return true
     }
+}
+
+private func shouldInsertAfterDictation(shortcut: DictationReleaseShortcut) -> Bool {
+    shortcut != .clipboardOnly
 }
 
 @MainActor
@@ -8743,6 +8712,12 @@ private final class RecordingHUDView: NSView {
         }
     }
 
+    var completionText: String? {
+        didSet {
+            if oldValue != completionText { needsDisplay = true }
+        }
+    }
+
     var revealProgress: CGFloat = 1 {
         didSet {
             if oldValue != revealProgress { needsDisplay = true }
@@ -8814,9 +8789,9 @@ private final class RecordingHUDView: NSView {
         let palette = backgroundPalette(alpha: capsuleAlpha)
         palette.fill.setFill()
         capsule.fill()
-        let accent = mode == .transcribing
-            ? transcribingColor
-            : recordingColor
+        let accent = mode == .recording
+            ? recordingColor
+            : transcribingColor
         let vividAccent = accent
         if showsCapsuleStroke {
             palette.stroke.setStroke()
@@ -8834,6 +8809,11 @@ private final class RecordingHUDView: NSView {
         capsule.addClip()
         context.setAlpha(contentAlpha)
         defer { NSGraphicsContext.restoreGraphicsState() }
+
+        if mode == .completed {
+            drawCompletionText(in: capsuleRect)
+            return
+        }
 
         if mode == .transcribing {
             drawTranscribingWave(in: capsuleRect, alpha: 1)
@@ -8888,6 +8868,29 @@ private final class RecordingHUDView: NSView {
             vividAccent.withAlphaComponent(0.74 + (0.26 * activity)).setFill()
             path.fill()
         }
+    }
+
+    private func drawCompletionText(in capsuleRect: NSRect) {
+        let text = completionText ?? "Done"
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 9.2 * visualScale, weight: .bold),
+            .foregroundColor: transcribingColor.withAlphaComponent(0.98),
+        ]
+        let size = (text as NSString).size(withAttributes: attributes)
+        let availableWidth = max(1, capsuleRect.width - (8 * visualScale))
+        let scale = min(1, availableWidth / max(size.width, 1))
+        let fittedAttributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 9.2 * visualScale * scale, weight: .bold),
+            .foregroundColor: transcribingColor.withAlphaComponent(0.98),
+        ]
+        let fittedSize = (text as NSString).size(withAttributes: fittedAttributes)
+        (text as NSString).draw(
+            in: NSRect(x: capsuleRect.midX - (fittedSize.width / 2),
+                       y: capsuleRect.midY - (fittedSize.height / 2),
+                       width: fittedSize.width,
+                       height: fittedSize.height),
+            withAttributes: fittedAttributes
+        )
     }
 
     private func drawTranscribingWave(in capsuleRect: NSRect, alpha: CGFloat) {
@@ -10192,6 +10195,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var recordingHUDPanel: NSPanel?
     private var recordingHUDView: RecordingHUDView?
     private var recordingHUDTranscribingStartedAt: TimeInterval?
+    private var recordingHUDCompletionWorkItem: DispatchWorkItem?
     private var recordingHUDAnimationToken = 0
     private var recordingHUDDisplayLink: CADisplayLink?
     private var lastRecordingHUDMotionAt: TimeInterval?
@@ -10316,8 +10320,10 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         hotkey.onReleaseAlternate = { [weak self] detectedAt in
             self?.handleRelease(shortcut: .alternate, hotkeyDetectedAt: detectedAt)
         }
+        hotkey.onReleaseClipboard = { [weak self] detectedAt in
+            self?.handleRelease(shortcut: .clipboardOnly, hotkeyDetectedAt: detectedAt)
+        }
         hotkey.onCancel = { [weak self] in self?.cancelActiveRecording(reason: "escape") }
-        hotkey.onShowHistory = { [weak self] in self?.toggleHistoryOverlay() }
         hotkey.isRecordingActive = { [weak self] in self?.isRecording == true }
         // Mirrors the first guard in handlePress — if this returns
         // false the press would be silently discarded, so toggle mode
@@ -10339,8 +10345,8 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             hotkey.onPress = nil
             hotkey.onRelease = nil
             hotkey.onReleaseAlternate = nil
+            hotkey.onReleaseClipboard = nil
             hotkey.onCancel = nil
-            hotkey.onShowHistory = nil
             hotkey.isRecordingActive = nil
             hotkey.canStartRecording = nil
             hotkey.resetToggleState()
@@ -10406,6 +10412,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         // saved choice the moment the tap goes live.
         hotkey.setHotkey(settings.configuredHotkey)
         hotkey.setEnterHotkey(settings.configuredEnterHotkey)
+        hotkey.setClipboardHotkey(settings.configuredClipboardHotkey)
         hotkey.setTriggerMode(settings.triggerMode)
         startStartup(reason: "launch")
     }
@@ -10827,8 +10834,8 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         hotkey.onPress = nil
         hotkey.onRelease = nil
         hotkey.onReleaseAlternate = nil
+        hotkey.onReleaseClipboard = nil
         hotkey.onCancel = nil
-        hotkey.onShowHistory = nil
         hotkey.isRecordingActive = nil
         hotkey.canStartRecording = nil
         hotkey.resetToggleState()
@@ -10897,8 +10904,8 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         hotkey.onPress = nil
         hotkey.onRelease = nil
         hotkey.onReleaseAlternate = nil
+        hotkey.onReleaseClipboard = nil
         hotkey.onCancel = nil
-        hotkey.onShowHistory = nil
         hotkey.isRecordingActive = nil
         hotkey.canStartRecording = nil
         hotkey.resetToggleState()
@@ -11004,8 +11011,8 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         hotkey.onPress = nil
         hotkey.onRelease = nil
         hotkey.onReleaseAlternate = nil
+        hotkey.onReleaseClipboard = nil
         hotkey.onCancel = nil
-        hotkey.onShowHistory = nil
         hotkey.isRecordingActive = nil
         hotkey.canStartRecording = nil
         hotkey.resetToggleState()
@@ -11064,8 +11071,8 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         hotkey.onPress = nil
         hotkey.onRelease = nil
         hotkey.onReleaseAlternate = nil
+        hotkey.onReleaseClipboard = nil
         hotkey.onCancel = nil
-        hotkey.onShowHistory = nil
         hotkey.isRecordingActive = nil
         hotkey.canStartRecording = nil
         hotkey.resetToggleState()
@@ -11119,8 +11126,8 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         hotkey.onPress = nil
         hotkey.onRelease = nil
         hotkey.onReleaseAlternate = nil
+        hotkey.onReleaseClipboard = nil
         hotkey.onCancel = nil
-        hotkey.onShowHistory = nil
         hotkey.isRecordingActive = nil
         hotkey.canStartRecording = nil
         hotkey.resetToggleState()
@@ -11295,6 +11302,8 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     private func startRecordingLevelMeter(initialContext: InsertionTargetQueryContext?) {
+        recordingHUDCompletionWorkItem?.cancel()
+        recordingHUDCompletionWorkItem = nil
         recordingLevelTimer?.invalidate()
         recordingLevelTimer = nil
         recordingVisualLevel = 0
@@ -11424,7 +11433,20 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             showRecordingHUD(mode: .transcribing, level: 0)
         }
         recordingHUDView?.transcriptionProgress = showsProgress ? 0 : nil
+        recordingHUDView?.completionText = nil
         startRecordingHUDMotion()
+    }
+
+    private func showCompletedHUD() {
+        guard settings.showRecordingWaveform else { return }
+        recordingHUDView?.transcriptionProgress = nil
+        recordingHUDView?.completionText = settings.interfaceLanguage == .english ? "Done" : "Готово"
+        if recordingHUDPanel?.isVisible == true {
+            updateRecordingHUD(mode: .completed, level: 0)
+        } else {
+            showRecordingHUD(mode: .completed, level: 0)
+        }
+        stopRecordingHUDMotion()
     }
 
     private func updateTranscribingHUDProgress(_ progress: Int) {
@@ -11433,6 +11455,8 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     private func hideRecordingHUD() {
+        recordingHUDCompletionWorkItem?.cancel()
+        recordingHUDCompletionWorkItem = nil
         recordingHUDRetargetWorkItem?.cancel()
         recordingHUDRetargetWorkItem = nil
         guard let panel = recordingHUDPanel else {
@@ -11453,6 +11477,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             recordingHUDView?.mode = .recording
             recordingHUDView?.level = 0
             recordingHUDView?.transcriptionProgress = nil
+            recordingHUDView?.completionText = nil
             recordingHUDView?.phase = 0
             recordingHUDView?.revealProgress = 1
             recordingHUDInsertionTargetFrame = nil
@@ -11479,6 +11504,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             self.recordingHUDView?.mode = .recording
             self.recordingHUDView?.level = 0
             self.recordingHUDView?.transcriptionProgress = nil
+            self.recordingHUDView?.completionText = nil
             self.recordingHUDView?.phase = 0
             self.recordingHUDView?.revealProgress = 1
             self.recordingHUDInsertionTargetFrame = nil
@@ -11964,7 +11990,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         return NSRect(x: x, y: y, width: frame.width, height: frame.height)
     }
 
-    private func finishBusyHUD() {
+    private func finishBusyHUD(showCompletion: Bool = false) {
         if let startedAt = recordingHUDTranscribingStartedAt {
             let elapsed = ProcessInfo.processInfo.systemUptime - startedAt
             let remaining = RECORDING_HUD_TRANSCRIBING_MIN_VISIBLE_SECONDS - elapsed
@@ -11975,13 +12001,30 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                           !self.isBusy,
                           self.recordingHUDTranscribingStartedAt == startedAt else { return }
                     self.recordingHUDTranscribingStartedAt = nil
-                    self.hideRecordingHUD()
+                    self.resolveBusyHUD(showCompletion: showCompletion)
                 }
                 return
             }
         }
         recordingHUDTranscribingStartedAt = nil
-        hideRecordingHUD()
+        resolveBusyHUD(showCompletion: showCompletion)
+    }
+
+    private func resolveBusyHUD(showCompletion: Bool) {
+        guard showCompletion, settings.showRecordingWaveform else {
+            hideRecordingHUD()
+            return
+        }
+        showCompletedHUD()
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self, !self.isRecording, !self.isBusy else { return }
+            self.recordingHUDCompletionWorkItem = nil
+            self.hideRecordingHUD()
+        }
+        recordingHUDCompletionWorkItem?.cancel()
+        recordingHUDCompletionWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + RECORDING_HUD_COMPLETED_VISIBLE_SECONDS,
+                                      execute: workItem)
     }
 
     // Visible + audible cue that a press produced no pasted text — the
@@ -11995,16 +12038,6 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             Sounds.playError()
         }
         flashErrorMenuBarIcon()
-    }
-
-    /// The transcript and WAV are durable before this runs. If macOS rejects
-    /// the paste event for the field currently in focus, hand the text to the
-    /// user through the clipboard instead of losing it.
-    private func copyTranscriptForRecovery(_ text: String) {
-        let pasteboard = NSPasteboard.general
-        pasteboard.clearContents()
-        pasteboard.setString(text, forType: .string)
-        log("dictation copied to clipboard for recovery (\(text.count) chars)")
     }
 
     private func activeApplicationDescription() -> String {
@@ -12132,16 +12165,11 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let settingsRefreshStartedAt = ProcessInfo.processInfo.systemUptime
         settings.refreshFromDisk()
         let settingsRefreshedAt = ProcessInfo.processInfo.systemUptime
+        let shouldInsertAfterRecognition = shouldInsertAfterDictation(shortcut: shortcut)
         let shouldPressEnterAfterInsertion = shouldPressEnterAfterDictation(shortcut: shortcut)
         let releasePermissionCheckStartedAt = ProcessInfo.processInfo.systemUptime
-        let missing = missingPermissions()
+        _ = missingPermissions()
         let releasePermissionCheckCompletedAt = ProcessInfo.processInfo.systemUptime
-        guard missing.isEmpty else {
-            recoverActiveRecordingToHistory(reason: "permission lost on release") { [weak self] in
-                self?.enterPermissionBlockedState(missing: missing, reason: "hotkey release")
-            }
-            return
-        }
 
         isRecording = false
         stopRecordingLevelMeter(hideHUD: false)
@@ -12224,6 +12252,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         Task { @MainActor in
             let taskStartedAt = ProcessInfo.processInfo.systemUptime
             var dictationFailed = false
+            var shouldShowClipboardCompletion = false
             do {
                 let completed = try await transcriptionTask.value
                 let transcription = completed.transcription
@@ -12264,38 +12293,43 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                                              asrSeconds: asrTiming.totalSeconds)
                         let historyCompletedAt = ProcessInfo.processInfo.systemUptime
 
-                        let permissionRecheckStartedAt = ProcessInfo.processInfo.systemUptime
-                        let missing = missingPermissions()
-                        let permissionRecheckCompletedAt = ProcessInfo.processInfo.systemUptime
-                        guard missing.isEmpty else {
-                            isBusy = false
-                            finishBusyHUD()
-                            enterPermissionBlockedState(missing: missing, reason: "paste")
-                            return
-                        }
-
                         let insertionStartedAt = ProcessInfo.processInfo.systemUptime
                         let insertionText = pastedText(from: cleaned, suffix: settings.pasteSuffix)
-                        // Dictation always goes to the field that has focus now.
-                        // This works uniformly for native, browser and Electron
-                        // apps and does not depend on an app exposing its input
-                        // field through the Accessibility tree at recording start.
-                        let activeDestination = activeApplicationDescription()
-                        log("text insertion dispatch: active field; started=\(recordingStart); destination=\(activeDestination)")
-                        let inserted = TextInserter.insert(insertionText)
-                        if !inserted {
-                            log("text insertion event could not be posted; destination=\(activeDestination)")
+                        // Every successful recognition is copied first and left
+                        // in the system clipboard. Automatic insertion is an
+                        // optional delivery step layered on top of that durable
+                        // clipboard copy.
+                        let copied = ClipboardPasteInserter.writePersistent(insertionText)
+                        let permissionRecheckStartedAt = ProcessInfo.processInfo.systemUptime
+                        let missing = shouldInsertAfterRecognition ? missingPermissions() : []
+                        let permissionRecheckCompletedAt = ProcessInfo.processInfo.systemUptime
+                        var inserted = false
+                        if shouldInsertAfterRecognition, missing.isEmpty {
+                            // Dictation always goes to the field that has focus
+                            // now. This works uniformly for native, browser and
+                            // Electron apps.
+                            let activeDestination = activeApplicationDescription()
+                            log("text insertion dispatch: active field; started=\(recordingStart); destination=\(activeDestination)")
+                            inserted = TextInserter.insert(insertionText)
+                            if !inserted {
+                                log("text insertion event could not be posted; destination=\(activeDestination)")
+                            }
+                        } else if shouldInsertAfterRecognition {
+                            log("text insertion skipped because permissions are missing: \(missing.map(\.rawValue).joined(separator: ", "))")
+                        } else {
+                            log("clipboard-only dictation completed; insertion intentionally skipped")
                         }
                         let insertionCompletedAt = ProcessInfo.processInfo.systemUptime
+                        let deliverySucceeded = copied && (!shouldInsertAfterRecognition || inserted)
                         var enterDelaySeconds: Double?
                         let journalCleanupStartedAt = ProcessInfo.processInfo.systemUptime
-                        if inserted {
+                        if deliverySucceeded {
                             if archivedURL != nil, archivedAudioURL != nil {
                                 PendingDictationRecovery.remove(captured.recoveryURL)
                             } else {
                                 log("pending dictation retained because its transcript or source WAV could not be archived")
                             }
-                            if shouldPressEnterAfterInsertion {
+                            if shouldInsertAfterRecognition && shouldPressEnterAfterInsertion {
                                 let enterDelayStartedAt = ProcessInfo.processInfo.systemUptime
                                 try? await Task.sleep(nanoseconds: ENTER_AFTER_INSERT_DELAY_NANOSECONDS)
                                 if KeyboardShortcutPoster.postReturn() {
@@ -12308,16 +12342,22 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                             if settings.playFeedbackSounds {
                                 Sounds.playDone()
                             }
+                            shouldShowClipboardCompletion = shortcut == .clipboardOnly
                         } else {
-                            log("text insertion failed")
+                            log(shouldInsertAfterRecognition
+                                ? "text insertion or persistent clipboard copy failed"
+                                : "persistent clipboard copy failed")
                             DictationArchive.preserveFailedAudio(
                                 samples,
                                 sourceAudioURL: captured.recoveryURL,
-                                errorDescription: "Text could not be inserted into the active field. The transcript was copied to the clipboard."
+                                errorDescription: shouldInsertAfterRecognition
+                                    ? "Text could not be inserted into the active field. MyDictate attempted to keep the transcript in the clipboard."
+                                    : "The transcript could not be copied to the clipboard."
                             )
                             PendingDictationRecovery.remove(captured.recoveryURL)
-                            copyTranscriptForRecovery(cleaned)
-                            presentInsertionRecoveryNotice()
+                            if copied {
+                                presentInsertionRecoveryNotice()
+                            }
                             dictationFailed = true
                         }
                         let journalCleanupCompletedAt = ProcessInfo.processInfo.systemUptime
@@ -12343,7 +12383,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                             insertionDispatchSeconds: insertionCompletedAt - insertionStartedAt,
                             releaseToPasteDispatchSeconds: insertionCompletedAt - releaseReceivedAt,
                             enterDelaySeconds: enterDelaySeconds,
-                            pasteSucceeded: inserted
+                            pasteSucceeded: deliverySucceeded
                         ).logLine)
                     } else {
                         // Preserve the visible bad result as evidence, but retain
@@ -12376,7 +12416,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 dictationFailed = true
             }
             isBusy = false
-            finishBusyHUD()
+            finishBusyHUD(showCompletion: shouldShowClipboardCompletion && !dictationFailed)
             if dictationFailed && !isTerminating {
                 signalDictationFailure()
             } else {
@@ -12537,8 +12577,8 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         hotkey.onPress = nil
         hotkey.onRelease = nil
         hotkey.onReleaseAlternate = nil
+        hotkey.onReleaseClipboard = nil
         hotkey.onCancel = nil
-        hotkey.onShowHistory = nil
         hotkey.isRecordingActive = nil
         hotkey.canStartRecording = nil
         hotkey.stop()
@@ -17069,9 +17109,10 @@ private enum ParakeySelfTest {
         try testCustomShortcutMatching()
         try testModifierOnlyChordMatching()
         try testConfigurableEnterShortcut()
+        try testConfigurableClipboardShortcut()
         try testFKeyAutoRepeatSuppressesWithoutAction()
         try testRightModifierReleaseWithLeftFlagStillSet()
-        try testHistoryChordShowsOverlay()
+        try testShiftCommandClipboardChord()
         try testOptionCommandEnterChordStopsWithEnter()
         try testEnterShortcutModeSelection()
         try testTogglePressFlipsOnceAndReleaseIsNoOp()
@@ -17595,9 +17636,7 @@ private enum ParakeySelfTest {
             let pasteboardName = NSPasteboard.Name("com.local.mydictate.self-test.\(UUID().uuidString)")
             let pasteboard = NSPasteboard(name: pasteboardName)
             let wrote = ClipboardPasteInserter.write("pasteboard probe", to: pasteboard)
-            let snapshot = PasteboardSnapshot.capture(from: pasteboard)
             _ = ClipboardPasteInserter.write("temporary dictation", to: pasteboard)
-            snapshot.restore(to: pasteboard)
             return (wrote: wrote, stored: pasteboard.string(forType: .string))
         }
         try expect(
@@ -17607,8 +17646,8 @@ private enum ParakeySelfTest {
         )
         try expect(
             pasteboardProbe.stored,
-            equals: "pasteboard probe",
-            "clipboard paste should write the intended string before posting Cmd+V"
+            equals: "temporary dictation",
+            "clipboard writes should remain in place instead of restoring the previous clipboard"
         )
     }
 
@@ -20615,6 +20654,42 @@ private enum ParakeySelfTest {
         )
     }
 
+    private static func testConfigurableClipboardShortcut() throws {
+        var state = HotkeyTransitionState()
+        let standard = hotkeyChoice(forKeycode: 96)
+        let enterShortcut = hotkeyChoice(forKeycode: 98)
+        let clipboardShortcut = hotkeyChoice(forKeycode: 40,
+                                             modifiers: [.maskCommand, .maskShift])
+        let commandShift = CGEventFlags.maskCommand.rawValue | CGEventFlags.maskShift.rawValue
+
+        try expect(
+            state.transition(for: event(.keyDown,
+                                        keycode: 40,
+                                        flags: commandShift),
+                             hotkey: standard,
+                             enterHotkey: enterShortcut,
+                             clipboardHotkey: clipboardShortcut,
+                             triggerMode: .toggle,
+                             isRecording: true),
+            equals: HotkeyTransitionResult(suppress: true, actions: [.releaseClipboard]),
+            "a user-configured clipboard shortcut should use the clipboard-only completion path"
+        )
+
+        var idleState = HotkeyTransitionState()
+        try expect(
+            idleState.transition(for: event(.keyDown,
+                                            keycode: 40,
+                                            flags: commandShift),
+                                 hotkey: standard,
+                                 enterHotkey: enterShortcut,
+                                 clipboardHotkey: clipboardShortcut,
+                                 triggerMode: .toggle,
+                                 isRecording: false),
+            equals: .pass,
+            "the clipboard-only shortcut should not start a new recording"
+        )
+    }
+
     private static func testFKeyAutoRepeatSuppressesWithoutAction() throws {
         var state = HotkeyTransitionState()
         let f5 = hotkeyChoice(forKeycode: 96)
@@ -20675,102 +20750,52 @@ private enum ParakeySelfTest {
         )
     }
 
-    private static func testHistoryChordShowsOverlay() throws {
+    private static func testShiftCommandClipboardChord() throws {
         let rightCommand = hotkeyChoice(forKeycode: RIGHT_COMMAND_KEYCODE)
+        let enterShortcut = hotkeyChoice(forKeycode: RIGHT_COMMAND_KEYCODE,
+                                         modifiers: .maskAlternate)
+        let clipboardShortcut = hotkeyChoice(forKeycode: RIGHT_COMMAND_KEYCODE,
+                                             modifiers: .maskShift)
         let commandShift = CGEventFlags.maskCommand.rawValue | CGEventFlags.maskShift.rawValue
 
-        var shiftFirst = HotkeyTransitionState()
+        var state = HotkeyTransitionState()
         try expect(
-            shiftFirst.transition(for: event(.flagsChanged,
-                                             keycode: RIGHT_SHIFT_KEYCODE,
-                                             flags: CGEventFlags.maskShift.rawValue),
-                                  hotkey: rightCommand,
-                                  triggerMode: .toggle,
-                                  isRecording: false),
-            equals: .pass,
-            "right shift alone should pass through before the history chord is complete"
-        )
-        try expect(
-            shiftFirst.transition(for: event(.flagsChanged,
-                                             keycode: RIGHT_COMMAND_KEYCODE,
-                                             flags: commandShift),
-                                  hotkey: rightCommand,
-                                  triggerMode: .toggle,
-                                  isRecording: false),
-            equals: HotkeyTransitionResult(suppress: true, actions: [.showHistory]),
-            "right shift then right command should show history without starting dictation"
-        )
-        try expect(
-            shiftFirst.transition(for: event(.flagsChanged,
-                                             keycode: RIGHT_COMMAND_KEYCODE,
-                                             flags: CGEventFlags.maskShift.rawValue),
-                                  hotkey: rightCommand,
-                                  triggerMode: .toggle,
-                                  isRecording: false),
+            state.transition(for: event(.flagsChanged,
+                                        keycode: RIGHT_SHIFT_KEYCODE,
+                                        flags: CGEventFlags.maskShift.rawValue),
+                             hotkey: rightCommand,
+                             enterHotkey: enterShortcut,
+                             clipboardHotkey: clipboardShortcut,
+                             triggerMode: .toggle,
+                             isRecording: true),
             equals: .suppressOnly,
-            "history chord should suppress the paired right command release"
+            "right shift should be reserved while a clipboard-only chord is forming"
         )
         try expect(
-            shiftFirst.transition(for: event(.flagsChanged,
-                                             keycode: RIGHT_SHIFT_KEYCODE,
-                                             flags: 0),
-                                  hotkey: rightCommand,
-                                  triggerMode: .toggle,
-                                  isRecording: false),
-            equals: .pass,
-            "history chord should pass the right shift release when its press was passed through"
+            state.transition(for: event(.flagsChanged,
+                                        keycode: RIGHT_COMMAND_KEYCODE,
+                                        flags: commandShift),
+                             hotkey: rightCommand,
+                             enterHotkey: enterShortcut,
+                             clipboardHotkey: clipboardShortcut,
+                             triggerMode: .toggle,
+                             isRecording: true),
+            equals: HotkeyTransitionResult(suppress: true, actions: [.releaseClipboard]),
+            "right shift then right command should finish into the clipboard"
         )
 
-        var commandFirst = HotkeyTransitionState()
+        var idleState = HotkeyTransitionState()
         try expect(
-            commandFirst.transition(for: event(.flagsChanged,
-                                               keycode: RIGHT_COMMAND_KEYCODE,
-                                               flags: CGEventFlags.maskCommand.rawValue),
-                                    hotkey: rightCommand,
-                                    triggerMode: .toggle,
-                                    isRecording: false),
-            equals: HotkeyTransitionResult(suppress: true, actions: [.press]),
-            "right command alone should still start toggle dictation"
-        )
-        try expect(
-            commandFirst.transition(for: event(.flagsChanged,
-                                               keycode: RIGHT_SHIFT_KEYCODE,
-                                               flags: commandShift),
-                                    hotkey: rightCommand,
-                                    triggerMode: .toggle,
-                                    isRecording: true),
-            equals: HotkeyTransitionResult(suppress: true, actions: [.showHistory]),
-            "history chord should show history without canceling active dictation"
-        )
-        try expect(
-            commandFirst.transition(for: event(.flagsChanged,
-                                               keycode: RIGHT_COMMAND_KEYCODE,
-                                               flags: CGEventFlags.maskShift.rawValue),
-                                    hotkey: rightCommand,
-                                    triggerMode: .toggle,
-                                    isRecording: true),
-            equals: .suppressOnly,
-            "history chord should suppress the paired right command release while recording"
-        )
-        try expect(
-            commandFirst.transition(for: event(.flagsChanged,
-                                               keycode: RIGHT_SHIFT_KEYCODE,
-                                               flags: 0),
-                                    hotkey: rightCommand,
-                                    triggerMode: .toggle,
-                                    isRecording: true),
-            equals: .suppressOnly,
-            "history chord should suppress the paired right shift release"
-        )
-        try expect(
-            commandFirst.transition(for: event(.flagsChanged,
-                                               keycode: RIGHT_COMMAND_KEYCODE,
-                                               flags: CGEventFlags.maskCommand.rawValue),
-                                    hotkey: rightCommand,
-                                    triggerMode: .toggle,
-                                    isRecording: true),
-            equals: HotkeyTransitionResult(suppress: true, actions: [.release]),
-            "right command after the history chord should still stop active dictation"
+            idleState.transition(for: event(.flagsChanged,
+                                            keycode: RIGHT_SHIFT_KEYCODE,
+                                            flags: CGEventFlags.maskShift.rawValue),
+                                 hotkey: rightCommand,
+                                 enterHotkey: enterShortcut,
+                                 clipboardHotkey: clipboardShortcut,
+                                 triggerMode: .toggle,
+                                 isRecording: false),
+            equals: .pass,
+            "right shift alone should continue to work normally while idle"
         )
     }
 
@@ -20833,6 +20858,21 @@ private enum ParakeySelfTest {
             shouldPressEnterAfterDictation(shortcut: .alternate),
             equals: true,
             "the dedicated Enter shortcut should always press Enter after insertion"
+        )
+        try expect(
+            shouldPressEnterAfterDictation(shortcut: .clipboardOnly),
+            equals: false,
+            "the clipboard-only shortcut should never press Enter"
+        )
+        try expect(
+            shouldInsertAfterDictation(shortcut: .clipboardOnly),
+            equals: false,
+            "the clipboard-only shortcut should not insert text"
+        )
+        try expect(
+            shouldInsertAfterDictation(shortcut: .standard),
+            equals: true,
+            "the standard shortcut should still insert text"
         )
     }
 
@@ -20980,11 +21020,13 @@ private enum ControlPanelServiceOperation: String, Sendable {
 private enum ControlPanelShortcutKind: Int {
     case withoutEnter = 0
     case withEnter = 1
+    case clipboardOnly = 2
 }
 
 private struct ControlPanelSettingsDraft: Equatable {
     var hotkeyWithoutEnter: HotkeyChoice
     var hotkeyWithEnter: HotkeyChoice
+    var hotkeyClipboardOnly: HotkeyChoice
     var speechModelProfile: SpeechModelProfile
     var recordingColor: RecordingHUDAccentColor
     var transcribingColor: RecordingHUDAccentColor
@@ -20994,6 +21036,7 @@ private struct ControlPanelSettingsDraft: Equatable {
     init(settings: Settings) {
         hotkeyWithoutEnter = settings.configuredHotkey
         hotkeyWithEnter = settings.configuredEnterHotkey
+        hotkeyClipboardOnly = settings.configuredClipboardHotkey
         speechModelProfile = settings.speechModelProfile
         recordingColor = settings.recordingHUDRecordingColor
         transcribingColor = settings.recordingHUDTranscribingColor
@@ -21015,13 +21058,6 @@ private func hotkeyIsModifierPrefix(_ prefix: HotkeyChoice,
         return shortcut.requiredModifiers.contains(prefixMask)
     }
     return shortcut.requiredModifiers.contains(prefixMask)
-}
-
-private func isReservedHistoryHotkey(_ choice: HotkeyChoice) -> Bool {
-    guard choice.isModifier else { return false }
-    let allModifiers = choice.requiredModifiers.union(choice.modifierFlag ?? [])
-    guard allModifiers == [.maskShift, .maskCommand] else { return false }
-    return choice.keycode == RIGHT_COMMAND_KEYCODE || choice.keycode == RIGHT_SHIFT_KEYCODE
 }
 
 private enum ControlPanelUpdateState: Equatable, Sendable {
@@ -21848,6 +21884,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                 permissions,
                 settings.configuredHotkey.name,
                 settings.configuredEnterHotkey.name,
+                settings.configuredClipboardHotkey.name,
                 settings.speechModelProfile.rawValue,
                 settings.triggerMode.rawValue,
                 settings.recordingHUDRecordingColor.rawValue,
@@ -22665,6 +22702,20 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             toolTip: t("Назначить отдельное сочетание для завершения диктовки с Enter.",
                        "Assign a separate shortcut that finishes dictation and sends Enter.")
         ))
+        form.addArrangedSubview(statusRow(
+            title: t("Только в буфер обмена", "Clipboard only"),
+            detail: t("Во время записи распознаёт и копирует текст без вставки: ",
+                      "While recording, transcribes and copies without inserting: ")
+                + localizedHotkeyName(draft.hotkeyClipboardOnly, language: language),
+            status: "",
+            statusColor: .secondaryLabelColor,
+            buttonTitle: t("Изменить…", "Change…"),
+            action: #selector(recordDictationShortcutClicked(_:)),
+            tag: ControlPanelShortcutKind.clipboardOnly.rawValue,
+            buttonEnabled: serviceOperation == nil,
+            toolTip: t("Назначить сочетание для сохранения результата только в буфере обмена.",
+                       "Assign a shortcut that leaves the result in the clipboard without inserting it.")
+        ))
         form.addArrangedSubview(separator())
         form.addArrangedSubview(popupRow(
             title: t("Размер капсулы", "Capsule size"),
@@ -22864,9 +22915,11 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                                                     language: language)
             let sendHotkey = localizedHotkeyName(settings.configuredEnterHotkey,
                                                  language: language)
+            let clipboardHotkey = localizedHotkeyName(settings.configuredClipboardHotkey,
+                                                      language: language)
             serviceDetail = t(
-                "\(dictateHotkey) — распознать · \(sendHotkey) — отправить",
-                "\(dictateHotkey) — dictate · \(sendHotkey) — send"
+                "\(dictateHotkey) — вставить · \(sendHotkey) — отправить · \(clipboardHotkey) — буфер",
+                "\(dictateHotkey) — insert · \(sendHotkey) — send · \(clipboardHotkey) — clipboard"
             )
         } else {
             serviceDetail = presentation.detail
@@ -23497,17 +23550,26 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
     }
 
     private func settingsValidationMessage(_ draft: ControlPanelSettingsDraft) -> String? {
-        if hotkeysConflict(draft.hotkeyWithoutEnter, draft.hotkeyWithEnter) {
-            return t("Сочетания должны отличаться.", "The two shortcuts must be different.")
+        let shortcuts = [
+            draft.hotkeyWithoutEnter,
+            draft.hotkeyWithEnter,
+            draft.hotkeyClipboardOnly,
+        ]
+        for lhsIndex in shortcuts.indices {
+            for rhsIndex in shortcuts.indices where lhsIndex < rhsIndex {
+                if hotkeysConflict(shortcuts[lhsIndex], shortcuts[rhsIndex]) {
+                    return t("Все три сочетания должны отличаться.",
+                             "All three shortcuts must be different.")
+                }
+            }
         }
-        if hotkeyIsModifierPrefix(draft.hotkeyWithoutEnter, of: draft.hotkeyWithEnter)
-            || hotkeyIsModifierPrefix(draft.hotkeyWithEnter, of: draft.hotkeyWithoutEnter) {
-            return t("Одно сочетание не должно быть частью другого.",
-                     "One shortcut cannot be a prefix of the other.")
-        }
-        if isReservedHistoryHotkey(draft.hotkeyWithoutEnter)
-            || isReservedHistoryHotkey(draft.hotkeyWithEnter) {
-            return t("⇧⌘ зарезервировано для истории.", "⇧⌘ is reserved for history.")
+        for lhsIndex in shortcuts.indices {
+            for rhsIndex in shortcuts.indices where lhsIndex != rhsIndex {
+                if hotkeyIsModifierPrefix(shortcuts[lhsIndex], of: shortcuts[rhsIndex]) {
+                    return t("Одно сочетание не должно быть частью другого.",
+                             "One shortcut cannot be a prefix of another.")
+                }
+            }
         }
         return nil
     }
@@ -24306,7 +24368,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         settingsDraft = ControlPanelSettingsDraft(settings: settings)
 
         let settingsWindow = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 500, height: 460),
+            contentRect: NSRect(x: 0, y: 0, width: 500, height: 520),
             styleMask: [.titled, .closable, .miniaturizable],
             backing: .buffered,
             defer: false
@@ -24342,7 +24404,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
     }
 
     private func resizeSettingsWindow(_ settingsWindow: NSWindow) {
-        let size = fittedSecondarySize(NSSize(width: 500, height: 460))
+        let size = fittedSecondarySize(NSSize(width: 500, height: 520))
         let oldTop = settingsWindow.frame.maxY
         settingsWindow.contentMinSize = size
         settingsWindow.contentMaxSize = size
@@ -24399,6 +24461,11 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             description: t("Завершить диктовку · вставить текст и отправить Enter",
                            "Finish dictation · insert text and send Enter")
         ))
+        shortcutStack.addArrangedSubview(dictationHelpShortcutRow(
+            hotkey: localizedHotkeyName(settings.configuredClipboardHotkey, language: language),
+            description: t("Завершить диктовку · сохранить только в буфер обмена",
+                           "Finish dictation · save only to the clipboard")
+        ))
         root.addArrangedSubview(shortcutStack)
 
         let insertionCard = compactCard(style: .inset)
@@ -24413,8 +24480,8 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                                                     description: nil,
                                                     pointSize: 15))
         let insertionInfo = panelLabel(
-            t("Текст попадёт туда, где стоит курсор при завершении. Копия всегда остаётся в «Сохранённых диктовках».",
-              "Text goes where the cursor is active when you finish. A copy always remains in Saved Dictations."),
+            t("Результат всегда остаётся в буфере и «Сохранённых диктовках». Обычный режим дополнительно вставляет текст туда, где стоит курсор при завершении.",
+              "The result always remains in the clipboard and Saved Dictations. Normal mode also inserts it where the cursor is active when you finish."),
             size: 11,
             color: .secondaryLabelColor
         )
@@ -24490,7 +24557,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         )
         configureSecondaryWindowAppearance(helpWindow)
         helpWindow.title = t("Как пользоваться MyDictate", "Using MyDictate")
-        let size = fittedSecondarySize(NSSize(width: 460, height: 235))
+        let size = fittedSecondarySize(NSSize(width: 460, height: 270))
         helpWindow.contentMinSize = size
         helpWindow.contentMaxSize = size
         helpWindow.setContentSize(size)
@@ -24504,7 +24571,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         DispatchQueue.main.async { [weak self, weak helpWindow] in
             guard let self, let helpWindow,
                   self.dictationHelpWindow === helpWindow else { return }
-            let size = self.fittedSecondarySize(NSSize(width: 460, height: 235))
+            let size = self.fittedSecondarySize(NSSize(width: 460, height: 270))
             helpWindow.contentMinSize = size
             helpWindow.contentMaxSize = size
             helpWindow.setContentSize(size)
@@ -24550,6 +24617,8 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             recorderTitle = t("Новое сочетание без Enter", "Shortcut Without Enter")
         case .withEnter:
             recorderTitle = t("Новое сочетание с Enter", "Shortcut With Enter")
+        case .clipboardOnly:
+            recorderTitle = t("Новое сочетание для буфера", "Clipboard-Only Shortcut")
         }
         let selected = presentHotkeyRecorder(language: language,
                                              titleOverride: recorderTitle)
@@ -24564,6 +24633,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         switch kind {
         case .withoutEnter: draft.hotkeyWithoutEnter = selected
         case .withEnter: draft.hotkeyWithEnter = selected
+        case .clipboardOnly: draft.hotkeyClipboardOnly = selected
         }
         settingsDraft = draft
         refreshSettingsWindow()
@@ -24632,6 +24702,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
               settingsValidationMessage(draft) == nil else { return }
         settings.setConfiguredHotkey(draft.hotkeyWithoutEnter)
         settings.setConfiguredEnterHotkey(draft.hotkeyWithEnter)
+        settings.setConfiguredClipboardHotkey(draft.hotkeyClipboardOnly)
         settings.speechModelProfile = draft.speechModelProfile
         settings.recordingHUDRecordingColor = draft.recordingColor
         settings.recordingHUDTranscribingColor = draft.transcribingColor
