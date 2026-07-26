@@ -118,6 +118,7 @@ let RECORDING_HUD_RECORDING_LEVEL_PHASE_SPEED: CGFloat = 10.08
 let RECORDING_HUD_TRANSCRIBING_PHASE_SPEED: CGFloat = 10.2
 let HOTKEY_CAPTURE_BEGIN_NOTIFICATION = Notification.Name("com.local.mydictate.hotkey-capture-begin")
 let HOTKEY_CAPTURE_END_NOTIFICATION = Notification.Name("com.local.mydictate.hotkey-capture-end")
+let QUALITY_RECOGNITION_QUEUE_CHANGED_NOTIFICATION = Notification.Name("com.local.mydictate.quality-recognition-queue-changed")
 let HOTKEY_CAPTURE_FAILSAFE_SECONDS: TimeInterval = 45
 let DICTATION_ERROR_FLASH_SECONDS: TimeInterval = 1.5  // how long the menu-bar icon flags a dropped dictation before returning to idle
 let AUDIO_START_RETRY_DELAYS_SECONDS: [UInt64] = [1, 3, 8]
@@ -125,8 +126,6 @@ let AUDIO_IDLE_STOP_DELAY_SECONDS: TimeInterval = 5
 let AUDIO_CONFIGURATION_CHANGE_SUPPRESSION_SECONDS: TimeInterval = 1
 let MODEL_DOWNLOAD_HEADROOM_BYTES: Int64 = 500 * 1024 * 1024
 let WHISPER_TECHNICAL_TERMS = "GitHub, Codex, ChatGPT, Claude, MyDictate, Whisper, Swift, SwiftUI, Xcode, macOS, main, Command, Option, Shift, Control, API, JSON, TypeScript, JavaScript, Python, Docker, PostgreSQL."
-let WHISPER_RUSSIAN_PUNCTUATION_PROMPT = "Это аккуратно оформленная русская диктовка. Предложения начинаются с заглавной буквы и заканчиваются точкой, вопросительным или восклицательным знаком. Внутри предложений используются запятые."
-let WHISPER_ENGLISH_PUNCTUATION_PROMPT = "This is carefully punctuated dictation. Sentences begin with capital letters and end with a period, question mark, or exclamation mark. Commas are used inside sentences."
 let WHISPER_VAD_MODEL_FILE_NAME = "ggml-silero-v6.2.0.bin"
 let WHISPER_VAD_MODEL_SIZE_BYTES: Int64 = 885_098
 let WHISPER_VAD_MODEL_SHA256 = "2aa269b785eeb53a82983a20501ddf7c1d9c48e33ab63a41391ac6c9f7fb6987"
@@ -2673,9 +2672,13 @@ final class Settings: @unchecked Sendable {
     private static let legacyKeyShowRecordingIndicator = "show_recording_indicator"
     private static let keyMuteWhileRecording = "mute_while_recording"
     private static let keyPlayFeedbackSounds = "play_feedback_sounds"
+    private static let keyRecordingStartSound = "recording_start_sound"
     private static let keyWithoutEnterCompletionSound = "without_enter_completion_sound"
     private static let keyWithEnterCompletionSound = "with_enter_completion_sound"
     private static let keyClipboardCompletionSound = "clipboard_completion_sound"
+    private static let keyRecognitionErrorSound = "recognition_error_sound"
+    private static let keyCancellationSound = "cancellation_sound"
+    private static let keyQualityRecognitionCompletionSound = "quality_recognition_completion_sound"
     private static let keyCompletionSoundVolume = "completion_sound_volume"
     private static let keyClipboardCompletionVisibleSeconds = "clipboard_completion_visible_seconds"
     private static let keyShowInDock = "show_in_dock"
@@ -3080,6 +3083,26 @@ final class Settings: @unchecked Sendable {
         return .pop
     }
 
+    private func sound(forKey key: String,
+                       default defaultSound: DictationCompletionSound) -> DictationCompletionSound {
+        if let raw = defaults.string(forKey: key),
+           let sound = DictationCompletionSound(rawValue: raw) {
+            return sound
+        }
+        // Honour the old all-or-nothing feedback switch on the first launch
+        // after upgrading, then persist independent choices from the new UI.
+        if defaults.object(forKey: Self.keyPlayFeedbackSounds) != nil,
+           !defaults.bool(forKey: Self.keyPlayFeedbackSounds) {
+            return .none
+        }
+        return defaultSound
+    }
+
+    var recordingStartSound: DictationCompletionSound {
+        get { sound(forKey: Self.keyRecordingStartSound, default: .tink) }
+        set { defaults.set(newValue.rawValue, forKey: Self.keyRecordingStartSound) }
+    }
+
     var withoutEnterCompletionSound: DictationCompletionSound {
         get { completionSound(forKey: Self.keyWithoutEnterCompletionSound) }
         set { defaults.set(newValue.rawValue, forKey: Self.keyWithoutEnterCompletionSound) }
@@ -3093,6 +3116,21 @@ final class Settings: @unchecked Sendable {
     var clipboardCompletionSound: DictationCompletionSound {
         get { completionSound(forKey: Self.keyClipboardCompletionSound) }
         set { defaults.set(newValue.rawValue, forKey: Self.keyClipboardCompletionSound) }
+    }
+
+    var recognitionErrorSound: DictationCompletionSound {
+        get { sound(forKey: Self.keyRecognitionErrorSound, default: .basso) }
+        set { defaults.set(newValue.rawValue, forKey: Self.keyRecognitionErrorSound) }
+    }
+
+    var cancellationSound: DictationCompletionSound {
+        get { sound(forKey: Self.keyCancellationSound, default: .none) }
+        set { defaults.set(newValue.rawValue, forKey: Self.keyCancellationSound) }
+    }
+
+    var qualityRecognitionCompletionSound: DictationCompletionSound {
+        get { sound(forKey: Self.keyQualityRecognitionCompletionSound, default: .pop) }
+        set { defaults.set(newValue.rawValue, forKey: Self.keyQualityRecognitionCompletionSound) }
     }
 
     var completionSoundVolume: Double {
@@ -4653,6 +4691,28 @@ private struct CapturedRecording {
     let flattenSeconds: TimeInterval
 }
 
+private enum QualityRecognitionJobState: String, Codable, Sendable {
+    case queued
+    case loadingModel
+    case recognizing
+    case cleaning
+    case completed
+    case failed
+
+    var isPending: Bool {
+        self == .queued || self == .loadingModel || self == .recognizing || self == .cleaning
+    }
+}
+
+private struct QualityRecognitionJob: Codable, Equatable, Sendable {
+    let stem: String
+    var state: QualityRecognitionJobState
+    var progress: Int
+    var createdAt: Date
+    var updatedAt: Date
+    var error: String?
+}
+
 // Every completed transcript is written here before MyDictate attempts to
 // paste it. Text files are intentionally kept without an automatic limit:
 // they are tiny, user-readable, and serve as the durable source of truth when
@@ -4664,6 +4724,7 @@ private enum DictationArchive {
     private static let recordingsDirectoryName = "Audio Recordings"
     private static let failedAudioDirectoryName = "Failed Audio"
     private static let pendingAudioDirectoryName = "Pending Audio"
+    private static let qualityJobsDirectoryName = "Quality Recognition"
     static let audioRetentionDays = 7
 
     static func rootDirectoryURL() throws -> URL {
@@ -4703,6 +4764,159 @@ private enum DictationArchive {
             .appendingPathComponent(pendingAudioDirectoryName, isDirectory: true)
         try createPrivateDirectory(url)
         return url
+    }
+
+    static func qualityJobsDirectoryURL() throws -> URL {
+        let url = try rootDirectoryURL()
+            .appendingPathComponent(qualityJobsDirectoryName, isDirectory: true)
+        try createPrivateDirectory(url)
+        return url
+    }
+
+    private static func validArchiveStem(_ stem: String) -> Bool {
+        !stem.isEmpty
+            && stem.utf8.count <= 255
+            && !stem.contains("/")
+            && !stem.contains("\\")
+            && stem != "."
+            && stem != ".."
+    }
+
+    private static func qualityJobURL(stem: String) throws -> URL {
+        guard validArchiveStem(stem) else { throw posixError(EINVAL) }
+        return try qualityJobsDirectoryURL()
+            .appendingPathComponent(stem)
+            .appendingPathExtension("json")
+    }
+
+    private static func qualityRecognitionJob(stem: String) -> QualityRecognitionJob? {
+        guard validArchiveStem(stem),
+              let url = try? qualityJobURL(stem: stem),
+              let values = try? url.resourceValues(forKeys: [
+                .isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey,
+              ]),
+              values.isRegularFile == true,
+              values.isSymbolicLink != true,
+              let size = values.fileSize,
+              size > 0,
+              size <= 64 * 1024,
+              let data = try? Data(contentsOf: url),
+              let job = try? JSONDecoder().decode(QualityRecognitionJob.self, from: data),
+              job.stem == stem else {
+            return nil
+        }
+        return job
+    }
+
+    static func qualityRecognitionJobs() -> [QualityRecognitionJob] {
+        guard let directory = try? qualityJobsDirectoryURL(),
+              let urls = try? FileManager.default.contentsOfDirectory(
+                at: directory,
+                includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey],
+                options: [.skipsHiddenFiles]
+              ) else { return [] }
+        let decoder = JSONDecoder()
+        return urls.compactMap { url in
+            guard url.pathExtension == "json",
+                  let values = try? url.resourceValues(forKeys: [
+                    .isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey,
+                  ]),
+                  values.isRegularFile == true,
+                  values.isSymbolicLink != true,
+                  let size = values.fileSize,
+                  size > 0,
+                  size <= 64 * 1024,
+                  let data = try? Data(contentsOf: url),
+                  let job = try? decoder.decode(QualityRecognitionJob.self, from: data),
+                  validArchiveStem(job.stem),
+                  url.deletingPathExtension().lastPathComponent == job.stem else { return nil }
+            return job
+        }
+        .sorted {
+            if $0.state.isPending != $1.state.isPending {
+                return $0.state.isPending
+            }
+            return $0.createdAt < $1.createdAt
+        }
+    }
+
+    @discardableResult
+    static func enqueueQualityRecognition(audioURL: URL) throws -> QualityRecognitionJob {
+        let playableURL = audioURL.standardizedFileURL
+        let stem = playableURL.deletingPathExtension().lastPathComponent
+            .replacingOccurrences(of: "pending-", with: "")
+        guard validArchiveStem(stem) else { throw posixError(EINVAL) }
+        guard qualityRecognitionAudioURL(stem: stem) != nil else {
+            throw NSError(
+                domain: "MyDictate.QualityRecognition",
+                code: -1,
+                userInfo: [NSLocalizedDescriptionKey: "The retained source WAV could not be found."]
+            )
+        }
+        if let existing = qualityRecognitionJobs().first(where: { $0.stem == stem }),
+           existing.state.isPending {
+            return existing
+        }
+        let now = Date()
+        let job = QualityRecognitionJob(
+            stem: stem,
+            state: .queued,
+            progress: 0,
+            createdAt: now,
+            updatedAt: now,
+            error: nil
+        )
+        try saveQualityRecognitionJob(job)
+        return job
+    }
+
+    static func saveQualityRecognitionJob(_ job: QualityRecognitionJob) throws {
+        guard validArchiveStem(job.stem) else { throw posixError(EINVAL) }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        try writePrivateFile(try encoder.encode(job), to: qualityJobURL(stem: job.stem))
+    }
+
+    static func updateQualityRecognitionJob(
+        stem: String,
+        _ update: (inout QualityRecognitionJob) -> Void
+    ) {
+        // Progress can update dozens of times per recording. Read only the
+        // corresponding small job file instead of rescanning the whole queue.
+        guard var job = qualityRecognitionJob(stem: stem) else { return }
+        update(&job)
+        job.progress = min(100, max(0, job.progress))
+        job.updatedAt = Date()
+        do {
+            try saveQualityRecognitionJob(job)
+        } catch {
+            log("quality recognition job update failed: \(error.localizedDescription)")
+        }
+    }
+
+    static func qualityRecognitionAudioURL(stem: String) -> URL? {
+        guard validArchiveStem(stem) else { return nil }
+        let candidates = [
+            try? audioRecordingsDirectoryURL().appendingPathComponent(stem).appendingPathExtension("wav"),
+            try? failedAudioDirectoryURL().appendingPathComponent(stem).appendingPathExtension("wav"),
+        ].compactMap { $0 }
+        return candidates.first { url in
+            guard let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey]) else {
+                return false
+            }
+            return values.isRegularFile == true && values.isSymbolicLink != true
+        }
+    }
+
+    static func requeueInterruptedQualityRecognitionJobs() {
+        for job in qualityRecognitionJobs()
+        where job.state == .loadingModel || job.state == .recognizing || job.state == .cleaning {
+            updateQualityRecognitionJob(stem: job.stem) {
+                $0.state = .queued
+                $0.progress = 0
+                $0.error = nil
+            }
+        }
     }
 
     @discardableResult
@@ -4873,6 +5087,7 @@ private enum DictationArchive {
             try? audioRecordingsDirectoryURL(),
             try? failedAudioDirectoryURL(),
             try? pendingAudioDirectoryURL(),
+            try? qualityJobsDirectoryURL(),
         ]
             .compactMap { $0 }
         for directory in directories {
@@ -5736,6 +5951,7 @@ private struct WhisperTranscriptQualityAssessment: Equatable {
     let hasSparsePunctuation: Bool
     let isUnexpectedlyShort: Bool
     let hasExcessiveRepetition: Bool
+    let hasPromptEcho: Bool
     let maximumTrigramRepetition: Int
 
     var shouldRetry: Bool {
@@ -5743,6 +5959,7 @@ private struct WhisperTranscriptQualityAssessment: Equatable {
             || hasSparsePunctuation
             || isUnexpectedlyShort
             || hasExcessiveRepetition
+            || hasPromptEcho
     }
 
     var score: Int {
@@ -5750,6 +5967,7 @@ private struct WhisperTranscriptQualityAssessment: Equatable {
         result += min(punctuationCount, 120) * 8
         if hasSparsePunctuation { result -= 500 }
         if hasKnownHallucination { result -= 1_000 }
+        if hasPromptEcho { result -= 1_500 }
         if isUnexpectedlyShort { result -= 750 }
         if hasExcessiveRepetition {
             result -= min(2_400, max(0, maximumTrigramRepetition - 8) * 24)
@@ -5758,7 +5976,7 @@ private struct WhisperTranscriptQualityAssessment: Equatable {
     }
 
     var logDescription: String {
-        "chars=\(characterCount) punctuation=\(punctuationCount) sparse=\(hasSparsePunctuation) short=\(isUnexpectedlyShort) repetition=\(maximumTrigramRepetition) hallucination=\(hasKnownHallucination)"
+        "chars=\(characterCount) punctuation=\(punctuationCount) sparse=\(hasSparsePunctuation) short=\(isUnexpectedlyShort) repetition=\(maximumTrigramRepetition) hallucination=\(hasKnownHallucination) promptEcho=\(hasPromptEcho)"
     }
 }
 
@@ -5775,10 +5993,17 @@ private func whisperTranscriptQuality(_ text: String,
         .folding(options: [.caseInsensitive, .diacriticInsensitive],
                  locale: Locale(identifier: "ru_RU"))
         .lowercased()
+    // Do not remove Russian diacritics for prompt-echo checks: Foundation
+    // folds "й" into "и", which would make exact Russian phrases invisible.
+    let lowercaseText = text.lowercased(with: Locale(identifier: "ru_RU"))
     let knownHallucination = normalized.contains("редактор субтитров")
         || normalized.contains("корректор а. кулакова")
         || normalized.contains("корректор а кулакова")
         || normalized.contains("subtitles by")
+    let promptEcho = lowercaseText.contains("внутри предложений используются запятые")
+        || lowercaseText.contains("это аккуратно оформленная русская диктовка")
+        || lowercaseText.contains("this is carefully punctuated dictation")
+        || lowercaseText.contains("github, codex, chatgpt, claude, mydictate, whisper")
     let minimumPunctuation = max(2, characters / 350)
     let sparsePunctuation = characters >= 240 && punctuation < minimumPunctuation
     let unexpectedlyShort: Bool
@@ -5808,25 +6033,9 @@ private func whisperTranscriptQuality(_ text: String,
         hasSparsePunctuation: sparsePunctuation,
         isUnexpectedlyShort: unexpectedlyShort,
         hasExcessiveRepetition: excessiveRepetition,
+        hasPromptEcho: promptEcho,
         maximumTrigramRepetition: maximumTrigramCount
     )
-}
-
-private func whisperInitialPrompt(for language: DictationLanguage, recovery: Bool) -> String {
-    let punctuationPrompt: String
-    let recoverySentence: String
-    switch language {
-    case .auto, .russian, .ukrainian, .belarusian, .bulgarian, .serbian:
-        punctuationPrompt = WHISPER_RUSSIAN_PUNCTUATION_PROMPT
-        recoverySentence = "Каждая законченная мысль отделена знаком препинания."
-    default:
-        punctuationPrompt = WHISPER_ENGLISH_PUNCTUATION_PROMPT
-        recoverySentence = "Every complete thought is separated by punctuation."
-    }
-    if recovery {
-        return "\(punctuationPrompt) \(recoverySentence) \(WHISPER_TECHNICAL_TERMS)"
-    }
-    return "\(punctuationPrompt) \(WHISPER_TECHNICAL_TERMS)"
 }
 
 private final class WhisperSpeechEngine: @unchecked Sendable {
@@ -5867,70 +6076,91 @@ private final class WhisperSpeechEngine: @unchecked Sendable {
             )
         }
 
-        let primaryReporter = progressHandler.map {
-            WhisperProgressReporter(handler: $0, startProgress: 0, endProgress: 85)
+        let reporter = progressHandler.map {
+            WhisperProgressReporter(handler: $0)
         }
-        let primary = try decode(
+        let text = try decode(
             samples: samples,
             languageCode: language.whisperLanguageCode,
-            prompt: whisperInitialPrompt(for: language, recovery: false),
+            prompt: nil,
             useBeamSearch: false,
-            progressReporter: primaryReporter
+            progressReporter: reporter
         )
+        progressHandler?(100)
+        return text
+    }
+
+    /// Deliberately slower manual path. It never runs during ordinary
+    /// dictation: the user explicitly chooses it for a saved recording and
+    /// can watch its independent progress in the archive.
+    func transcribeQuality(samples: [Float],
+                           language: DictationLanguage,
+                           progressHandler: (@Sendable (Int) -> Void)? = nil) throws -> String {
+        guard samples.count <= Int(Int32.max) else {
+            throw NSError(
+                domain: "SuperDictate.Whisper",
+                code: -2,
+                userInfo: [NSLocalizedDescriptionKey: "The recording is too long for Whisper."]
+            )
+        }
         let audioDurationSeconds = Double(samples.count) / SAMPLE_RATE
-        let primaryQuality = whisperTranscriptQuality(
-            primary,
-            audioDurationSeconds: audioDurationSeconds
-        )
-        log("ASR: Whisper primary quality \(primaryQuality.logDescription)")
-
-        guard primaryQuality.shouldRetry else {
-            progressHandler?(100)
-            return primary
+        let firstReporter = progressHandler.map {
+            WhisperProgressReporter(handler: $0, startProgress: 0, endProgress: 47)
         }
-
-        let retryLanguageCode: String
-        if language == .auto {
-            let cyrillicCount = primary.unicodeScalars.reduce(into: 0) { count, scalar in
-                if (0x0400...0x04FF).contains(scalar.value) {
-                    count += 1
-                }
-            }
-            retryLanguageCode = cyrillicCount * 3 >= max(1, primary.unicodeScalars.count)
-                ? "ru"
-                : "auto"
-        } else {
-            retryLanguageCode = language.whisperLanguageCode
-        }
-        log("ASR: Whisper quality retry started; language=\(retryLanguageCode)")
-        let retryReporter = progressHandler.map {
-            WhisperProgressReporter(handler: $0, startProgress: 85, endProgress: 100)
-        }
-        let retry = try decode(
+        let first = try decode(
             samples: samples,
-            languageCode: retryLanguageCode,
-            prompt: whisperInitialPrompt(for: language, recovery: true),
+            languageCode: language.whisperLanguageCode,
+            prompt: nil,
             useBeamSearch: true,
-            progressReporter: retryReporter
+            progressReporter: firstReporter
         )
-        let retryQuality = whisperTranscriptQuality(
-            retry,
+        let firstQuality = whisperTranscriptQuality(
+            first,
             audioDurationSeconds: audioDurationSeconds
         )
-        log("ASR: Whisper retry quality \(retryQuality.logDescription)")
+        log("ASR: Whisper quality pass 1 \(firstQuality.logDescription)")
+
+        let qualityLanguageCode: String
+        if language == .auto {
+            let scalars = first.unicodeScalars
+            let cyrillicCount = scalars.reduce(into: 0) { count, scalar in
+                if (0x0400...0x04FF).contains(scalar.value) { count += 1 }
+            }
+            qualityLanguageCode = cyrillicCount * 3 >= max(1, scalars.count) ? "ru" : "auto"
+        } else {
+            qualityLanguageCode = language.whisperLanguageCode
+        }
+        let secondReporter = progressHandler.map {
+            WhisperProgressReporter(handler: $0, startProgress: 48, endProgress: 100)
+        }
+        let second = try decode(
+            samples: samples,
+            languageCode: qualityLanguageCode,
+            // Whisper treats this as vocabulary/context, not as a natural
+            // language instruction. Keeping it to names prevents the
+            // punctuation instruction itself from leaking into output.
+            prompt: WHISPER_TECHNICAL_TERMS,
+            useBeamSearch: true,
+            progressReporter: secondReporter
+        )
+        let secondQuality = whisperTranscriptQuality(
+            second,
+            audioDurationSeconds: audioDurationSeconds
+        )
+        log("ASR: Whisper quality pass 2 \(secondQuality.logDescription)")
         progressHandler?(100)
 
-        if retryQuality.score > primaryQuality.score {
-            log("ASR: Whisper quality retry selected")
-            return retry
+        if secondQuality.score > firstQuality.score {
+            log("ASR: Whisper quality pass 2 selected")
+            return second
         }
-        log("ASR: Whisper primary result retained after quality retry")
-        return primary
+        log("ASR: Whisper quality pass 1 selected")
+        return first
     }
 
     private func decode(samples: [Float],
                         languageCode: String,
-                        prompt: String,
+                        prompt: String?,
                         useBeamSearch: Bool,
                         progressReporter: WhisperProgressReporter?) throws -> String {
         var params = whisper_full_default_params(
@@ -5958,13 +6188,14 @@ private final class WhisperSpeechEngine: @unchecked Sendable {
             params.beam_search.beam_size = 5
             params.beam_search.patience = 1
         } else {
-            // The fast primary pass is deterministic. Our own quality gate
-            // decides whether the safer beam-search retry is needed.
+            // The ordinary path is a single deterministic pass. A slower
+            // beam-search retry is only available through Saved Dictations.
             params.temperature_inc = 0
             params.greedy.best_of = 5
         }
-        // Use the punctuation/spelling prompt once. Carrying it into every
-        // internal window can displace real rolling context on long audio.
+        // If the explicit quality pass supplies vocabulary context, apply it
+        // only once. Carrying it into every internal window can displace real
+        // rolling context on long audio.
         params.carry_initial_prompt = false
         if vadModelURL != nil {
             params.vad = true
@@ -5988,7 +6219,7 @@ private final class WhisperSpeechEngine: @unchecked Sendable {
                 .toOpaque()
         }
 
-        let resultCode = prompt.withCString { promptPointer in
+        let runWhisper: (UnsafePointer<CChar>?) -> Int32 = { promptPointer in
             languageCode.withCString { languagePointer in
                 params.initial_prompt = promptPointer
                 params.language = languagePointer
@@ -5996,19 +6227,25 @@ private final class WhisperSpeechEngine: @unchecked Sendable {
                 // `detect_language = true` is a detection-only mode that exits
                 // successfully without decoding any text segments.
                 params.detect_language = false
-                if let vadModelURL {
+                if let vadModelURL = self.vadModelURL {
                     return vadModelURL.path.withCString { vadPathPointer in
                         params.vad_model_path = vadPathPointer
                         return samples.withUnsafeBufferPointer { sampleBuffer in
-                            whisper_full(context, params, sampleBuffer.baseAddress, Int32(samples.count))
+                            whisper_full(self.context, params, sampleBuffer.baseAddress, Int32(samples.count))
                         }
                     }
                 } else {
                     return samples.withUnsafeBufferPointer { sampleBuffer in
-                        whisper_full(context, params, sampleBuffer.baseAddress, Int32(samples.count))
+                        whisper_full(self.context, params, sampleBuffer.baseAddress, Int32(samples.count))
                     }
                 }
             }
+        }
+        let resultCode: Int32
+        if let prompt, !prompt.isEmpty {
+            resultCode = prompt.withCString { runWhisper($0) }
+        } else {
+            resultCode = runWhisper(nil)
         }
         guard resultCode == 0 else {
             throw NSError(
@@ -6337,6 +6574,48 @@ actor TranscriptionWorker {
         }
     }
 
+    fileprivate func transcribeQuality(
+        samples: [Float],
+        language: DictationLanguage = .auto,
+        requestedAt: TimeInterval,
+        progressHandler: (@Sendable (Int) -> Void)? = nil
+    ) async throws -> TranscriptionWorkerResult {
+        let workerEnteredAt = ProcessInfo.processInfo.systemUptime
+        guard let engine else { throw NSError(domain: "Parakey", code: -2) }
+        guard !inFlight else {
+            log("ASR: quality transcription refused because another inference is active")
+            throw NSError(
+                domain: "Parakey",
+                code: -3,
+                userInfo: [NSLocalizedDescriptionKey: "Another transcription is already running."]
+            )
+        }
+        guard case .whisperLargeV3Turbo(let whisperEngine) = engine else {
+            throw NSError(
+                domain: "Parakey",
+                code: -4,
+                userInfo: [NSLocalizedDescriptionKey: "Quality recognition requires Whisper Large V3 Turbo."]
+            )
+        }
+        inFlight = true
+        defer { inFlight = false }
+        let startedAt = ProcessInfo.processInfo.systemUptime
+        let text = try whisperEngine.transcribeQuality(
+            samples: samples,
+            language: language,
+            progressHandler: progressHandler
+        )
+        let completedAt = ProcessInfo.processInfo.systemUptime
+        let elapsed = completedAt - startedAt
+        return TranscriptionWorkerResult(
+            text: text,
+            workerQueueSeconds: workerEnteredAt - requestedAt,
+            decoderPreparationSeconds: 0,
+            fluidCallSeconds: elapsed,
+            fluidProcessingSeconds: elapsed
+        )
+    }
+
     func warmUp() async throws -> ASRTimingBreakdown {
         let samples = [Float](repeating: 0, count: Int(SAMPLE_RATE * 0.4))
         let requestedAt = ProcessInfo.processInfo.systemUptime
@@ -6644,6 +6923,12 @@ private struct DictationTextProcessingResult: Equatable {
     let removedFillerWordCount: Int
 }
 
+/// Ordinary dictation stays as close as possible to the recognizer output.
+/// The explicit quality-retry path below owns every optional correction.
+private func ordinaryDictationText(_ rawTranscript: String) -> String {
+    rawTranscript.trimmingCharacters(in: .whitespacesAndNewlines)
+}
+
 private func processedDictationText(rawTranscript: String,
                                     corrections: [TranscriptCorrection],
                                     removeFillerWords: Bool) -> DictationTextProcessingResult {
@@ -6661,6 +6946,62 @@ private func processedDictationText(rawTranscript: String,
     return DictationTextProcessingResult(text: stripped.text,
                                          appliedCorrectionCount: corrected.appliedCount,
                                          removedFillerWordCount: stripped.removedCount)
+}
+
+/// Conservative formatting used only by the explicit quality-recognition
+/// command. It removes known decoder/prompt artifacts and fixes mechanical
+/// whitespace without inventing words or rewriting the user's meaning.
+private func cleanedQualityTranscript(_ text: String) -> String {
+    var result = text
+    let artifacts = [
+        #"(?i)\bредактор субтитров(?:\s+[а-яё]\.?)?(?:\s+[а-яё-]+)?[.!?]?"#,
+        #"(?i)\bкорректор а\.?\s*кулакова[^.!?\n]*(?:[.!?]|$)"#,
+        #"(?i)\bsubtitles by[^.!?\n]*(?:[.!?]|$)"#,
+        #"(?i)внутри предложений используются запятые\.?"#,
+        #"(?i)это аккуратно оформленная русская диктовка\.?"#,
+        #"(?i)this is carefully punctuated dictation\.?"#,
+    ]
+    for pattern in artifacts {
+        result = result.replacingOccurrences(of: pattern,
+                                             with: "",
+                                             options: .regularExpression)
+    }
+    result = result.replacingOccurrences(of: #"\s+"#,
+                                         with: " ",
+                                         options: .regularExpression)
+    result = result.replacingOccurrences(of: #"\s+([.,!?;:])"#,
+                                         with: "$1",
+                                         options: .regularExpression)
+    result = result.replacingOccurrences(of: #"([.,!?;:])([^\s”»)])"#,
+                                         with: "$1 $2",
+                                         options: .regularExpression)
+    result = result.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !result.isEmpty else { return result }
+
+    var characters = Array(result)
+    var shouldCapitalize = true
+    for index in characters.indices {
+        let character = characters[index]
+        if shouldCapitalize, character.isLetter {
+            let uppercase = String(character).uppercased()
+            // A few Unicode letters expand to multiple graphemes when
+            // uppercased (for example ß → SS). Keep those untouched instead
+            // of forcing them through Character's single-grapheme initializer.
+            if uppercase.count == 1, let uppercaseCharacter = uppercase.first {
+                characters[index] = uppercaseCharacter
+            }
+            shouldCapitalize = false
+        } else if ".!?".contains(character) {
+            shouldCapitalize = true
+        } else if character.isLetter || character.isNumber {
+            shouldCapitalize = false
+        }
+    }
+    result = String(characters)
+    if result.count >= 20, let last = result.last, !".!?…".contains(last) {
+        result.append(".")
+    }
+    return result
 }
 
 // MARK: - Text insertion
@@ -7823,14 +8164,12 @@ private func systemAudioMuteWatchdogScript() -> String {
 // MARK: - Sounds
 //
 // Short system sounds loaded from /System/Library/Sounds so we don't
-// have to bundle audio resources. Start and error keep their existing
-// cues; each successful completion mode has its own user-selected sound.
+// have to bundle audio resources. Every event is user-selectable and all
+// events share one volume control.
 
 @MainActor
 enum Sounds {
-    private static let start = systemSound("Tink", volume: 0.55)
-    private static let error = systemSound("Basso", volume: 0.30)
-    private static var completionSounds: [String: NSSound] = [:]
+    private static var cachedSounds: [String: NSSound] = [:]
 
     private static func systemSound(_ name: String, volume: Float) -> NSSound? {
         let path = "/System/Library/Sounds/\(name).aiff"
@@ -7839,23 +8178,25 @@ enum Sounds {
         return sound
     }
 
-    static func playStart() { start?.stop(); start?.play() }
-    static func playError() { error?.stop(); error?.play() }
-
-    static func playCompletion(_ choice: DictationCompletionSound,
-                               volume: Double) {
+    static func play(_ choice: DictationCompletionSound,
+                     volume: Double) {
         guard choice != .none else { return }
         let sound: NSSound
-        if let cached = completionSounds[choice.rawValue] {
+        if let cached = cachedSounds[choice.rawValue] {
             sound = cached
         } else {
             guard let loaded = systemSound(choice.rawValue, volume: 1) else { return }
-            completionSounds[choice.rawValue] = loaded
+            cachedSounds[choice.rawValue] = loaded
             sound = loaded
         }
         sound.stop()
         sound.volume = Float(min(1, max(0, volume)))
         sound.play()
+    }
+
+    static func playCompletion(_ choice: DictationCompletionSound,
+                               volume: Double) {
+        play(choice, volume: volume)
     }
 }
 
@@ -10607,6 +10948,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var isSwitchingSpeechModel = false
     private var fallbackSpeechModelProfileAfterStartupFailure: SpeechModelProfile?
     private var startupTask: Task<Void, Never>?
+    private var qualityRecognitionTask: Task<Void, Never>?
     private var updateCheckLoopTask: Task<Void, Never>?
     private var manualUpdateCheckTask: Task<Void, Never>?
     private var startupStatusTitle = "Loading speech model…"
@@ -10825,12 +11167,14 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         rebuildMenu()
         startUpdateCheckLoop()
+        startQualityRecognitionIfPossible()
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         settings.enableMyDictateUpdatesIfNeeded()
         pendingUpdate = nil
         DictationArchive.removeExpiredRecoverableAudio()
+        DictationArchive.requeueInterruptedQualityRecognitionJobs()
         if settings.normalizeSpeechModelProfileForCurrentBuild() {
             log("ASR: reset unsupported saved speech model selection to \(settings.speechModelProfile.shortName)")
         }
@@ -10860,6 +11204,12 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         installWorkspacePowerObservers()
         installGlobalMouseMonitor()
         installHotkeyCaptureObservers()
+        DistributedNotificationCenter.default().addObserver(
+            self,
+            selector: #selector(qualityRecognitionQueueChanged(_:)),
+            name: QUALITY_RECOGNITION_QUEUE_CHANGED_NOTIFICATION,
+            object: nil
+        )
 
         // Configure hotkey listener up front so it picks up the user's
         // saved choice the moment the tap goes live.
@@ -10935,6 +11285,8 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         settings.hasActiveRunMarker = false
         startupTask?.cancel()
         startupTask = nil
+        qualityRecognitionTask?.cancel()
+        qualityRecognitionTask = nil
         updateCheckLoopTask?.cancel()
         updateCheckLoopTask = nil
         manualUpdateCheckTask?.cancel()
@@ -10944,6 +11296,11 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         removeWorkspacePowerObservers()
         removeGlobalMouseMonitor()
         removeHotkeyCaptureObservers()
+        DistributedNotificationCenter.default().removeObserver(
+            self,
+            name: QUALITY_RECOGNITION_QUEUE_CHANGED_NOTIFICATION,
+            object: nil
+        )
         correctionSyncTimer?.invalidate()
         correctionSyncTimer = nil
         cleanupPendingSharedCorrections(reason: "terminate")
@@ -10997,6 +11354,187 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     @objc private func externalHotkeyCaptureDidEnd(_ notification: Notification) {
         resumeHotkeyAfterExternalCapture(reason: "control panel finished")
+    }
+
+    @objc private func qualityRecognitionQueueChanged(_ notification: Notification) {
+        startQualityRecognitionIfPossible()
+    }
+
+    private func startQualityRecognitionIfPossible() {
+        guard qualityRecognitionTask == nil,
+              isReady,
+              !isRecording,
+              !isBusy,
+              !isTerminating,
+              DictationArchive.qualityRecognitionJobs().contains(where: { $0.state == .queued })
+        else { return }
+
+        qualityRecognitionTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.processQualityRecognitionQueue()
+        }
+    }
+
+    private func processQualityRecognitionQueue() async {
+        guard !isRecording, !isBusy, !isTerminating else {
+            qualityRecognitionTask = nil
+            return
+        }
+
+        settings.refreshFromDisk()
+        let normalProfile = settings.speechModelProfile.productionProfile
+        isBusy = true
+        setMenuBarState(.busy)
+        rebuildMenu()
+
+        do {
+            if let first = DictationArchive.qualityRecognitionJobs()
+                .first(where: { $0.state == .queued }) {
+                DictationArchive.updateQualityRecognitionJob(stem: first.stem) {
+                    $0.state = .loadingModel
+                    $0.progress = 1
+                    $0.error = nil
+                }
+            }
+            try await asr.load(profile: .whisperLargeV3Turbo)
+
+            while !Task.isCancelled, !isTerminating,
+                  let job = DictationArchive.qualityRecognitionJobs()
+                    .first(where: { $0.state == .queued || $0.state == .loadingModel }) {
+                await processQualityRecognitionJob(job)
+            }
+
+            if !Task.isCancelled, !isTerminating, normalProfile != .whisperLargeV3Turbo {
+                try await asr.load(profile: normalProfile)
+            }
+        } catch {
+            let message = error.localizedDescription
+            for job in DictationArchive.qualityRecognitionJobs() where job.state.isPending {
+                DictationArchive.updateQualityRecognitionJob(stem: job.stem) {
+                    $0.state = .failed
+                    $0.error = message
+                }
+            }
+            log("quality recognition queue failed: \(message)")
+            signalDictationFailure()
+        }
+
+        isBusy = false
+        qualityRecognitionTask = nil
+        if !isTerminating {
+            setMenuBarState(.idle)
+            rebuildMenu()
+            scheduleAudioIdleStop(reason: "quality recognition finished")
+            startQualityRecognitionIfPossible()
+        }
+    }
+
+    private func processQualityRecognitionJob(_ job: QualityRecognitionJob) async {
+        guard let audioURL = DictationArchive.qualityRecognitionAudioURL(stem: job.stem) else {
+            DictationArchive.updateQualityRecognitionJob(stem: job.stem) {
+                $0.state = .failed
+                $0.error = "The retained source audio is no longer available."
+            }
+            return
+        }
+
+        do {
+            let samples = try DictationArchive.loadRecordingAudio(from: audioURL)
+            guard !samples.isEmpty else { throw posixError(EINVAL) }
+            DictationArchive.updateQualityRecognitionJob(stem: job.stem) {
+                $0.state = .recognizing
+                $0.progress = 2
+                $0.error = nil
+            }
+            let requestedAt = ProcessInfo.processInfo.systemUptime
+            let stem = job.stem
+            let transcription = try await asr.transcribeQuality(
+                samples: samples,
+                language: settings.dictationLanguage,
+                requestedAt: requestedAt,
+                progressHandler: { @Sendable progress in
+                    DictationArchive.updateQualityRecognitionJob(stem: stem) {
+                        $0.state = .recognizing
+                        $0.progress = min(94, max(2, progress))
+                    }
+                }
+            )
+            DictationArchive.updateQualityRecognitionJob(stem: job.stem) {
+                $0.state = .cleaning
+                $0.progress = 96
+            }
+            let processed = processedDictationText(
+                rawTranscript: transcription.text,
+                corrections: settings.transcriptCorrections,
+                removeFillerWords: settings.removeFillerWords
+            )
+            let polishedText = cleanedQualityTranscript(processed.text)
+            let quality = whisperTranscriptQuality(
+                polishedText,
+                audioDurationSeconds: Double(samples.count) / SAMPLE_RATE
+            )
+            guard DictationArchive.hasMeaningfulTranscriptContent(polishedText),
+                  !quality.shouldRetry else {
+                throw NSError(
+                    domain: "MyDictate.QualityRecognition",
+                    code: -2,
+                    userInfo: [NSLocalizedDescriptionKey:
+                        "The quality pass still returned suspicious or incomplete text."]
+                )
+            }
+            guard DictationArchive.saveTranscript(
+                polishedText,
+                sourceAudioURL: audioURL
+            ) != nil else {
+                throw NSError(
+                    domain: "MyDictate.QualityRecognition",
+                    code: -3,
+                    userInfo: [NSLocalizedDescriptionKey:
+                        "The improved transcript could not be saved."]
+                )
+            }
+            DictationArchive.clearFailedAudioArtifacts(sourceAudioURL: audioURL)
+            DictationArchive.updateQualityRecognitionJob(stem: job.stem) {
+                $0.state = .completed
+                $0.progress = 100
+                $0.error = nil
+            }
+            Sounds.play(settings.qualityRecognitionCompletionSound,
+                        volume: settings.completionSoundVolume)
+            presentQualityRecognitionCompletionNotification()
+            log("quality recognition completed: \(job.stem), \(polishedText.count) chars")
+        } catch {
+            DictationArchive.updateQualityRecognitionJob(stem: job.stem) {
+                $0.state = .failed
+                $0.error = error.localizedDescription
+            }
+            signalDictationFailure()
+            log("quality recognition failed for \(job.stem): \(error.localizedDescription)")
+        }
+    }
+
+    private func presentQualityRecognitionCompletionNotification() {
+        let content = UNMutableNotificationContent()
+        content.title = settings.interfaceLanguage == .english
+            ? "MyDictate: recognition complete"
+            : "MyDictate: распознавание готово"
+        content.body = settings.interfaceLanguage == .english
+            ? "The improved text is available in Saved Dictations."
+            : "Улучшенный текст доступен в «Сохранённых диктовках»."
+        let request = UNNotificationRequest(
+            identifier: "quality-recognition-\(UUID().uuidString)",
+            content: content,
+            trigger: nil
+        )
+        Task { @MainActor in
+            let center = UNUserNotificationCenter.current()
+            do {
+                let granted = try await center.requestAuthorization(options: [.alert])
+                if granted { try await center.add(request) }
+            } catch {
+                log("quality recognition notification failed: \(error.localizedDescription)")
+            }
+        }
     }
 
     private func resumeHotkeyAfterExternalCapture(reason: String) {
@@ -11192,6 +11730,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         for url in pendingURLs {
             guard !Task.isCancelled, !isTerminating else { return }
             var recoverySamples: [Float] = []
+            var archivedAudioURL: URL?
             do {
                 let samples = try PendingDictationRecovery.loadSamples(from: url)
                 recoverySamples = samples
@@ -11199,7 +11738,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     PendingDictationRecovery.remove(url)
                     continue
                 }
-                let archivedAudioURL = DictationArchive.saveRecordingAudio(
+                archivedAudioURL = DictationArchive.saveRecordingAudio(
                     samples,
                     sourceAudioURL: url
                 )
@@ -11215,32 +11754,33 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 )
                 let completedAt = ProcessInfo.processInfo.systemUptime
                 let timing = transcription.timing(totalSeconds: completedAt - requestedAt)
-                let processed = processedDictationText(rawTranscript: transcription.text,
-                                                       corrections: settings.transcriptCorrections,
-                                                       removeFillerWords: settings.removeFillerWords)
-                guard DictationArchive.hasMeaningfulTranscriptContent(processed.text) else {
-                    if !processed.text.isEmpty {
-                        _ = DictationArchive.saveTranscript(processed.text, sourceAudioURL: url)
+                let cleaned = ordinaryDictationText(transcription.text)
+                guard DictationArchive.hasMeaningfulTranscriptContent(cleaned) else {
+                    if !cleaned.isEmpty {
+                        _ = DictationArchive.saveTranscript(cleaned, sourceAudioURL: url)
                     }
                     DictationArchive.preserveFailedAudio(
                         samples,
                         sourceAudioURL: url,
-                        errorDescription: processed.text.isEmpty
+                        errorDescription: cleaned.isEmpty
                             ? "The speech model returned an empty transcript."
                             : "The speech model returned only punctuation or no readable words."
                     )
+                    if archivedAudioURL != nil {
+                        PendingDictationRecovery.remove(url)
+                    }
                     log("pending dictation recovery returned no meaningful text; audio retained")
                     continue
                 }
 
-                let archivedURL = DictationArchive.saveTranscript(processed.text,
+                let archivedURL = DictationArchive.saveTranscript(cleaned,
                                                                   sourceAudioURL: url)
                 addToHistory(
-                    processed.text,
+                    cleaned,
                     transcriptionDurationSeconds: timing.totalSeconds,
                     asrTiming: timing
                 )
-                recordDictationUsage(text: processed.text,
+                recordDictationUsage(text: cleaned,
                                      audioSeconds: duration,
                                      asrSeconds: timing.totalSeconds)
                 if archivedURL != nil, archivedAudioURL != nil {
@@ -11249,14 +11789,19 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 } else {
                     log("pending dictation retained because its transcript or source WAV could not be archived")
                 }
-                log("pending dictation recovered: \(String(format: "%.2f", duration)) s audio → \(String(format: "%.2f", timing.totalSeconds)) s → \(processed.text.count) chars")
+                log("pending dictation recovered: \(String(format: "%.2f", duration)) s audio → \(String(format: "%.2f", timing.totalSeconds)) s → \(cleaned.count) chars")
             } catch {
                 DictationArchive.preserveFailedAudio(
                     recoverySamples,
                     sourceAudioURL: url,
                     errorDescription: error.localizedDescription
                 )
-                log("pending dictation recovery deferred: \(error.localizedDescription)")
+                if archivedAudioURL != nil {
+                    PendingDictationRecovery.remove(url)
+                    log("pending dictation recovery failed once; source WAV retained for manual retry: \(error.localizedDescription)")
+                } else {
+                    log("pending dictation recovery deferred because source WAV could not be archived: \(error.localizedDescription)")
+                }
             }
         }
     }
@@ -12500,9 +13045,8 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     // the feedback-sounds toggle; the icon flash always fires since it's the
     // only signal for users who run silent.
     private func signalDictationFailure() {
-        if settings.playFeedbackSounds {
-            Sounds.playError()
-        }
+        Sounds.play(settings.recognitionErrorSound,
+                    volume: settings.completionSoundVolume)
         flashErrorMenuBarIcon()
     }
 
@@ -12611,9 +13155,8 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             updateSetupChecklist()
         }
         startRecordingLevelMeter(initialContext: initialInsertionContext)
-        if settings.playFeedbackSounds {
-            Sounds.playStart()
-        }
+        Sounds.play(settings.recordingStartSound,
+                    volume: settings.completionSoundVolume)
         muteIfNeededForRecording()
         log("press: recording; started in \(recordingStartApplicationDescription ?? "unavailable")")
 
@@ -12653,7 +13196,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             log("release: clip too short (\(String(format: "%.2f", dur)) s), discarding")
             PendingDictationRecovery.remove(captured.recoveryURL)
             hideRecordingHUD()
-            setMenuBarState(.idle)
+            signalDictationFailure()
             rebuildMenu()
             if !runDeferredAudioRouteRefreshIfNeeded() {
                 scheduleAudioIdleStop(reason: "short clip")
@@ -12727,17 +13270,12 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 )
                 if !isTerminating {
                     let postprocessingStartedAt = ProcessInfo.processInfo.systemUptime
-                    let processed = processedDictationText(rawTranscript: transcription.text,
-                                                           corrections: settings.transcriptCorrections,
-                                                           removeFillerWords: settings.removeFillerWords)
+                    // The ordinary path intentionally returns Whisper's own
+                    // deterministic result. User corrections, filler-word
+                    // removal and punctuation cleanup belong exclusively to
+                    // the explicit “Recognize Again” quality path.
+                    let cleaned = ordinaryDictationText(transcription.text)
                     let postprocessingCompletedAt = ProcessInfo.processInfo.systemUptime
-                    if processed.appliedCorrectionCount > 0 {
-                        log("transcript corrections applied: \(processed.appliedCorrectionCount)")
-                    }
-                    if processed.removedFillerWordCount > 0 {
-                        log("filler words removed: \(processed.removedFillerWordCount)")
-                    }
-                    let cleaned = processed.text
                     log("\(String(format: "%.2f", dur)) s audio → \(String(format: "%.2f", asrTiming.totalSeconds)) s → \(cleaned.count) chars")
                     if DictationArchive.hasMeaningfulTranscriptContent(cleaned) {
                         // The durable text file is written before history and
@@ -12895,6 +13433,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             if !didRestartAudio {
                 scheduleAudioIdleStop(reason: "recording finished")
             }
+            startQualityRecognitionIfPossible()
         }
     }
 
@@ -12951,20 +13490,18 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 let completedAt = ProcessInfo.processInfo.systemUptime
                 let timing = transcription.timing(totalSeconds: completedAt - requestedAt)
                 if !isTerminating {
-                    let processed = processedDictationText(rawTranscript: transcription.text,
-                                                           corrections: settings.transcriptCorrections,
-                                                           removeFillerWords: settings.removeFillerWords)
-                    if DictationArchive.hasMeaningfulTranscriptContent(processed.text) {
+                    let cleaned = ordinaryDictationText(transcription.text)
+                    if DictationArchive.hasMeaningfulTranscriptContent(cleaned) {
                         let archivedURL = DictationArchive.saveTranscript(
-                            processed.text,
+                            cleaned,
                             sourceAudioURL: captured.recoveryURL
                         )
                         addToHistory(
-                            processed.text,
+                            cleaned,
                             transcriptionDurationSeconds: timing.totalSeconds,
                             asrTiming: timing
                         )
-                        recordDictationUsage(text: processed.text,
+                        recordDictationUsage(text: cleaned,
                                              audioSeconds: duration,
                                              asrSeconds: timing.totalSeconds)
                         if archivedURL != nil, archivedAudioURL != nil {
@@ -12980,22 +13517,22 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                         }
                     } else {
                         recoveryFailed = true
-                        if !processed.text.isEmpty {
+                        if !cleaned.isEmpty {
                             _ = DictationArchive.saveTranscript(
-                                processed.text,
+                                cleaned,
                                 sourceAudioURL: captured.recoveryURL
                             )
                         }
                         DictationArchive.preserveFailedAudio(
                             captured.samples,
                             sourceAudioURL: captured.recoveryURL,
-                            errorDescription: processed.text.isEmpty
+                            errorDescription: cleaned.isEmpty
                                 ? "The speech model returned an empty transcript."
                                 : "The speech model returned only punctuation or no readable words."
                         )
                         log("dictation recovery returned no meaningful text; audio retained")
                     }
-                    log("recovered dictation: \(String(format: "%.2f", duration)) s audio → \(String(format: "%.2f", timing.totalSeconds)) s → \(processed.text.count) chars in history")
+                    log("recovered dictation: \(String(format: "%.2f", duration)) s audio → \(String(format: "%.2f", timing.totalSeconds)) s → \(cleaned.count) chars in history")
                 }
             } catch {
                 recoveryFailed = true
@@ -13024,6 +13561,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             if !didRestartAudio {
                 scheduleAudioIdleStop(reason: reason)
             }
+            startQualityRecognitionIfPossible()
         }
     }
 
@@ -13061,6 +13599,8 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             settings.interfaceLanguage == .english ? "Canceled" : "Отменено",
             visibleSeconds: RECORDING_HUD_TRANSIENT_STATUS_VISIBLE_SECONDS
         )
+        Sounds.play(settings.cancellationSound,
+                    volume: settings.completionSoundVolume)
         log("recording canceled deliberately (\(reason)); \(captured.samples.count) samples discarded")
 
         let didRestartAudio = runDeferredAudioRouteRefreshIfNeeded()
@@ -14596,8 +15136,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 "Text insertion: \(TextInserter.defaultStrategyDescription)",
                 "Recording waveform: \(settings.showRecordingWaveform)",
                 "Mute while recording: \(settings.muteWhileRecording)",
-                "Feedback sounds: \(settings.playFeedbackSounds)",
-                "Completion sounds: standard=\(settings.withoutEnterCompletionSound.rawValue), enter=\(settings.withEnterCompletionSound.rawValue), clipboard=\(settings.clipboardCompletionSound.rawValue)",
+                "Event sounds: start=\(settings.recordingStartSound.rawValue), standard=\(settings.withoutEnterCompletionSound.rawValue), enter=\(settings.withEnterCompletionSound.rawValue), clipboard=\(settings.clipboardCompletionSound.rawValue), error=\(settings.recognitionErrorSound.rawValue), cancel=\(settings.cancellationSound.rawValue), quality=\(settings.qualityRecognitionCompletionSound.rawValue)",
                 "Completion sound volume: \(Int((settings.completionSoundVolume * 100).rounded()))%",
                 "Clipboard completion visible: \(Int(settings.clipboardCompletionVisibleSeconds.rounded())) s",
                 "Show in Dock: \(settings.showInDock)",
@@ -15044,11 +15583,12 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         sub.addItem(buildRecentTranscriptLimitSettingsItem())
         sub.addItem(buildCorrectionsItem())
 
-        let filler = NSMenuItem(title: "Remove filler words (um, uh, ah, er, hmm)",
+        let filler = NSMenuItem(title: "Remove filler words during Recognize Again",
                                 action: #selector(toggleRemoveFillerWords(_:)),
                                 keyEquivalent: "")
         filler.target = self
         filler.state = settings.removeFillerWords ? .on : .off
+        filler.toolTip = "Ordinary dictation stays untouched; this applies only to the manual quality pass."
         sub.addItem(filler)
 
         parent.submenu = sub
@@ -15073,13 +15613,6 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         mute.target = self
         mute.state = settings.muteWhileRecording ? .on : .off
         sub.addItem(mute)
-
-        let sounds = NSMenuItem(title: "Play recording start and error sounds",
-                                action: #selector(toggleFeedbackSounds(_:)),
-                                keyEquivalent: "")
-        sounds.target = self
-        sounds.state = settings.playFeedbackSounds ? .on : .off
-        sub.addItem(sounds)
 
         let launchAtLogin = NSMenuItem(title: "Launch at Login",
                                        action: #selector(toggleLaunchAtLogin(_:)),
@@ -15426,8 +15959,11 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     private func buildCorrectionsItem() -> NSMenuItem {
         let corrections = settings.transcriptCorrections
-        let title = corrections.isEmpty ? "Text Corrections" : "Text Corrections (\(corrections.count))"
+        let title = corrections.isEmpty
+            ? "Recognize Again Corrections"
+            : "Recognize Again Corrections (\(corrections.count))"
         let parent = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+        parent.toolTip = "Corrections are applied only when a saved recording is recognized again."
         let sub = NSMenu()
         sub.autoenablesItems = false
 
@@ -16477,11 +17013,6 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         sender.state = settings.removeFillerWords ? .on : .off
     }
 
-    @objc private func toggleFeedbackSounds(_ sender: NSMenuItem) {
-        settings.playFeedbackSounds.toggle()
-        sender.state = settings.playFeedbackSounds ? .on : .off
-    }
-
     @objc private func toggleDock(_ sender: NSMenuItem) {
         settings.showInDock.toggle()
         sender.state = settings.showInDock ? .on : .off
@@ -17199,7 +17730,12 @@ private enum ParakeySelfTest {
     static func run(arguments: [String]) -> Int32? {
         guard arguments.count >= 2, arguments[0] == "--self-test" else { return nil }
         if arguments[1] == "whisper-files" {
-            return runWhisperFiles(arguments: Array(arguments.dropFirst(2)))
+            return runWhisperFiles(arguments: Array(arguments.dropFirst(2)),
+                                   qualityMode: false)
+        }
+        if arguments[1] == "whisper-quality-files" {
+            return runWhisperFiles(arguments: Array(arguments.dropFirst(2)),
+                                   qualityMode: true)
         }
         guard arguments.count == 2 else { return fail("usage") }
 
@@ -17273,9 +17809,10 @@ private enum ParakeySelfTest {
         return EXIT_FAILURE
     }
 
-    private static func runWhisperFiles(arguments: [String]) -> Int32 {
+    private static func runWhisperFiles(arguments: [String],
+                                        qualityMode: Bool) -> Int32 {
         guard arguments.count >= 3 else {
-            return fail("usage: --self-test whisper-files <model> <vad-model> <audio>...")
+            return fail("usage: --self-test whisper[-quality]-files <model> <vad-model> <audio>...")
         }
         do {
             let engine = try WhisperSpeechEngine(
@@ -17285,7 +17822,9 @@ private enum ParakeySelfTest {
             for audioPath in arguments.dropFirst(2) {
                 let audioURL = URL(fileURLWithPath: audioPath)
                 let samples = try DictationArchive.loadRecordingAudio(from: audioURL)
-                let text = try engine.transcribe(samples: samples, language: .auto)
+                let text = try qualityMode
+                    ? engine.transcribeQuality(samples: samples, language: .auto)
+                    : engine.transcribe(samples: samples, language: .auto)
                 let quality = whisperTranscriptQuality(text)
                 print("BEGIN \(audioURL.lastPathComponent)")
                 print(text)
@@ -19351,6 +19890,12 @@ private enum ParakeySelfTest {
     }
 
     private static func testWhisperTranscriptQuality() throws {
+        try expect(
+            ordinaryDictationText("  эээ github без запятых  "),
+            equals: "эээ github без запятых",
+            "ordinary dictation should only trim its edges, not rewrite words or punctuation"
+        )
+
         let punctuated = whisperTranscriptQuality(
             "Это первое предложение. Здесь есть запятая, а затем вопрос: всё работает?"
         )
@@ -19402,6 +19947,24 @@ private enum ParakeySelfTest {
             repeatedLoop.hasExcessiveRepetition,
             equals: true,
             "decoder loops should trigger a safer retry"
+        )
+
+        let leakedPrompt = whisperTranscriptQuality(
+            "Внутри предложений используются запятые. Внутри предложений используются запятые."
+        )
+        try expect(
+            leakedPrompt.hasPromptEcho,
+            equals: true,
+            "the former punctuation prompt must be recognized as leaked decoder context"
+        )
+
+        let polished = cleanedQualityTranscript(
+            "редактор субтитров А. Синецкая   нормальный текст без лишних пробелов"
+        )
+        try expect(
+            polished,
+            equals: "Нормальный текст без лишних пробелов.",
+            "manual quality cleanup should remove known credits and normalize formatting"
         )
     }
 
@@ -20848,6 +21411,11 @@ private enum ParakeySelfTest {
             "saved dictation browser should count all retained source recordings"
         )
         try expect(
+            archiveSnapshot.retainedAudioCount,
+            equals: 1,
+            "saved dictation browser should not double-count a recording that also has a failure copy"
+        )
+        try expect(
             archiveSnapshot.pendingAudioCount,
             equals: 0,
             "saved dictation browser should report pending recovery recordings separately"
@@ -21713,9 +22281,13 @@ private enum ControlPanelShortcutKind: Int {
 }
 
 private enum ControlPanelCompletionSoundKind: Int {
-    case withoutEnter = 0
-    case withEnter = 1
-    case clipboardOnly = 2
+    case recordingStart = 0
+    case withoutEnter = 1
+    case withEnter = 2
+    case clipboardOnly = 3
+    case recognitionError = 4
+    case cancellation = 5
+    case qualityRecognition = 6
 }
 
 private struct ControlPanelSettingsDraft: Equatable {
@@ -21728,9 +22300,13 @@ private struct ControlPanelSettingsDraft: Equatable {
     var transcribingColor: RecordingHUDAccentColor
     var backgroundStyle: RecordingHUDBackgroundStyle
     var hudSize: RecordingHUDSize
+    var recordingStartSound: DictationCompletionSound
     var withoutEnterCompletionSound: DictationCompletionSound
     var withEnterCompletionSound: DictationCompletionSound
     var clipboardCompletionSound: DictationCompletionSound
+    var recognitionErrorSound: DictationCompletionSound
+    var cancellationSound: DictationCompletionSound
+    var qualityRecognitionCompletionSound: DictationCompletionSound
     var completionSoundVolume: Double
     var clipboardCompletionVisibleSeconds: TimeInterval
 
@@ -21744,9 +22320,13 @@ private struct ControlPanelSettingsDraft: Equatable {
         transcribingColor = settings.recordingHUDTranscribingColor
         backgroundStyle = settings.recordingHUDBackgroundStyle
         hudSize = settings.recordingHUDSize
+        recordingStartSound = settings.recordingStartSound
         withoutEnterCompletionSound = settings.withoutEnterCompletionSound
         withEnterCompletionSound = settings.withEnterCompletionSound
         clipboardCompletionSound = settings.clipboardCompletionSound
+        recognitionErrorSound = settings.recognitionErrorSound
+        cancellationSound = settings.cancellationSound
+        qualityRecognitionCompletionSound = settings.qualityRecognitionCompletionSound
         completionSoundVolume = settings.completionSoundVolume
         clipboardCompletionVisibleSeconds = settings.clipboardCompletionVisibleSeconds
     }
@@ -21785,6 +22365,7 @@ private struct SavedDictationTranscript {
     /// insertion was not completed safely and can be run again.
     let retryAudioURL: URL?
     let needsRecognitionRetry: Bool
+    let qualityRecognitionJob: QualityRecognitionJob?
 }
 
 private struct SavedDictationAudioIssue {
@@ -21792,15 +22373,21 @@ private struct SavedDictationAudioIssue {
     let retryAudioURL: URL
     let date: Date
     let isPendingJournal: Bool
+    let qualityRecognitionJob: QualityRecognitionJob?
 }
 
 private struct SavedDictationArchiveSnapshot {
     let transcripts: [SavedDictationTranscript]
     let audioIssues: [SavedDictationAudioIssue]
     let totalTranscriptCount: Int
+    /// Unique recordings across the normal archive, failure copies and
+    /// recovery journals. The same dictation can legitimately exist in more
+    /// than one of those folders, so summing the folder counts overstates it.
+    let retainedAudioCount: Int
     let recordingAudioCount: Int
     let failedAudioCount: Int
     let pendingAudioCount: Int
+    let qualityRecognitionJobs: [QualityRecognitionJob]
 }
 
 private func savedDictationArchiveSnapshot(transcriptsDirectory: URL,
@@ -21866,6 +22453,8 @@ private func savedDictationArchiveSnapshot(transcriptsDirectory: URL,
             ($0.deletingPathExtension().lastPathComponent.replacingOccurrences(of: "pending-", with: ""), $0)
         }
     )
+    let qualityJobs = DictationArchive.qualityRecognitionJobs()
+    let qualityJobsByStem = Dictionary(uniqueKeysWithValues: qualityJobs.map { ($0.stem, $0) })
 
     func archiveDate(_ url: URL) -> Date {
         let values = try? url.resourceValues(forKeys: [.contentModificationDateKey, .creationDateKey])
@@ -21895,7 +22484,8 @@ private func savedDictationArchiveSnapshot(transcriptsDirectory: URL,
             date: values.contentModificationDate ?? values.creationDate ?? .distantPast,
             recordingAudioURL: recordingAudio,
             retryAudioURL: pendingAudio ?? recordingAudio ?? failedAudio,
-            needsRecognitionRetry: pendingAudio != nil || failedAudio != nil
+            needsRecognitionRetry: pendingAudio != nil || failedAudio != nil,
+            qualityRecognitionJob: qualityJobsByStem[stem]
         )
     }
 
@@ -21908,14 +22498,16 @@ private func savedDictationArchiveSnapshot(transcriptsDirectory: URL,
                 audioURL: recordingAudioByStem[stem] ?? failedAudioByStem[stem] ?? pending,
                 retryAudioURL: pending,
                 date: archiveDate(pending),
-                isPendingJournal: true
+                isPendingJournal: true,
+                qualityRecognitionJob: qualityJobsByStem[stem]
             ))
         } else if let failed = failedAudioByStem[stem] {
             audioIssues.append(SavedDictationAudioIssue(
                 audioURL: recordingAudioByStem[stem] ?? failed,
                 retryAudioURL: recordingAudioByStem[stem] ?? failed,
                 date: archiveDate(failed),
-                isPendingJournal: false
+                isPendingJournal: false,
+                qualityRecognitionJob: qualityJobsByStem[stem]
             ))
         }
     }
@@ -21925,9 +22517,14 @@ private func savedDictationArchiveSnapshot(transcriptsDirectory: URL,
         transcripts: transcripts,
         audioIssues: Array(audioIssues.prefix(loadLimit)),
         totalTranscriptCount: transcriptURLs.count,
+        retainedAudioCount: Set(recordingAudioByStem.keys)
+            .union(failedAudioByStem.keys)
+            .union(pendingAudioByStem.keys)
+            .count,
         recordingAudioCount: recordingAudioByStem.count,
-        failedAudioCount: regularFiles(in: failedAudioDirectory, extension: "wav").count,
-        pendingAudioCount: regularFiles(in: pendingAudioDirectory, extension: "sdaudio").count
+        failedAudioCount: failedAudioByStem.count,
+        pendingAudioCount: pendingAudioByStem.count,
+        qualityRecognitionJobs: qualityJobs
     )
 }
 
@@ -22557,7 +23154,11 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
            savedDictationDetailWindow.isVisible,
            let transcript = savedDictationDetailTranscript {
             savedDictationDetailWindow.title = t("Сохранённая диктовка", "Saved Dictation")
-            savedDictationDetailWindow.contentView = makeSavedTranscriptDetailContentView(transcript)
+            let current = currentSavedDictationSnapshot().transcripts.first {
+                $0.url.standardizedFileURL == transcript.url.standardizedFileURL
+            } ?? transcript
+            savedDictationDetailTranscript = current
+            savedDictationDetailWindow.contentView = makeSavedTranscriptDetailContentView(current)
             resizeSavedTranscriptDetailWindow(savedDictationDetailWindow)
         }
         if let dictationHelpWindow, dictationHelpWindow.isVisible {
@@ -22645,9 +23246,11 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                 transcripts: [],
                 audioIssues: [],
                 totalTranscriptCount: 0,
+                retainedAudioCount: 0,
                 recordingAudioCount: 0,
                 failedAudioCount: 0,
-                pendingAudioCount: 0
+                pendingAudioCount: 0,
+                qualityRecognitionJobs: []
             )
         }
         return savedDictationArchiveSnapshot(
@@ -22661,7 +23264,10 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
 
     private func savedDictationArchiveFingerprint() -> String {
         let snapshot = currentSavedDictationSnapshot(maximumLoadedTranscripts: 0)
-        return "\(snapshot.totalTranscriptCount):\(snapshot.recordingAudioCount):\(snapshot.failedAudioCount):\(snapshot.pendingAudioCount)"
+        let jobs = snapshot.qualityRecognitionJobs.map {
+            "\($0.stem):\($0.state.rawValue):\($0.progress):\($0.updatedAt.timeIntervalSince1970)"
+        }.joined(separator: "|")
+        return "\(snapshot.totalTranscriptCount):\(snapshot.recordingAudioCount):\(snapshot.failedAudioCount):\(snapshot.pendingAudioCount):\(jobs)"
     }
 
     private func makeContentView() -> NSView {
@@ -22896,12 +23502,12 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                                                  weight: .semibold))
         let retryCount = snapshot.audioIssues.count
             + snapshot.transcripts.filter(\.needsRecognitionRetry).count
-        let totalAudioCount = snapshot.recordingAudioCount
-            + snapshot.failedAudioCount
-            + snapshot.pendingAudioCount
+            + snapshot.transcripts.filter {
+                $0.qualityRecognitionJob?.state == .failed && !$0.needsRecognitionRetry
+            }.count
         let archiveSummary = panelLabel(
-            t("\(snapshot.totalTranscriptCount) текстов · \(totalAudioCount) аудиозаписей на 7 дней · \(retryCount) требуют внимания",
-              "\(snapshot.totalTranscriptCount) texts · \(totalAudioCount) recordings kept for 7 days · \(retryCount) need attention"),
+            t("\(snapshot.totalTranscriptCount) текстов · \(snapshot.retainedAudioCount) аудиозаписей на 7 дней · \(retryCount) требуют внимания",
+              "\(snapshot.totalTranscriptCount) texts · \(snapshot.retainedAudioCount) recordings kept for 7 days · \(retryCount) need attention"),
             size: 11.5,
             color: .secondaryLabelColor
         )
@@ -22911,6 +23517,23 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         archiveSummary.setContentHuggingPriority(.defaultLow, for: .horizontal)
         archiveSummary.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         headerText.addArrangedSubview(archiveSummary)
+        let pendingQualityJobs = snapshot.qualityRecognitionJobs.filter(\.state.isPending)
+        if !pendingQualityJobs.isEmpty {
+            let activeIndex = pendingQualityJobs.firstIndex {
+                $0.state != .queued
+            } ?? 0
+            let active = pendingQualityJobs[activeIndex]
+            let queueStatus = panelLabel(
+                t("Качественное распознавание: \(activeIndex + 1) из \(pendingQualityJobs.count) · \(qualityRecognitionStatusText(active))",
+                  "Quality recognition: \(activeIndex + 1) of \(pendingQualityJobs.count) · \(qualityRecognitionStatusText(active))"),
+                size: 10.5,
+                weight: .medium,
+                color: .systemBlue
+            )
+            queueStatus.maximumNumberOfLines = 1
+            queueStatus.lineBreakMode = .byTruncatingTail
+            headerText.addArrangedSubview(queueStatus)
+        }
         header.addArrangedSubview(headerText)
         header.addArrangedSubview(NSView())
         root.addArrangedSubview(header)
@@ -23055,7 +23678,16 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                               weight: .medium,
                               color: .secondaryLabelColor)
         top.addArrangedSubview(date)
-        if transcript.needsRecognitionRetry {
+        if let job = transcript.qualityRecognitionJob {
+            let status = panelLabel(
+                qualityRecognitionStatusText(job),
+                size: 10.5,
+                weight: .medium,
+                color: qualityRecognitionStatusColor(job)
+            )
+            status.lineBreakMode = .byTruncatingTail
+            top.addArrangedSubview(status)
+        } else if transcript.needsRecognitionRetry {
             let status = panelLabel(
                 t("Нужно повторить распознавание", "Recognition needs retry"),
                 size: 10.5,
@@ -23081,7 +23713,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             openAudio.setAccessibilityLabel(t("Открыть аудио", "Open audio"))
             top.addArrangedSubview(openAudio)
         }
-        if transcript.needsRecognitionRetry, let retryURL = transcript.retryAudioURL {
+        if let retryURL = transcript.recordingAudioURL ?? transcript.retryAudioURL {
             let retry = SavedAudioActionButton(
                 title: "",
                 audioURL: retryURL,
@@ -23094,6 +23726,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             retry.imagePosition = .imageOnly
             retry.toolTip = t("Распознать эту запись ещё раз", "Recognize this recording again")
             retry.setAccessibilityLabel(t("Распознать ещё раз", "Recognize again"))
+            retry.isEnabled = transcript.qualityRecognitionJob?.state.isPending != true
             top.addArrangedSubview(retry)
         }
         let copy = SavedTranscriptCopyButton(
@@ -23155,6 +23788,14 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             size: 12.5,
             weight: .semibold
         ))
+        if let job = issue.qualityRecognitionJob {
+            title.addArrangedSubview(panelLabel(
+                qualityRecognitionStatusText(job),
+                size: 10.5,
+                weight: .medium,
+                color: qualityRecognitionStatusColor(job)
+            ))
+        }
         title.addArrangedSubview(NSView())
         title.addArrangedSubview(panelLabel(savedTranscriptDateText(issue.date),
                                             size: 10.5,
@@ -23192,6 +23833,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             usesDarkAppearance: usesDarkPanelAppearance,
             style: .secondary
         )
+        retry.isEnabled = issue.qualityRecognitionJob?.state.isPending != true
         actions.addArrangedSubview(retry)
         content.addArrangedSubview(actions)
         pin(content, inside: card, horizontal: 16, vertical: 12)
@@ -23223,7 +23865,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                                               color: .secondaryLabelColor))
         header.addArrangedSubview(heading)
         header.addArrangedSubview(NSView())
-        if transcript.needsRecognitionRetry, let retryURL = transcript.retryAudioURL {
+        if let retryURL = transcript.recordingAudioURL ?? transcript.retryAudioURL {
             let retry = SavedAudioActionButton(
                 title: t("Распознать снова", "Recognize Again"),
                 audioURL: retryURL,
@@ -23234,11 +23876,21 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             )
             retry.toolTip = t("Повторно распознать сохранённую аудиозапись",
                               "Recognize the saved audio recording again")
+            retry.isEnabled = transcript.qualityRecognitionJob?.state.isPending != true
             header.addArrangedSubview(retry)
         }
         root.addArrangedSubview(header)
 
-        if transcript.needsRecognitionRetry {
+        if let job = transcript.qualityRecognitionJob {
+            let status = panelLabel(
+                qualityRecognitionStatusText(job),
+                size: 11,
+                weight: .medium,
+                color: qualityRecognitionStatusColor(job)
+            )
+            status.maximumNumberOfLines = 2
+            root.addArrangedSubview(status)
+        } else if transcript.needsRecognitionRetry {
             let warning = panelLabel(
                 t("Распознавание не завершено. Аудио сохранено на 7 дней.",
                   "Recognition was not completed. Audio is saved for 7 days."),
@@ -23477,8 +24129,8 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             weight: .semibold
         ))
         soundsHeader.addArrangedSubview(panelLabel(
-            t("Выберите отдельный звук завершения для каждого способа диктовки.",
-              "Choose a separate completion sound for each dictation mode."),
+            t("Выберите отдельный звук для каждого события. Новый звук сразу проигрывается.",
+              "Choose a separate sound for each event. A new choice plays immediately."),
             size: 12,
             color: .secondaryLabelColor
         ))
@@ -23486,6 +24138,15 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         let soundOptions = DictationCompletionSound.allCases.map {
             (language == .russian ? $0.displayName : $0.englishDisplayName, $0.rawValue)
         }
+        form.addArrangedSubview(popupRow(
+            title: t("Начало записи", "Recording starts"),
+            detail: t("Звук после успешного включения микрофона.",
+                      "Sound after the microphone starts successfully."),
+            selectedValue: draft.recordingStartSound.rawValue,
+            options: soundOptions,
+            action: #selector(selectCompletionSound(_:)),
+            tag: ControlPanelCompletionSoundKind.recordingStart.rawValue
+        ))
         form.addArrangedSubview(popupRow(
             title: t("Диктовка без Enter", "Dictation without Enter"),
             detail: t("Звук после вставки текста без Enter.",
@@ -23519,10 +24180,37 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             toolTip: t("При выборе звук сразу проигрывается.",
                        "The selected sound plays immediately.")
         ))
+        form.addArrangedSubview(popupRow(
+            title: t("Ошибка или нет речи", "Error or no speech"),
+            detail: t("Звук, если запись слишком короткая, распознавание или вставка не удались.",
+                      "Sound when the clip is too short or recognition/insertion fails."),
+            selectedValue: draft.recognitionErrorSound.rawValue,
+            options: soundOptions,
+            action: #selector(selectCompletionSound(_:)),
+            tag: ControlPanelCompletionSoundKind.recognitionError.rawValue
+        ))
+        form.addArrangedSubview(popupRow(
+            title: t("Полная отмена", "Full cancellation"),
+            detail: t("Звук после безвозвратной отмены текущей записи.",
+                      "Sound after permanently cancelling the current recording."),
+            selectedValue: draft.cancellationSound.rawValue,
+            options: soundOptions,
+            action: #selector(selectCompletionSound(_:)),
+            tag: ControlPanelCompletionSoundKind.cancellation.rawValue
+        ))
+        form.addArrangedSubview(popupRow(
+            title: t("Качественное распознавание готово", "Quality recognition complete"),
+            detail: t("Звук после успешной повторной обработки сохранённого аудио.",
+                      "Sound after saved audio is successfully reprocessed."),
+            selectedValue: draft.qualityRecognitionCompletionSound.rawValue,
+            options: soundOptions,
+            action: #selector(selectCompletionSound(_:)),
+            tag: ControlPanelCompletionSoundKind.qualityRecognition.rawValue
+        ))
         form.addArrangedSubview(sliderRow(
-            title: t("Громкость завершения", "Completion volume"),
-            detail: t("Общая громкость трёх выбранных звуков.",
-                      "Shared volume for the three selected sounds."),
+            title: t("Громкость звуков", "Sound volume"),
+            detail: t("Общая громкость всех событий MyDictate.",
+                      "Shared volume for every MyDictate event."),
             value: draft.completionSoundVolume * 100,
             minimum: 0,
             maximum: 100,
@@ -24963,6 +25651,34 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         return formatter.string(from: date)
     }
 
+    private func qualityRecognitionStatusText(_ job: QualityRecognitionJob) -> String {
+        switch job.state {
+        case .queued:
+            return t("В очереди", "Queued")
+        case .loadingModel:
+            return t("Загружаю Whisper Large V3 Turbo…", "Loading Whisper Large V3 Turbo…")
+        case .recognizing:
+            return t("Распознаю · \(job.progress)%", "Recognizing · \(job.progress)%")
+        case .cleaning:
+            return t("Очищаю и проверяю текст…", "Cleaning and checking text…")
+        case .completed:
+            return t("Качественное распознавание готово", "Quality recognition complete")
+        case .failed:
+            return t("Повторное распознавание не удалось", "Recognition failed")
+        }
+    }
+
+    private func qualityRecognitionStatusColor(_ job: QualityRecognitionJob) -> NSColor {
+        switch job.state {
+        case .queued, .loadingModel, .recognizing, .cleaning:
+            return .systemBlue
+        case .completed:
+            return .systemGreen
+        case .failed:
+            return .systemRed
+        }
+    }
+
     private func beginServiceOperation(_ operation: ControlPanelServiceOperation) {
         guard serviceOperation == nil else { return }
         serviceOperation = operation
@@ -25283,28 +25999,25 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
     }
 
     private func queueAudioForRetry(_ audioURL: URL) throws {
-        if audioURL.pathExtension.lowercased() == "sdaudio" {
-            return // The existing journal is already in the agent's queue.
-        }
-        let samples = try DictationArchive.loadRecordingAudio(from: audioURL)
-        _ = try PendingDictationRecovery.createRetryJournal(
-            samples: samples,
-            archiveBaseName: audioURL.deletingPathExtension().lastPathComponent
+        let playableURL = try playableAudioURL(for: audioURL)
+        _ = try DictationArchive.enqueueQualityRecognition(audioURL: playableURL)
+        DistributedNotificationCenter.default().post(
+            name: QUALITY_RECOGNITION_QUEUE_CHANGED_NOTIFICATION,
+            object: nil
         )
-    }
-
-    private func restartServiceForQueuedAudioRetry() {
-        settings.agentEnabled = true
-        _ = settings.refreshFromDisk()
-        beginServiceOperation(.restarting)
-        log("saved audio retry requested from archive window")
+        if !SuperDictateAgentService.isAgentRunning(), serviceOperation == nil {
+            settings.agentEnabled = true
+            _ = settings.refreshFromDisk()
+            beginServiceOperation(.starting)
+        }
+        log("saved audio queued for quality recognition")
     }
 
     @objc private func retrySavedAudioClicked(_ sender: SavedAudioActionButton) {
-        guard serviceOperation == nil else { return }
         do {
             try queueAudioForRetry(sender.audioURL)
-            restartServiceForQueuedAudioRetry()
+            lastRenderFingerprint = ""
+            refresh(force: true)
         } catch {
             showError(title: t("Не удалось подготовить аудио", "Could Not Prepare Audio"),
                       detail: error.localizedDescription)
@@ -25312,9 +26025,12 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
     }
 
     @objc private func retryAllSavedAudioRecognitionClicked(_ sender: NSButton) {
-        guard serviceOperation == nil else { return }
         let snapshot = currentSavedDictationSnapshot()
-        let urls = snapshot.transcripts.compactMap(\.retryAudioURL)
+        let urls = snapshot.transcripts
+            .filter {
+                $0.needsRecognitionRetry || $0.qualityRecognitionJob?.state == .failed
+            }
+            .compactMap(\.retryAudioURL)
             + snapshot.audioIssues.map(\.retryAudioURL)
         let uniqueURLs = Dictionary(uniqueKeysWithValues: urls.map {
             ($0.standardizedFileURL.path, $0)
@@ -25327,7 +26043,8 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             for url in uniqueURLs {
                 try queueAudioForRetry(url)
             }
-            restartServiceForQueuedAudioRetry()
+            lastRenderFingerprint = ""
+            refresh(force: true)
         } catch {
             showError(title: t("Не удалось подготовить аудио", "Could Not Prepare Audio"),
                       detail: error.localizedDescription)
@@ -25740,15 +26457,23 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
               let sound = DictationCompletionSound(rawValue: raw) else { return }
         var draft = settingsDraft ?? ControlPanelSettingsDraft(settings: settings)
         switch kind {
+        case .recordingStart:
+            draft.recordingStartSound = sound
         case .withoutEnter:
             draft.withoutEnterCompletionSound = sound
         case .withEnter:
             draft.withEnterCompletionSound = sound
         case .clipboardOnly:
             draft.clipboardCompletionSound = sound
+        case .recognitionError:
+            draft.recognitionErrorSound = sound
+        case .cancellation:
+            draft.cancellationSound = sound
+        case .qualityRecognition:
+            draft.qualityRecognitionCompletionSound = sound
         }
         settingsDraft = draft
-        Sounds.playCompletion(sound, volume: draft.completionSoundVolume)
+        Sounds.play(sound, volume: draft.completionSoundVolume)
         refreshSettingsWindow()
     }
 
@@ -25756,10 +26481,13 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         var draft = settingsDraft ?? ControlPanelSettingsDraft(settings: settings)
         draft.completionSoundVolume = min(1, max(0, sender.doubleValue / 100))
         settingsDraft = draft
-        let preview = draft.clipboardCompletionSound == .none
-            ? DictationCompletionSound.pop
-            : draft.clipboardCompletionSound
-        Sounds.playCompletion(preview, volume: draft.completionSoundVolume)
+        let preview = [
+            draft.clipboardCompletionSound,
+            draft.withoutEnterCompletionSound,
+            draft.recordingStartSound,
+            .pop,
+        ].first(where: { $0 != .none }) ?? .pop
+        Sounds.play(preview, volume: draft.completionSoundVolume)
         refreshSettingsWindow()
     }
 
@@ -25787,14 +26515,21 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         settings.recordingHUDTranscribingColor = draft.transcribingColor
         settings.recordingHUDBackgroundStyle = draft.backgroundStyle
         settings.recordingHUDSize = draft.hudSize
+        settings.recordingStartSound = draft.recordingStartSound
         settings.withoutEnterCompletionSound = draft.withoutEnterCompletionSound
         settings.withEnterCompletionSound = draft.withEnterCompletionSound
         settings.clipboardCompletionSound = draft.clipboardCompletionSound
+        settings.recognitionErrorSound = draft.recognitionErrorSound
+        settings.cancellationSound = draft.cancellationSound
+        settings.qualityRecognitionCompletionSound = draft.qualityRecognitionCompletionSound
         settings.completionSoundVolume = draft.completionSoundVolume
         settings.clipboardCompletionVisibleSeconds = draft.clipboardCompletionVisibleSeconds
         settings.agentEnabled = true
         _ = settings.refreshFromDisk()
         settingsDraft = ControlPanelSettingsDraft(settings: settings)
+        settingsWindow?.close()
+        window?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
         beginServiceOperation(.applyingSettings)
     }
 

@@ -16,12 +16,13 @@ fail() { printf '\033[1;31mMyDictate:\033[0m %s\n' "$*" >&2; exit 1; }
 WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/mydictate-install.XXXXXX")"
 trap 'rm -rf "$WORK_DIR"' EXIT
 BUILT_APP="$WORK_DIR/MyDictate.app"
+EXPECTED_VERSION="$(plutil -extract CFBundleShortVersionString raw -o - "$ROOT_DIR/swift/Info.plist")"
 
 say "Собираю локальную версию из этого проекта…"
 "$ROOT_DIR/scripts/build-app.sh" "$BUILT_APP"
 
 [[ -x "$BUILT_APP/Contents/MacOS/MyDictate" ]] || fail "Сборка не создала MyDictate."
-[[ "$(plutil -extract CFBundleShortVersionString raw -o - "$BUILT_APP/Contents/Info.plist")" == "1.0.10" ]] \
+[[ "$(plutil -extract CFBundleShortVersionString raw -o - "$BUILT_APP/Contents/Info.plist")" == "$EXPECTED_VERSION" ]] \
     || fail "Неожиданная версия приложения."
 codesign --verify --deep --strict "$BUILT_APP" || fail "Проверка подписи не прошла."
 
@@ -44,4 +45,4 @@ rm -rf "$BACKUP"
 if [[ "$NO_OPEN" != "1" ]]; then
     open "$APP_PATH"
 fi
-say "Готово. Установлена MyDictate 1.0.10."
+say "Готово. Установлена MyDictate $EXPECTED_VERSION."
