@@ -105,7 +105,8 @@ let RECORDING_HUD_ANIMATE_IN_SECONDS: TimeInterval = 0.32
 let RECORDING_HUD_ANIMATE_OUT_SECONDS: TimeInterval = 0.23
 let RECORDING_HUD_TRANSCRIBING_RESOLVE_SECONDS: TimeInterval = 0.20
 let RECORDING_HUD_TRANSCRIBING_MIN_VISIBLE_SECONDS: TimeInterval = 0.24
-let RECORDING_HUD_COMPLETED_VISIBLE_SECONDS: TimeInterval = 1.8
+let RECORDING_HUD_TRANSIENT_STATUS_VISIBLE_SECONDS: TimeInterval = 1.8
+let DEFAULT_RECORDING_HUD_COMPLETED_VISIBLE_SECONDS: TimeInterval = 5
 let RECORDING_HUD_PROGRESS_MINIMUM_RECORDING_SECONDS: TimeInterval = 60
 let RECORDING_HUD_TARGET_REFRESH_INTERVAL: TimeInterval = 0.16
 let RECORDING_HUD_TARGET_FOLLOW_RESPONSE: CGFloat = 22
@@ -2621,6 +2622,32 @@ extension ISO8601DateFormatter {
 // by each getter when the key is missing, rather than via a central
 // `register()` call.
 
+enum DictationCompletionSound: String, CaseIterable, Sendable {
+    case none = ""
+    case basso = "Basso"
+    case blow = "Blow"
+    case bottle = "Bottle"
+    case frog = "Frog"
+    case funk = "Funk"
+    case glass = "Glass"
+    case hero = "Hero"
+    case morse = "Morse"
+    case ping = "Ping"
+    case pop = "Pop"
+    case purr = "Purr"
+    case sosumi = "Sosumi"
+    case submarine = "Submarine"
+    case tink = "Tink"
+
+    var displayName: String {
+        self == .none ? "Без звука" : rawValue
+    }
+
+    var englishDisplayName: String {
+        self == .none ? "No sound" : rawValue
+    }
+}
+
 final class Settings: @unchecked Sendable {
     private static let keyHotkeyKeycode = "hotkey_keycode"
     private static let keyHotkeyModifiers = "hotkey_modifiers"
@@ -2646,6 +2673,11 @@ final class Settings: @unchecked Sendable {
     private static let legacyKeyShowRecordingIndicator = "show_recording_indicator"
     private static let keyMuteWhileRecording = "mute_while_recording"
     private static let keyPlayFeedbackSounds = "play_feedback_sounds"
+    private static let keyWithoutEnterCompletionSound = "without_enter_completion_sound"
+    private static let keyWithEnterCompletionSound = "with_enter_completion_sound"
+    private static let keyClipboardCompletionSound = "clipboard_completion_sound"
+    private static let keyCompletionSoundVolume = "completion_sound_volume"
+    private static let keyClipboardCompletionVisibleSeconds = "clipboard_completion_visible_seconds"
     private static let keyShowInDock = "show_in_dock"
     private static let keyInputDevice = "input_device"
     private static let keyCheckForUpdates = "check_for_updates"
@@ -3038,6 +3070,55 @@ final class Settings: @unchecked Sendable {
             return defaults.bool(forKey: Self.keyPlayFeedbackSounds)
         }
         set { defaults.set(newValue, forKey: Self.keyPlayFeedbackSounds) }
+    }
+
+    private func completionSound(forKey key: String) -> DictationCompletionSound {
+        if let raw = defaults.string(forKey: key),
+           let sound = DictationCompletionSound(rawValue: raw) {
+            return sound
+        }
+        return .pop
+    }
+
+    var withoutEnterCompletionSound: DictationCompletionSound {
+        get { completionSound(forKey: Self.keyWithoutEnterCompletionSound) }
+        set { defaults.set(newValue.rawValue, forKey: Self.keyWithoutEnterCompletionSound) }
+    }
+
+    var withEnterCompletionSound: DictationCompletionSound {
+        get { completionSound(forKey: Self.keyWithEnterCompletionSound) }
+        set { defaults.set(newValue.rawValue, forKey: Self.keyWithEnterCompletionSound) }
+    }
+
+    var clipboardCompletionSound: DictationCompletionSound {
+        get { completionSound(forKey: Self.keyClipboardCompletionSound) }
+        set { defaults.set(newValue.rawValue, forKey: Self.keyClipboardCompletionSound) }
+    }
+
+    var completionSoundVolume: Double {
+        get {
+            guard defaults.object(forKey: Self.keyCompletionSoundVolume) != nil else {
+                return 0.75
+            }
+            return min(1, max(0, defaults.double(forKey: Self.keyCompletionSoundVolume)))
+        }
+        set {
+            defaults.set(min(1, max(0, newValue)),
+                         forKey: Self.keyCompletionSoundVolume)
+        }
+    }
+
+    var clipboardCompletionVisibleSeconds: TimeInterval {
+        get {
+            guard defaults.object(forKey: Self.keyClipboardCompletionVisibleSeconds) != nil else {
+                return DEFAULT_RECORDING_HUD_COMPLETED_VISIBLE_SECONDS
+            }
+            return min(10, max(0, defaults.double(forKey: Self.keyClipboardCompletionVisibleSeconds)))
+        }
+        set {
+            defaults.set(min(10, max(0, newValue.rounded())),
+                         forKey: Self.keyClipboardCompletionVisibleSeconds)
+        }
     }
 
     var showInDock: Bool {
@@ -7741,15 +7822,15 @@ private func systemAudioMuteWatchdogScript() -> String {
 
 // MARK: - Sounds
 //
-// Short system sounds: Tink on recording start, Pop after a
-// successful paste, Basso when a dictation is dropped. Loaded from
-// /System/Library/Sounds so we don't have to bundle audio resources.
+// Short system sounds loaded from /System/Library/Sounds so we don't
+// have to bundle audio resources. Start and error keep their existing
+// cues; each successful completion mode has its own user-selected sound.
 
 @MainActor
 enum Sounds {
     private static let start = systemSound("Tink", volume: 0.55)
-    private static let done = systemSound("Pop", volume: 0.45)
     private static let error = systemSound("Basso", volume: 0.30)
+    private static var completionSounds: [String: NSSound] = [:]
 
     private static func systemSound(_ name: String, volume: Float) -> NSSound? {
         let path = "/System/Library/Sounds/\(name).aiff"
@@ -7759,8 +7840,23 @@ enum Sounds {
     }
 
     static func playStart() { start?.stop(); start?.play() }
-    static func playDone()  { done?.stop();  done?.play() }
     static func playError() { error?.stop(); error?.play() }
+
+    static func playCompletion(_ choice: DictationCompletionSound,
+                               volume: Double) {
+        guard choice != .none else { return }
+        let sound: NSSound
+        if let cached = completionSounds[choice.rawValue] {
+            sound = cached
+        } else {
+            guard let loaded = systemSound(choice.rawValue, volume: 1) else { return }
+            completionSounds[choice.rawValue] = loaded
+            sound = loaded
+        }
+        sound.stop()
+        sound.volume = Float(min(1, max(0, volume)))
+        sound.play()
+    }
 }
 
 // MARK: - Bundle version helpers
@@ -8964,6 +9060,18 @@ private func shouldPressEnterAfterDictation(shortcut: DictationReleaseShortcut) 
 
 private func shouldInsertAfterDictation(shortcut: DictationReleaseShortcut) -> Bool {
     shortcut != .clipboardOnly
+}
+
+private func completionSound(for shortcut: DictationReleaseShortcut,
+                             settings: Settings) -> DictationCompletionSound {
+    switch shortcut {
+    case .standard:
+        return settings.withoutEnterCompletionSound
+    case .alternate:
+        return settings.withEnterCompletionSound
+    case .clipboardOnly:
+        return settings.clipboardCompletionSound
+    }
 }
 
 @MainActor
@@ -11796,8 +11904,9 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         stopRecordingHUDMotion()
     }
 
-    private func showTransientHUDCompletion(_ text: String? = nil) {
-        guard settings.showRecordingWaveform else {
+    private func showTransientHUDCompletion(_ text: String? = nil,
+                                            visibleSeconds: TimeInterval) {
+        guard settings.showRecordingWaveform, visibleSeconds > 0 else {
             hideRecordingHUD()
             return
         }
@@ -11809,7 +11918,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         recordingHUDCompletionWorkItem?.cancel()
         recordingHUDCompletionWorkItem = workItem
-        DispatchQueue.main.asyncAfter(deadline: .now() + RECORDING_HUD_COMPLETED_VISIBLE_SECONDS,
+        DispatchQueue.main.asyncAfter(deadline: .now() + visibleSeconds,
                                       execute: workItem)
     }
 
@@ -12379,7 +12488,9 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             hideRecordingHUD()
             return
         }
-        showTransientHUDCompletion()
+        showTransientHUDCompletion(
+            visibleSeconds: settings.clipboardCompletionVisibleSeconds
+        )
     }
 
     // Visible + audible cue that a press produced no pasted text — the
@@ -12694,9 +12805,10 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                                 }
                                 enterDelaySeconds = ProcessInfo.processInfo.systemUptime - enterDelayStartedAt
                             }
-                            if settings.playFeedbackSounds {
-                                Sounds.playDone()
-                            }
+                            Sounds.playCompletion(
+                                completionSound(for: shortcut, settings: settings),
+                                volume: settings.completionSoundVolume
+                            )
                             shouldShowClipboardCompletion = shortcut == .clipboardOnly
                         } else {
                             log(shouldInsertAfterRecognition
@@ -12946,7 +13058,8 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         setMenuBarState(.idle)
         rebuildMenu()
         showTransientHUDCompletion(
-            settings.interfaceLanguage == .english ? "Canceled" : "Отменено"
+            settings.interfaceLanguage == .english ? "Canceled" : "Отменено",
+            visibleSeconds: RECORDING_HUD_TRANSIENT_STATUS_VISIBLE_SECONDS
         )
         log("recording canceled deliberately (\(reason)); \(captured.samples.count) samples discarded")
 
@@ -14484,6 +14597,9 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 "Recording waveform: \(settings.showRecordingWaveform)",
                 "Mute while recording: \(settings.muteWhileRecording)",
                 "Feedback sounds: \(settings.playFeedbackSounds)",
+                "Completion sounds: standard=\(settings.withoutEnterCompletionSound.rawValue), enter=\(settings.withEnterCompletionSound.rawValue), clipboard=\(settings.clipboardCompletionSound.rawValue)",
+                "Completion sound volume: \(Int((settings.completionSoundVolume * 100).rounded()))%",
+                "Clipboard completion visible: \(Int(settings.clipboardCompletionVisibleSeconds.rounded())) s",
                 "Show in Dock: \(settings.showInDock)",
                 "Launch at Login: \(launchAtLoginText)",
             ],
@@ -14958,7 +15074,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         mute.state = settings.muteWhileRecording ? .on : .off
         sub.addItem(mute)
 
-        let sounds = NSMenuItem(title: "Play feedback sounds",
+        let sounds = NSMenuItem(title: "Play recording start and error sounds",
                                 action: #selector(toggleFeedbackSounds(_:)),
                                 keyEquivalent: "")
         sounds.target = self
@@ -17112,6 +17228,8 @@ private enum ParakeySelfTest {
             return runSuite("model-status", testSpeechModelStartupStatus)
         case "whisper-quality":
             return runSuite("whisper-quality", testWhisperTranscriptQuality)
+        case "completion-sounds":
+            return runSuite("completion-sounds", testCompletionSoundCatalog)
         case "audio-route":
             return runSuite("audio-route", testAudioRouteChangeDecision)
         case "recording-lifecycle":
@@ -17193,6 +17311,7 @@ private enum ParakeySelfTest {
         try testAudioInputDeviceFiltering()
         try testSpeechModelStartupStatus()
         try testWhisperTranscriptQuality()
+        try testCompletionSoundCatalog()
         try testAudioRouteChangeDecision()
         try testRecordingLifecycle()
         try testPowerStateRecoveryDecision()
@@ -17202,6 +17321,19 @@ private enum ParakeySelfTest {
         try testPrivateLogAppend()
         try testDiagnostics()
         try testInsertionTargetTracking()
+    }
+
+    private static func testCompletionSoundCatalog() throws {
+        let sounds = DictationCompletionSound.allCases
+        try expect(sounds.count, equals: 15,
+                   "completion sound catalog should contain None plus 14 macOS sounds")
+        try expect(Set(sounds.map(\.rawValue)).count, equals: sounds.count,
+                   "completion sound identifiers should be unique")
+        for sound in sounds where sound != .none {
+            let path = "/System/Library/Sounds/\(sound.rawValue).aiff"
+            try expect(FileManager.default.fileExists(atPath: path), equals: true,
+                       "completion sound should exist: \(sound.rawValue)")
+        }
     }
 
     private static func testInsertionTargetTracking() throws {
@@ -21565,11 +21697,25 @@ private enum ControlPanelServiceOperation: String, Sendable {
     case switchingModel
 }
 
+private struct ControlPanelServicePresentation {
+    let status: String
+    let detail: String
+    let color: NSColor
+    let detailColor: NSColor
+    let showsSpinner: Bool
+}
+
 private enum ControlPanelShortcutKind: Int {
     case withoutEnter = 0
     case withEnter = 1
     case clipboardOnly = 2
     case cancel = 3
+}
+
+private enum ControlPanelCompletionSoundKind: Int {
+    case withoutEnter = 0
+    case withEnter = 1
+    case clipboardOnly = 2
 }
 
 private struct ControlPanelSettingsDraft: Equatable {
@@ -21582,6 +21728,11 @@ private struct ControlPanelSettingsDraft: Equatable {
     var transcribingColor: RecordingHUDAccentColor
     var backgroundStyle: RecordingHUDBackgroundStyle
     var hudSize: RecordingHUDSize
+    var withoutEnterCompletionSound: DictationCompletionSound
+    var withEnterCompletionSound: DictationCompletionSound
+    var clipboardCompletionSound: DictationCompletionSound
+    var completionSoundVolume: Double
+    var clipboardCompletionVisibleSeconds: TimeInterval
 
     init(settings: Settings) {
         hotkeyWithoutEnter = settings.configuredHotkey
@@ -21593,6 +21744,11 @@ private struct ControlPanelSettingsDraft: Equatable {
         transcribingColor = settings.recordingHUDTranscribingColor
         backgroundStyle = settings.recordingHUDBackgroundStyle
         hudSize = settings.recordingHUDSize
+        withoutEnterCompletionSound = settings.withoutEnterCompletionSound
+        withEnterCompletionSound = settings.withEnterCompletionSound
+        clipboardCompletionSound = settings.clipboardCompletionSound
+        completionSoundVolume = settings.completionSoundVolume
+        clipboardCompletionVisibleSeconds = settings.clipboardCompletionVisibleSeconds
     }
 }
 
@@ -22141,6 +22297,8 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
     private var dictationHelpWindow: NSWindow?
     private var refreshTimer: Timer?
     private var serviceOperation: ControlPanelServiceOperation?
+    private var serviceOperationStartedAt: TimeInterval?
+    private var serviceOperationFailure: String?
     private var updateTask: Task<Void, Never>?
     private var updateState: ControlPanelUpdateState = .checking
     private var lastRenderFingerprint = ""
@@ -22212,6 +22370,16 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                 NSApp.appearance = NSAppearance(named: .darkAqua)
             } else if DESIGN_PREVIEW_LIGHT_MODE {
                 NSApp.appearance = NSAppearance(named: .aqua)
+            }
+            if let rawOperation = ProcessInfo.processInfo.environment[
+                "MYDICTATE_DESIGN_PREVIEW_SERVICE_OPERATION"
+            ],
+               let previewOperation = ControlPanelServiceOperation(rawValue: rawOperation) {
+                serviceOperation = previewOperation
+                let elapsed = ProcessInfo.processInfo.environment[
+                    "MYDICTATE_DESIGN_PREVIEW_SERVICE_SLOW"
+                ] == "1" ? 15.0 : 0
+                serviceOperationStartedAt = Date().timeIntervalSince1970 - elapsed
             }
             showWindow()
             startRefreshTimer()
@@ -22419,7 +22587,12 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         let permissions = Permission.allCases.map { Permissions.isGranted($0) ? "1" : "0" }.joined()
         let stateToken: String
         if serviceOperation != nil {
-            stateToken = "operation"
+            stateToken = [
+                "operation",
+                state?.status ?? "none",
+                state?.detail ?? "",
+                serviceOperationIsSlow ? "slow" : "normal",
+            ].joined(separator: "|")
         } else {
             stateToken = [state?.status ?? "none",
                           state?.detail ?? "",
@@ -22429,6 +22602,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         return [language.rawValue,
                 usesDarkPanelAppearance ? "dark" : "light",
                 serviceOperation?.rawValue ?? "idle",
+                serviceOperationFailure ?? "",
                 updateStateFingerprint(),
                 SuperDictateAgentService.isAgentRunning() ? "running" : "stopped",
                 stateToken,
@@ -22538,16 +22712,13 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         header.orientation = .horizontal
         header.alignment = .centerY
         header.spacing = 12
-        header.addArrangedSubview(panelSymbol("cpu",
-                                              color: panelAccentColor,
-                                              description: nil,
-                                              pointSize: 24))
         if isSwitchingModel {
-            let spinner = NSProgressIndicator()
-            spinner.style = .spinning
-            spinner.controlSize = .small
-            spinner.startAnimation(nil)
-            header.addArrangedSubview(spinner)
+            header.addArrangedSubview(serviceProgressIndicator())
+        } else {
+            header.addArrangedSubview(panelSymbol("cpu",
+                                                  color: panelAccentColor,
+                                                  description: nil,
+                                                  pointSize: 24))
         }
         let headerText = NSStackView()
         headerText.orientation = .vertical
@@ -22558,16 +22729,29 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             size: 20,
             weight: .semibold
         ))
-        headerText.addArrangedSubview(panelLabel(
-            isSwitchingModel
-                ? t("Переключаю модель и перезапускаю службу…",
-                    "Switching the model and restarting the service…")
-                : t("Выберите модель — MyDictate переключится автоматически.",
-                    "Choose a model — MyDictate switches automatically."),
-            size: isSwitchingModel ? 13 : 11.5,
-            weight: isSwitchingModel ? .semibold : .regular,
-            color: isSwitchingModel ? .systemOrange : .secondaryLabelColor
-        ))
+        if isSwitchingModel {
+            let state = AgentRuntimeStateStore.read()
+            let stage = state.map {
+                localizedStartupStage($0.detail, fallback: .switchingModel)
+            } ?? operationTitle(.switchingModel)
+            headerText.addArrangedSubview(panelLabel(stage,
+                                                     size: 12,
+                                                     weight: .semibold,
+                                                     color: .systemBlue))
+            headerText.addArrangedSubview(panelLabel(
+                operationUnavailableDetail(),
+                size: 11,
+                weight: .medium,
+                color: .systemRed
+            ))
+        } else {
+            headerText.addArrangedSubview(panelLabel(
+                t("Выберите модель — MyDictate переключится автоматически.",
+                  "Choose a model — MyDictate switches automatically."),
+                size: 11.5,
+                color: .secondaryLabelColor
+            ))
+        }
         header.addArrangedSubview(headerText)
         header.addArrangedSubview(NSView())
         root.addArrangedSubview(header)
@@ -22657,7 +22841,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             size: 11,
             weight: .semibold,
             color: selected && isSwitchingModel
-                ? .systemOrange
+                ? .systemBlue
                 : (selected ? panelAccentColor : .secondaryLabelColor)
         )
         badge.setContentHuggingPriority(.required, for: .horizontal)
@@ -23283,6 +23467,82 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                        "Assign a separate shortcut that permanently cancels the current recording.")
         ))
         form.addArrangedSubview(separator())
+        let soundsHeader = NSStackView()
+        soundsHeader.orientation = .vertical
+        soundsHeader.alignment = .leading
+        soundsHeader.spacing = 3
+        soundsHeader.addArrangedSubview(panelLabel(
+            t("Звуки и уведомления", "Sounds and notifications"),
+            size: 13,
+            weight: .semibold
+        ))
+        soundsHeader.addArrangedSubview(panelLabel(
+            t("Выберите отдельный звук завершения для каждого способа диктовки.",
+              "Choose a separate completion sound for each dictation mode."),
+            size: 12,
+            color: .secondaryLabelColor
+        ))
+        form.addArrangedSubview(soundsHeader)
+        let soundOptions = DictationCompletionSound.allCases.map {
+            (language == .russian ? $0.displayName : $0.englishDisplayName, $0.rawValue)
+        }
+        form.addArrangedSubview(popupRow(
+            title: t("Диктовка без Enter", "Dictation without Enter"),
+            detail: t("Звук после вставки текста без Enter.",
+                      "Sound after inserting text without Enter."),
+            selectedValue: draft.withoutEnterCompletionSound.rawValue,
+            options: soundOptions,
+            action: #selector(selectCompletionSound(_:)),
+            tag: ControlPanelCompletionSoundKind.withoutEnter.rawValue,
+            toolTip: t("При выборе звук сразу проигрывается.",
+                       "The selected sound plays immediately.")
+        ))
+        form.addArrangedSubview(popupRow(
+            title: t("Завершить с Enter", "Finish with Enter"),
+            detail: t("Звук после вставки текста и отправки Enter.",
+                      "Sound after inserting text and sending Enter."),
+            selectedValue: draft.withEnterCompletionSound.rawValue,
+            options: soundOptions,
+            action: #selector(selectCompletionSound(_:)),
+            tag: ControlPanelCompletionSoundKind.withEnter.rawValue,
+            toolTip: t("При выборе звук сразу проигрывается.",
+                       "The selected sound plays immediately.")
+        ))
+        form.addArrangedSubview(popupRow(
+            title: t("Только в буфер обмена", "Clipboard only"),
+            detail: t("Звук, когда распознанный текст готов в буфере.",
+                      "Sound when recognized text is ready in the clipboard."),
+            selectedValue: draft.clipboardCompletionSound.rawValue,
+            options: soundOptions,
+            action: #selector(selectCompletionSound(_:)),
+            tag: ControlPanelCompletionSoundKind.clipboardOnly.rawValue,
+            toolTip: t("При выборе звук сразу проигрывается.",
+                       "The selected sound plays immediately.")
+        ))
+        form.addArrangedSubview(sliderRow(
+            title: t("Громкость завершения", "Completion volume"),
+            detail: t("Общая громкость трёх выбранных звуков.",
+                      "Shared volume for the three selected sounds."),
+            value: draft.completionSoundVolume * 100,
+            minimum: 0,
+            maximum: 100,
+            tickMarks: 0,
+            valueText: "\(Int((draft.completionSoundVolume * 100).rounded()))%",
+            action: #selector(changeCompletionSoundVolume(_:))
+        ))
+        let visibleSeconds = Int(draft.clipboardCompletionVisibleSeconds.rounded())
+        form.addArrangedSubview(sliderRow(
+            title: t("Показывать «Готово»", "Show “Done”"),
+            detail: t("Сколько секунд держать подтверждение для режима буфера. 0 — не показывать.",
+                      "How long to show clipboard confirmation. 0 disables it."),
+            value: Double(visibleSeconds),
+            minimum: 0,
+            maximum: 10,
+            tickMarks: 11,
+            valueText: language == .russian ? "\(visibleSeconds) с" : "\(visibleSeconds) s",
+            action: #selector(changeClipboardCompletionDuration(_:))
+        ))
+        form.addArrangedSubview(separator())
         form.addArrangedSubview(popupRow(
             title: t("Размер капсулы", "Capsule size"),
             detail: t("Размер плавающего индикатора записи.",
@@ -23458,19 +23718,24 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         row.spacing = 12
         row.translatesAutoresizingMaskIntoConstraints = false
 
-        let icon = panelSymbol(running ? "waveform.circle.fill" : "waveform.circle",
-                               color: presentation.color,
-                               description: t("Состояние службы", "Service status"),
-                               pointSize: 25)
+        let icon = presentation.showsSpinner
+            ? serviceProgressIndicator()
+            : panelSymbol(running ? "waveform.circle.fill" : "waveform.circle",
+                          color: presentation.color,
+                          description: t("Состояние службы", "Service status"),
+                          pointSize: 25)
         let text = NSStackView()
         text.orientation = .vertical
         text.alignment = .leading
         text.spacing = 2
         text.setContentHuggingPriority(.defaultLow, for: .horizontal)
         text.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        let status = panelLabel(presentation.status, size: 14.5, weight: .semibold)
-        status.maximumNumberOfLines = 1
-        status.lineBreakMode = .byTruncatingTail
+        let status = panelLabel(presentation.status,
+                                size: 14.5,
+                                weight: .semibold,
+                                color: presentation.color)
+        status.maximumNumberOfLines = 2
+        status.lineBreakMode = .byWordWrapping
         status.preferredMaxLayoutWidth = 330
         status.setContentHuggingPriority(.defaultLow, for: .horizontal)
         status.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
@@ -23490,9 +23755,9 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         } else {
             serviceDetail = presentation.detail
         }
-        let detail = panelLabel(serviceDetail, size: 11.5, color: .secondaryLabelColor)
-        detail.maximumNumberOfLines = 1
-        detail.lineBreakMode = .byTruncatingTail
+        let detail = panelLabel(serviceDetail, size: 11.5, color: presentation.detailColor)
+        detail.maximumNumberOfLines = 2
+        detail.lineBreakMode = .byWordWrapping
         detail.preferredMaxLayoutWidth = 330
         detail.setContentHuggingPriority(.defaultLow, for: .horizontal)
         detail.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
@@ -23523,10 +23788,15 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             ))
         } else {
             actions.addArrangedSubview(compactIconButton(
-                symbol: "play.fill",
-                accessibilityTitle: t("Запустить службу", "Start Service"),
-                toolTip: t("Запустить фоновую службу диктовки",
-                           "Start the background dictation service"),
+                symbol: serviceOperationFailure == nil ? "play.fill" : "arrow.clockwise",
+                accessibilityTitle: serviceOperationFailure == nil
+                    ? t("Запустить службу", "Start Service")
+                    : t("Повторить запуск", "Retry Startup"),
+                toolTip: serviceOperationFailure == nil
+                    ? t("Запустить фоновую службу диктовки",
+                        "Start the background dictation service")
+                    : t("Повторить запуск фоновой службы",
+                        "Retry starting the background service"),
                 action: #selector(startAgentClicked(_:)),
                 enabled: enabled
             ))
@@ -23555,7 +23825,8 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             detail: settings.speechModelProfile.shortName,
             accessibilityTitle: t("Выбрать модель распознавания",
                                   "Choose recognition model"),
-            action: #selector(openModelSelectionClicked(_:))
+            action: #selector(openModelSelectionClicked(_:)),
+            enabled: serviceOperation == nil
         )
 
         let snapshot = currentSavedDictationSnapshot(maximumLoadedTranscripts: 0)
@@ -23710,7 +23981,8 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                     t("MyDictate актуален", "MyDictate is up to date"),
                     t("Установлена последняя версия v\(currentBundleVersion())",
                       "Latest version v\(currentBundleVersion()) is installed"),
-                    t("Проверить", "Check"), #selector(updateButtonClicked(_:)), true,
+                    t("Проверить", "Check"), #selector(updateButtonClicked(_:)),
+                    serviceOperation == nil,
                     t("Проверить GitHub Releases ещё раз", "Check GitHub Releases again"))
         case .available(let release):
             if DESIGN_PREVIEW_MODE {
@@ -23736,7 +24008,8 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             return ("exclamationmark.triangle.fill", .systemRed,
                     t("Обновление не проверено", "Update check failed"),
                     message,
-                    t("Повторить", "Retry"), #selector(updateButtonClicked(_:)), true,
+                    t("Повторить", "Retry"), #selector(updateButtonClicked(_:)),
+                    serviceOperation == nil,
                     t("Повторить проверку обновлений", "Retry the update check"))
         }
     }
@@ -23774,43 +24047,146 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         }
     }
 
-    private func operationDetail(_ operation: ControlPanelServiceOperation) -> String {
-        switch operation {
-        case .starting:
-            return t("Подключаю глобальный хоткей и локальную модель. Обычно 1–3 секунды; при первой загрузке дольше.",
-                     "Enabling the global shortcut and local model. Usually 1–3 seconds; the first download takes longer.")
-        case .restarting:
-            return t("Диктовка временно недоступна. Панель не зависла — новый воркер уже запускается.",
-                     "Dictation is temporarily unavailable. The panel is responsive while the new worker starts.")
-        case .applyingSettings:
-            return t("Перезапускаю службу. Диктовка временно недоступна.",
-                     "Restarting the service. Dictation is temporarily unavailable.")
-        case .switchingModel:
-            return t("Модель меняется, затем служба запустится заново. Панель не зависла.",
-                     "The model is changing, then the service will restart. The panel is still responsive.")
-        case .stopping:
-            return t("Хоткей перестанет работать, но настройки и история сохранятся.",
-                     "The shortcut will stop; settings and history remain saved.")
+    private var serviceOperationIsSlow: Bool {
+        guard let serviceOperationStartedAt else { return false }
+        return Date().timeIntervalSince1970 - serviceOperationStartedAt >= 12
+    }
+
+    private func operationUnavailableDetail() -> String {
+        if serviceOperationIsSlow {
+            return t("Диктовка временно недоступна · Запуск занимает больше времени, чем обычно.",
+                     "Dictation is temporarily unavailable · Startup is taking longer than usual.")
         }
+        return t("Диктовка временно недоступна · Дождитесь завершения.",
+                 "Dictation is temporarily unavailable · Please wait for completion.")
+    }
+
+    private func localizedStartupStage(_ raw: String,
+                                       fallback operation: ControlPanelServiceOperation) -> String {
+        let lower = raw.lowercased()
+        if lower.contains("checking speech model") {
+            return t("Проверяю файлы модели", "Checking model files")
+        }
+        if lower.contains("downloading speech model") {
+            let suffix = raw.split(separator: "…", maxSplits: 1)
+                .dropFirst()
+                .first
+                .map { "…\($0)" } ?? "…"
+            return t("Загружаю модель\(suffix)", "Downloading model\(suffix)")
+        }
+        if lower.contains("loading cached speech model") || lower.contains("loading speech model") {
+            return t("Загружаю локальную модель", "Loading local model")
+        }
+        if lower.contains("preparing speech model") || lower.contains("compiling") {
+            return t("Подготавливаю модель", "Preparing model")
+        }
+        if lower.contains("recovering interrupted dictation") {
+            return t("Восстанавливаю сохранённые диктовки", "Recovering saved dictations")
+        }
+        if lower.contains("starting audio input") {
+            return t("Запускаю микрофон", "Starting microphone input")
+        }
+        if lower.contains("retrying audio") {
+            return t("Повторно запускаю микрофон", "Retrying microphone input")
+        }
+        if lower.contains("starting hotkey") || lower.contains("finishing setup") {
+            return t("Подключаю горячие клавиши", "Enabling keyboard shortcuts")
+        }
+        if lower.contains("switching to") {
+            return t("Переключаю модель", "Switching model")
+        }
+        if lower.contains("falling back") {
+            return t("Возвращаю предыдущую модель", "Restoring the previous model")
+        }
+        if lower.contains("resetting speech model cache") {
+            return t("Очищаю файлы модели", "Resetting model files")
+        }
+        if lower.contains("waiting for system wake") {
+            return t("Ожидаю пробуждения Mac", "Waiting for the Mac to wake")
+        }
+        if lower.contains("restarting audio input") {
+            return t("Перезапускаю микрофон", "Restarting microphone input")
+        }
+        return operationTitle(operation)
     }
 
     private func servicePresentation(running: Bool,
-                                     state: AgentRuntimeState?) -> (status: String, detail: String, color: NSColor) {
+                                     state: AgentRuntimeState?) -> ControlPanelServicePresentation {
         if let operation = serviceOperation {
-            return (operationTitle(operation), operationDetail(operation), .systemBlue)
+            if operation == .stopping {
+                return ControlPanelServicePresentation(
+                    status: operationTitle(operation),
+                    detail: t("Хоткей перестанет работать, но настройки и история сохранятся.",
+                              "The shortcut will stop; settings and history remain saved."),
+                    color: .secondaryLabelColor,
+                    detailColor: .secondaryLabelColor,
+                    showsSpinner: true
+                )
+            }
+            let currentStage: String
+            if let state,
+               let serviceOperationStartedAt,
+               state.updatedAt >= serviceOperationStartedAt,
+               state.status == "starting" {
+                currentStage = localizedStartupStage(state.detail, fallback: operation)
+            } else {
+                currentStage = operationTitle(operation)
+            }
+            return ControlPanelServicePresentation(
+                status: currentStage,
+                detail: operationUnavailableDetail(),
+                color: .systemBlue,
+                detailColor: .systemRed,
+                showsSpinner: true
+            )
+        }
+        if let serviceOperationFailure, !running {
+            return ControlPanelServicePresentation(
+                status: t("Не удалось запустить службу", "Service failed to start"),
+                detail: serviceOperationFailure,
+                color: .systemRed,
+                detailColor: .systemRed,
+                showsSpinner: false
+            )
         }
         if running, let state {
-            return (displayStatus(state.status), localizedServiceDetail(state), colorForStatus(state.status))
+            if state.status == "starting" {
+                return ControlPanelServicePresentation(
+                    status: localizedStartupStage(state.detail, fallback: .starting),
+                    detail: t("Диктовка временно недоступна · Дождитесь завершения запуска.",
+                              "Dictation is temporarily unavailable · Wait for startup to finish."),
+                    color: .systemBlue,
+                    detailColor: .systemRed,
+                    showsSpinner: true
+                )
+            }
+            return ControlPanelServicePresentation(
+                status: displayStatus(state.status),
+                detail: localizedServiceDetail(state),
+                color: colorForStatus(state.status),
+                detailColor: state.status == "error" ? .systemRed : .secondaryLabelColor,
+                showsSpinner: state.status == "stopping"
+            )
         }
         if running {
-            return (t("Запускается", "Starting"),
-                    t("Фоновый процесс запущен и готовит модель.", "The background process is preparing the model."),
-                    .systemOrange)
+            return ControlPanelServicePresentation(
+                status: t("Запускаю службу", "Starting service"),
+                detail: t("Диктовка временно недоступна · Дождитесь завершения запуска.",
+                          "Dictation is temporarily unavailable · Wait for startup to finish."),
+                color: .systemBlue,
+                detailColor: .systemRed,
+                showsSpinner: true
+            )
         }
-        return (settings.agentEnabled ? t("Служба остановлена", "Service stopped") : t("Служба выключена", "Service off"),
-                t("Нажмите «Запустить службу».",
-                  "Click Start Service to begin."),
-                settings.agentEnabled ? .systemRed : .secondaryLabelColor)
+        return ControlPanelServicePresentation(
+            status: settings.agentEnabled ? t("Служба остановлена", "Service stopped")
+                                          : t("Служба выключена", "Service off"),
+            detail: t("Нажмите «Запустить службу».",
+                      "Click Start Service to begin."),
+            color: .secondaryLabelColor,
+            detailColor: .secondaryLabelColor,
+            showsSpinner: false
+        )
     }
 
     private func checkForUpdates() {
@@ -24041,6 +24417,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                           selectedValue: String,
                           options: [(title: String, value: String)],
                           action: Selector,
+                          tag: Int = 0,
                           toolTip: String? = nil) -> NSView {
         let row = NSStackView()
         row.orientation = .horizontal
@@ -24057,6 +24434,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         let popup = NSPopUpButton()
         popup.target = self
         popup.action = action
+        popup.tag = tag
         popup.isEnabled = true
         popup.toolTip = toolTip
         for option in options {
@@ -24071,6 +24449,56 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         row.addArrangedSubview(text)
         row.addArrangedSubview(NSView())
         row.addArrangedSubview(popup)
+        return row
+    }
+
+    private func sliderRow(title: String,
+                           detail: String,
+                           value: Double,
+                           minimum: Double,
+                           maximum: Double,
+                           tickMarks: Int,
+                           valueText: String,
+                           action: Selector) -> NSView {
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 14
+
+        let text = NSStackView()
+        text.orientation = .vertical
+        text.alignment = .leading
+        text.spacing = 3
+        text.addArrangedSubview(panelLabel(title, size: 13, weight: .semibold))
+        text.addArrangedSubview(panelLabel(detail, size: 12, color: .secondaryLabelColor))
+
+        let controls = NSStackView()
+        controls.orientation = .horizontal
+        controls.alignment = .centerY
+        controls.spacing = 8
+        let slider = NSSlider(value: value,
+                              minValue: minimum,
+                              maxValue: maximum,
+                              target: self,
+                              action: action)
+        slider.isContinuous = false
+        if tickMarks > 0 {
+            slider.numberOfTickMarks = tickMarks
+            slider.allowsTickMarkValuesOnly = true
+        }
+        slider.translatesAutoresizingMaskIntoConstraints = false
+        slider.widthAnchor.constraint(equalToConstant: 130).isActive = true
+        controls.addArrangedSubview(slider)
+        let valueLabel = panelLabel(valueText, size: 11.5, weight: .medium,
+                                    color: .secondaryLabelColor)
+        valueLabel.alignment = .right
+        valueLabel.setContentHuggingPriority(.required, for: .horizontal)
+        valueLabel.widthAnchor.constraint(greaterThanOrEqualToConstant: 42).isActive = true
+        controls.addArrangedSubview(valueLabel)
+
+        row.addArrangedSubview(text)
+        row.addArrangedSubview(NSView())
+        row.addArrangedSubview(controls)
         return row
     }
 
@@ -24271,8 +24699,10 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                                    title: String,
                                    detail: String,
                                    accessibilityTitle: String,
-                                   action: Selector) -> NSView {
+                                   action: Selector,
+                                   enabled: Bool = true) -> NSView {
         let card = DashboardLinkCard(usesDarkAppearance: usesDarkPanelAppearance)
+        card.alphaValue = enabled ? 1 : 0.58
         let row = NSStackView()
         row.orientation = .horizontal
         row.alignment = .centerY
@@ -24312,6 +24742,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         let button = NSButton(title: "", target: self, action: action)
         button.isBordered = false
         button.isTransparent = true
+        button.isEnabled = enabled
         button.setAccessibilityLabel(accessibilityTitle)
         button.toolTip = accessibilityTitle
         button.translatesAutoresizingMaskIntoConstraints = false
@@ -24335,6 +24766,35 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         view.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: pointSize, weight: .medium)
         view.setContentHuggingPriority(.required, for: .horizontal)
         return view
+    }
+
+    private func serviceProgressIndicator() -> NSView {
+        let container = NSView()
+        container.translatesAutoresizingMaskIntoConstraints = false
+        container.wantsLayer = true
+        container.layer?.cornerRadius = 15
+        container.layer?.cornerCurve = .continuous
+        container.layer?.borderWidth = 2
+        container.layer?.borderColor = NSColor.systemBlue.withAlphaComponent(0.30).cgColor
+        container.layer?.backgroundColor = NSColor.systemBlue.withAlphaComponent(
+            usesDarkPanelAppearance ? 0.12 : 0.07
+        ).cgColor
+
+        let spinner = NSProgressIndicator()
+        spinner.style = .spinning
+        spinner.controlSize = .small
+        spinner.isIndeterminate = true
+        spinner.translatesAutoresizingMaskIntoConstraints = false
+        spinner.startAnimation(nil)
+        container.addSubview(spinner)
+        NSLayoutConstraint.activate([
+            container.widthAnchor.constraint(equalToConstant: 30),
+            container.heightAnchor.constraint(equalToConstant: 30),
+            spinner.centerXAnchor.constraint(equalTo: container.centerXAnchor),
+            spinner.centerYAnchor.constraint(equalTo: container.centerYAnchor),
+        ])
+        container.setAccessibilityLabel(t("Выполняется операция", "Operation in progress"))
+        return container
     }
 
     private func pin(_ view: NSView,
@@ -24394,9 +24854,12 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
 
     private func colorForStatus(_ raw: String) -> NSColor {
         switch raw {
-        case "ready", "recording", "transcribing": return .systemGreen
-        case "starting", "needs_permissions", "stopping": return .systemOrange
-        case "error", "stopped": return .systemRed
+        case "ready": return .systemGreen
+        case "recording": return .systemRed
+        case "transcribing", "starting": return .systemBlue
+        case "needs_permissions": return .systemOrange
+        case "error": return .systemRed
+        case "stopping", "stopped": return .secondaryLabelColor
         default: return .secondaryLabelColor
         }
     }
@@ -24503,6 +24966,8 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
     private func beginServiceOperation(_ operation: ControlPanelServiceOperation) {
         guard serviceOperation == nil else { return }
         serviceOperation = operation
+        serviceOperationStartedAt = Date().timeIntervalSince1970
+        serviceOperationFailure = nil
         lastRenderFingerprint = ""
         refresh(force: true)
         let operationStartedAt = Date().timeIntervalSince1970
@@ -24529,6 +24994,8 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                 await self.waitForServiceResult(operation: operation, startedAt: operationStartedAt)
             }
             self.serviceOperation = nil
+            self.serviceOperationStartedAt = nil
+            self.serviceOperationFailure = failure
             self.lastRenderFingerprint = ""
             self.refresh(force: true)
             if let failure {
@@ -24542,7 +25009,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
 
     private func waitForServiceResult(operation: ControlPanelServiceOperation,
                                       startedAt: TimeInterval) async {
-        for _ in 0..<80 {
+        for _ in 0..<240 {
             let state = AgentRuntimeStateStore.read()
             if operation == .stopping {
                 if state?.status == "stopped" { return }
@@ -25267,6 +25734,42 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         refreshSettingsWindow()
     }
 
+    @objc private func selectCompletionSound(_ sender: NSPopUpButton) {
+        guard let kind = ControlPanelCompletionSoundKind(rawValue: sender.tag),
+              let raw = sender.selectedItem?.representedObject as? String,
+              let sound = DictationCompletionSound(rawValue: raw) else { return }
+        var draft = settingsDraft ?? ControlPanelSettingsDraft(settings: settings)
+        switch kind {
+        case .withoutEnter:
+            draft.withoutEnterCompletionSound = sound
+        case .withEnter:
+            draft.withEnterCompletionSound = sound
+        case .clipboardOnly:
+            draft.clipboardCompletionSound = sound
+        }
+        settingsDraft = draft
+        Sounds.playCompletion(sound, volume: draft.completionSoundVolume)
+        refreshSettingsWindow()
+    }
+
+    @objc private func changeCompletionSoundVolume(_ sender: NSSlider) {
+        var draft = settingsDraft ?? ControlPanelSettingsDraft(settings: settings)
+        draft.completionSoundVolume = min(1, max(0, sender.doubleValue / 100))
+        settingsDraft = draft
+        let preview = draft.clipboardCompletionSound == .none
+            ? DictationCompletionSound.pop
+            : draft.clipboardCompletionSound
+        Sounds.playCompletion(preview, volume: draft.completionSoundVolume)
+        refreshSettingsWindow()
+    }
+
+    @objc private func changeClipboardCompletionDuration(_ sender: NSSlider) {
+        var draft = settingsDraft ?? ControlPanelSettingsDraft(settings: settings)
+        draft.clipboardCompletionVisibleSeconds = min(10, max(0, sender.doubleValue.rounded()))
+        settingsDraft = draft
+        refreshSettingsWindow()
+    }
+
     @objc private func discardSettingsClicked(_ sender: NSButton) {
         settingsDraft = ControlPanelSettingsDraft(settings: settings)
         refreshSettingsWindow()
@@ -25284,6 +25787,11 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         settings.recordingHUDTranscribingColor = draft.transcribingColor
         settings.recordingHUDBackgroundStyle = draft.backgroundStyle
         settings.recordingHUDSize = draft.hudSize
+        settings.withoutEnterCompletionSound = draft.withoutEnterCompletionSound
+        settings.withEnterCompletionSound = draft.withEnterCompletionSound
+        settings.clipboardCompletionSound = draft.clipboardCompletionSound
+        settings.completionSoundVolume = draft.completionSoundVolume
+        settings.clipboardCompletionVisibleSeconds = draft.clipboardCompletionVisibleSeconds
         settings.agentEnabled = true
         _ = settings.refreshFromDisk()
         settingsDraft = ControlPanelSettingsDraft(settings: settings)
