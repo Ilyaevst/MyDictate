@@ -123,7 +123,13 @@ let AUDIO_START_RETRY_DELAYS_SECONDS: [UInt64] = [1, 3, 8]
 let AUDIO_IDLE_STOP_DELAY_SECONDS: TimeInterval = 5
 let AUDIO_CONFIGURATION_CHANGE_SUPPRESSION_SECONDS: TimeInterval = 1
 let MODEL_DOWNLOAD_HEADROOM_BYTES: Int64 = 500 * 1024 * 1024
-let WHISPER_TECHNICAL_PROMPT = "GitHub, Codex, ChatGPT, Claude, MyDictate, Whisper, Swift, SwiftUI, Xcode, macOS, main, Command, Option, Shift, Control, API, JSON, TypeScript, JavaScript, Python, Docker, PostgreSQL."
+let WHISPER_TECHNICAL_TERMS = "GitHub, Codex, ChatGPT, Claude, MyDictate, Whisper, Swift, SwiftUI, Xcode, macOS, main, Command, Option, Shift, Control, API, JSON, TypeScript, JavaScript, Python, Docker, PostgreSQL."
+let WHISPER_RUSSIAN_PUNCTUATION_PROMPT = "Это аккуратно оформленная русская диктовка. Предложения начинаются с заглавной буквы и заканчиваются точкой, вопросительным или восклицательным знаком. Внутри предложений используются запятые."
+let WHISPER_ENGLISH_PUNCTUATION_PROMPT = "This is carefully punctuated dictation. Sentences begin with capital letters and end with a period, question mark, or exclamation mark. Commas are used inside sentences."
+let WHISPER_VAD_MODEL_FILE_NAME = "ggml-silero-v6.2.0.bin"
+let WHISPER_VAD_MODEL_SIZE_BYTES: Int64 = 885_098
+let WHISPER_VAD_MODEL_SHA256 = "2aa269b785eeb53a82983a20501ddf7c1d9c48e33ab63a41391ac6c9f7fb6987"
+let WHISPER_VAD_MODEL_DOWNLOAD_URL = URL(string: "https://huggingface.co/ggml-org/whisper-vad/resolve/main/\(WHISPER_VAD_MODEL_FILE_NAME)")!
 
 let SETTINGS_SUITE = "com.local.mydictate"
 let CORRECTIONS_FILE_UTI = "com.local.mydictate.corrections"
@@ -5614,15 +5620,23 @@ private enum LoadedSpeechEngine {
 
 private final class WhisperProgressReporter: @unchecked Sendable {
     private let handler: @Sendable (Int) -> Void
+    private let startProgress: Int
+    private let endProgress: Int
     private let lock = NSLock()
     private var lastReported = -1
 
-    init(handler: @escaping @Sendable (Int) -> Void) {
+    init(handler: @escaping @Sendable (Int) -> Void,
+         startProgress: Int = 0,
+         endProgress: Int = 100) {
         self.handler = handler
+        self.startProgress = min(100, max(0, startProgress))
+        self.endProgress = min(100, max(self.startProgress, endProgress))
     }
 
     func report(_ rawProgress: Int) {
-        let progress = min(100, max(0, rawProgress))
+        let sourceProgress = min(100, max(0, rawProgress))
+        let span = endProgress - startProgress
+        let progress = startProgress + Int((Double(sourceProgress) * Double(span) / 100).rounded())
         lock.lock()
         guard progress > lastReported else {
             lock.unlock()
@@ -5634,10 +5648,111 @@ private final class WhisperProgressReporter: @unchecked Sendable {
     }
 }
 
+private struct WhisperTranscriptQualityAssessment: Equatable {
+    let characterCount: Int
+    let punctuationCount: Int
+    let hasKnownHallucination: Bool
+    let hasSparsePunctuation: Bool
+    let isUnexpectedlyShort: Bool
+    let hasExcessiveRepetition: Bool
+    let maximumTrigramRepetition: Int
+
+    var shouldRetry: Bool {
+        hasKnownHallucination
+            || hasSparsePunctuation
+            || isUnexpectedlyShort
+            || hasExcessiveRepetition
+    }
+
+    var score: Int {
+        var result = min(characterCount, 4_000) / 25
+        result += min(punctuationCount, 120) * 8
+        if hasSparsePunctuation { result -= 500 }
+        if hasKnownHallucination { result -= 1_000 }
+        if isUnexpectedlyShort { result -= 750 }
+        if hasExcessiveRepetition {
+            result -= min(2_400, max(0, maximumTrigramRepetition - 8) * 24)
+        }
+        return result
+    }
+
+    var logDescription: String {
+        "chars=\(characterCount) punctuation=\(punctuationCount) sparse=\(hasSparsePunctuation) short=\(isUnexpectedlyShort) repetition=\(maximumTrigramRepetition) hallucination=\(hasKnownHallucination)"
+    }
+}
+
+private func whisperTranscriptQuality(_ text: String,
+                                      audioDurationSeconds: Double? = nil) -> WhisperTranscriptQualityAssessment {
+    let characters = text.count
+    let punctuationCharacters = CharacterSet(charactersIn: ".!?…,:;")
+    let punctuation = text.unicodeScalars.reduce(into: 0) { count, scalar in
+        if punctuationCharacters.contains(scalar) {
+            count += 1
+        }
+    }
+    let normalized = text
+        .folding(options: [.caseInsensitive, .diacriticInsensitive],
+                 locale: Locale(identifier: "ru_RU"))
+        .lowercased()
+    let knownHallucination = normalized.contains("редактор субтитров")
+        || normalized.contains("корректор а. кулакова")
+        || normalized.contains("корректор а кулакова")
+        || normalized.contains("subtitles by")
+    let minimumPunctuation = max(2, characters / 350)
+    let sparsePunctuation = characters >= 240 && punctuation < minimumPunctuation
+    let unexpectedlyShort: Bool
+    if let audioDurationSeconds, audioDurationSeconds >= 60 {
+        unexpectedlyShort = characters < max(120, Int(audioDurationSeconds * 2.5))
+    } else {
+        unexpectedlyShort = false
+    }
+    let words = normalized
+        .split(whereSeparator: { !$0.isLetter && !$0.isNumber })
+        .map(String.init)
+    var trigramCounts: [String: Int] = [:]
+    var maximumTrigramCount = 0
+    if words.count >= 30 {
+        for index in 0...(words.count - 3) {
+            let trigram = words[index...index + 2].joined(separator: "\u{1F}")
+            let count = (trigramCounts[trigram] ?? 0) + 1
+            trigramCounts[trigram] = count
+            maximumTrigramCount = max(maximumTrigramCount, count)
+        }
+    }
+    let excessiveRepetition = maximumTrigramCount >= 12
+    return WhisperTranscriptQualityAssessment(
+        characterCount: characters,
+        punctuationCount: punctuation,
+        hasKnownHallucination: knownHallucination,
+        hasSparsePunctuation: sparsePunctuation,
+        isUnexpectedlyShort: unexpectedlyShort,
+        hasExcessiveRepetition: excessiveRepetition,
+        maximumTrigramRepetition: maximumTrigramCount
+    )
+}
+
+private func whisperInitialPrompt(for language: DictationLanguage, recovery: Bool) -> String {
+    let punctuationPrompt: String
+    let recoverySentence: String
+    switch language {
+    case .auto, .russian, .ukrainian, .belarusian, .bulgarian, .serbian:
+        punctuationPrompt = WHISPER_RUSSIAN_PUNCTUATION_PROMPT
+        recoverySentence = "Каждая законченная мысль отделена знаком препинания."
+    default:
+        punctuationPrompt = WHISPER_ENGLISH_PUNCTUATION_PROMPT
+        recoverySentence = "Every complete thought is separated by punctuation."
+    }
+    if recovery {
+        return "\(punctuationPrompt) \(recoverySentence) \(WHISPER_TECHNICAL_TERMS)"
+    }
+    return "\(punctuationPrompt) \(WHISPER_TECHNICAL_TERMS)"
+}
+
 private final class WhisperSpeechEngine: @unchecked Sendable {
     private let context: OpaquePointer
+    private let vadModelURL: URL?
 
-    init(modelURL: URL) throws {
+    init(modelURL: URL, vadModelURL: URL?) throws {
         var params = whisper_context_default_params()
         params.use_gpu = true
         params.flash_attn = true
@@ -5653,6 +5768,7 @@ private final class WhisperSpeechEngine: @unchecked Sendable {
             )
         }
         context = loadedContext
+        self.vadModelURL = vadModelURL
     }
 
     deinit {
@@ -5670,10 +5786,80 @@ private final class WhisperSpeechEngine: @unchecked Sendable {
             )
         }
 
-        var params = whisper_full_default_params(WHISPER_SAMPLING_GREEDY)
+        let primaryReporter = progressHandler.map {
+            WhisperProgressReporter(handler: $0, startProgress: 0, endProgress: 85)
+        }
+        let primary = try decode(
+            samples: samples,
+            languageCode: language.whisperLanguageCode,
+            prompt: whisperInitialPrompt(for: language, recovery: false),
+            useBeamSearch: false,
+            progressReporter: primaryReporter
+        )
+        let audioDurationSeconds = Double(samples.count) / SAMPLE_RATE
+        let primaryQuality = whisperTranscriptQuality(
+            primary,
+            audioDurationSeconds: audioDurationSeconds
+        )
+        log("ASR: Whisper primary quality \(primaryQuality.logDescription)")
+
+        guard primaryQuality.shouldRetry else {
+            progressHandler?(100)
+            return primary
+        }
+
+        let retryLanguageCode: String
+        if language == .auto {
+            let cyrillicCount = primary.unicodeScalars.reduce(into: 0) { count, scalar in
+                if (0x0400...0x04FF).contains(scalar.value) {
+                    count += 1
+                }
+            }
+            retryLanguageCode = cyrillicCount * 3 >= max(1, primary.unicodeScalars.count)
+                ? "ru"
+                : "auto"
+        } else {
+            retryLanguageCode = language.whisperLanguageCode
+        }
+        log("ASR: Whisper quality retry started; language=\(retryLanguageCode)")
+        let retryReporter = progressHandler.map {
+            WhisperProgressReporter(handler: $0, startProgress: 85, endProgress: 100)
+        }
+        let retry = try decode(
+            samples: samples,
+            languageCode: retryLanguageCode,
+            prompt: whisperInitialPrompt(for: language, recovery: true),
+            useBeamSearch: true,
+            progressReporter: retryReporter
+        )
+        let retryQuality = whisperTranscriptQuality(
+            retry,
+            audioDurationSeconds: audioDurationSeconds
+        )
+        log("ASR: Whisper retry quality \(retryQuality.logDescription)")
+        progressHandler?(100)
+
+        if retryQuality.score > primaryQuality.score {
+            log("ASR: Whisper quality retry selected")
+            return retry
+        }
+        log("ASR: Whisper primary result retained after quality retry")
+        return primary
+    }
+
+    private func decode(samples: [Float],
+                        languageCode: String,
+                        prompt: String,
+                        useBeamSearch: Bool,
+                        progressReporter: WhisperProgressReporter?) throws -> String {
+        var params = whisper_full_default_params(
+            useBeamSearch ? WHISPER_SAMPLING_BEAM_SEARCH : WHISPER_SAMPLING_GREEDY
+        )
         params.n_threads = Int32(max(4, min(8, ProcessInfo.processInfo.activeProcessorCount - 2)))
         params.translate = false
-        params.no_context = false
+        // Every dictation is a separate document. whisper_full() reuses the
+        // context's rolling prompt history across calls unless this is true.
+        params.no_context = true
         params.no_timestamps = true
         params.single_segment = false
         params.print_special = false
@@ -5684,8 +5870,29 @@ private final class WhisperSpeechEngine: @unchecked Sendable {
         params.suppress_blank = true
         params.suppress_nst = true
         params.temperature = 0
-        params.carry_initial_prompt = true
-        let progressReporter = progressHandler.map(WhisperProgressReporter.init)
+        if useBeamSearch {
+            // Recovery mode may raise temperature when whisper.cpp detects a
+            // repetitive/compressed decoder loop.
+            params.temperature_inc = 0.2
+            params.beam_search.beam_size = 5
+            params.beam_search.patience = 1
+        } else {
+            // The fast primary pass is deterministic. Our own quality gate
+            // decides whether the safer beam-search retry is needed.
+            params.temperature_inc = 0
+            params.greedy.best_of = 5
+        }
+        // Use the punctuation/spelling prompt once. Carrying it into every
+        // internal window can displace real rolling context on long audio.
+        params.carry_initial_prompt = false
+        if vadModelURL != nil {
+            params.vad = true
+            params.vad_params.threshold = 0.5
+            params.vad_params.min_speech_duration_ms = 250
+            params.vad_params.min_silence_duration_ms = 100
+            params.vad_params.speech_pad_ms = 60
+            params.vad_params.samples_overlap = 0.1
+        }
         if let progressReporter {
             progressReporter.report(0)
             params.progress_callback = { _, _, progress, userData in
@@ -5700,16 +5907,25 @@ private final class WhisperSpeechEngine: @unchecked Sendable {
                 .toOpaque()
         }
 
-        let resultCode = WHISPER_TECHNICAL_PROMPT.withCString { promptPointer in
-            language.whisperLanguageCode.withCString { languagePointer in
+        let resultCode = prompt.withCString { promptPointer in
+            languageCode.withCString { languagePointer in
                 params.initial_prompt = promptPointer
                 params.language = languagePointer
                 // `language = "auto"` enables automatic language selection.
                 // `detect_language = true` is a detection-only mode that exits
                 // successfully without decoding any text segments.
                 params.detect_language = false
-                return samples.withUnsafeBufferPointer { sampleBuffer in
-                    whisper_full(context, params, sampleBuffer.baseAddress, Int32(samples.count))
+                if let vadModelURL {
+                    return vadModelURL.path.withCString { vadPathPointer in
+                        params.vad_model_path = vadPathPointer
+                        return samples.withUnsafeBufferPointer { sampleBuffer in
+                            whisper_full(context, params, sampleBuffer.baseAddress, Int32(samples.count))
+                        }
+                    }
+                } else {
+                    return samples.withUnsafeBufferPointer { sampleBuffer in
+                        whisper_full(context, params, sampleBuffer.baseAddress, Int32(samples.count))
+                    }
                 }
             }
         }
@@ -5717,10 +5933,9 @@ private final class WhisperSpeechEngine: @unchecked Sendable {
             throw NSError(
                 domain: "SuperDictate.Whisper",
                 code: Int(resultCode),
-                userInfo: [NSLocalizedDescriptionKey: "Whisper failed to transcribe the recording (code (resultCode))."]
+                userInfo: [NSLocalizedDescriptionKey: "Whisper failed to transcribe the recording (code \(resultCode))."]
             )
         }
-        progressReporter?.report(100)
 
         let segmentCount = whisper_full_n_segments(context)
         var text = ""
@@ -5826,9 +6041,20 @@ actor TranscriptionWorker {
     ) async throws -> WhisperSpeechEngine {
         let modelURL = try await ensureWhisperModel(profile: profile,
                                                     progressHandler: progressHandler)
+        let vadModelURL: URL?
+        do {
+            vadModelURL = try await ensureWhisperVADModel()
+            log("ASR: Whisper VAD ready")
+        } catch {
+            // Context isolation and punctuation prompting remain active even
+            // while offline. Retry the tiny VAD download on the next service
+            // start instead of making dictation unavailable.
+            vadModelURL = nil
+            log("ASR: Whisper VAD unavailable; continuing without silence filtering: \(error.localizedDescription)")
+        }
         progressHandler?(.init(fractionCompleted: 0.98,
                                phase: .compiling(modelName: profile.shortName)))
-        return try WhisperSpeechEngine(modelURL: modelURL)
+        return try WhisperSpeechEngine(modelURL: modelURL, vadModelURL: vadModelURL)
     }
 
     private func ensureWhisperModel(
@@ -5885,6 +6111,72 @@ actor TranscriptionWorker {
         return modelURL
     }
 
+    private func ensureWhisperVADModel() async throws -> URL {
+        let cacheDirectory = speechModelCacheBaseDirectory()
+            .appendingPathComponent("whisper-vad", isDirectory: true)
+        let modelURL = cacheDirectory.appendingPathComponent(WHISPER_VAD_MODEL_FILE_NAME)
+
+        if FileManager.default.fileExists(atPath: modelURL.path) {
+            do {
+                try verifyWhisperVADModel(at: modelURL)
+                return modelURL
+            } catch {
+                log("ASR: cached Whisper VAD failed integrity check; redownloading: \(error.localizedDescription)")
+                try FileManager.default.removeItem(at: modelURL)
+            }
+        }
+
+        try FileManager.default.createDirectory(at: cacheDirectory,
+                                                withIntermediateDirectories: true,
+                                                attributes: [.posixPermissions: 0o700])
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = 60
+        configuration.timeoutIntervalForResource = 5 * 60
+        let session = URLSession(configuration: configuration)
+        let (temporaryURL, response) = try await session.download(from: WHISPER_VAD_MODEL_DOWNLOAD_URL)
+        guard let httpResponse = response as? HTTPURLResponse,
+              (200..<300).contains(httpResponse.statusCode) else {
+            throw NSError(
+                domain: "MyDictate.WhisperVAD",
+                code: -1,
+                userInfo: [NSLocalizedDescriptionKey: "The Whisper VAD model server returned an invalid response."]
+            )
+        }
+
+        let stagedURL = cacheDirectory
+            .appendingPathComponent(".\(WHISPER_VAD_MODEL_FILE_NAME).\(UUID().uuidString).download")
+        defer { try? FileManager.default.removeItem(at: stagedURL) }
+        try FileManager.default.moveItem(at: temporaryURL, to: stagedURL)
+        try verifyWhisperVADModel(at: stagedURL)
+        try FileManager.default.moveItem(at: stagedURL, to: modelURL)
+        return modelURL
+    }
+
+    private func verifyWhisperVADModel(at modelURL: URL) throws {
+        let attributes = try FileManager.default.attributesOfItem(atPath: modelURL.path)
+        guard let fileType = attributes[.type] as? FileAttributeType,
+              fileType == .typeRegular,
+              let size = attributes[.size] as? NSNumber,
+              size.int64Value == WHISPER_VAD_MODEL_SIZE_BYTES else {
+            throw NSError(
+                domain: "MyDictate.WhisperVAD",
+                code: -2,
+                userInfo: [NSLocalizedDescriptionKey: "The local Whisper VAD model has an unexpected size."]
+            )
+        }
+        let digest = try ModelIntegrity.sha256Hex(
+            of: modelURL,
+            relativePath: WHISPER_VAD_MODEL_FILE_NAME
+        )
+        guard digest == WHISPER_VAD_MODEL_SHA256 else {
+            throw NSError(
+                domain: "MyDictate.WhisperVAD",
+                code: -3,
+                userInfo: [NSLocalizedDescriptionKey: "The local Whisper VAD model checksum does not match the official file."]
+            )
+        }
+    }
+
     private func verifyWhisperModel(at modelURL: URL,
                                     profile: SpeechModelProfile) throws {
         guard let fileName = profile.whisperModelFileName,
@@ -5928,6 +6220,9 @@ actor TranscriptionWorker {
         }
         inFlight = true
         defer { inFlight = false }
+        let profileName = loadedProfile?.shortName ?? "unknown"
+        let audioSeconds = Double(samples.count) / SAMPLE_RATE
+        log("ASR: transcribing profile=\(profileName) language=\(language.rawValue) audio=\(String(format: "%.2f", audioSeconds))s")
         switch engine {
         case .parakeetV3(let asr):
             let decoderPreparationStartedAt = ProcessInfo.processInfo.systemUptime
@@ -16787,6 +17082,9 @@ private enum SelfTestFailure: Error, CustomStringConvertible {
 private enum ParakeySelfTest {
     static func run(arguments: [String]) -> Int32? {
         guard arguments.count >= 2, arguments[0] == "--self-test" else { return nil }
+        if arguments[1] == "whisper-files" {
+            return runWhisperFiles(arguments: Array(arguments.dropFirst(2)))
+        }
         guard arguments.count == 2 else { return fail("usage") }
 
         switch arguments[1] {
@@ -16812,6 +17110,8 @@ private enum ParakeySelfTest {
             return runSuite("audio-input", testAudioInputDeviceFiltering)
         case "model-status":
             return runSuite("model-status", testSpeechModelStartupStatus)
+        case "whisper-quality":
+            return runSuite("whisper-quality", testWhisperTranscriptQuality)
         case "audio-route":
             return runSuite("audio-route", testAudioRouteChangeDecision)
         case "recording-lifecycle":
@@ -16855,6 +17155,31 @@ private enum ParakeySelfTest {
         return EXIT_FAILURE
     }
 
+    private static func runWhisperFiles(arguments: [String]) -> Int32 {
+        guard arguments.count >= 3 else {
+            return fail("usage: --self-test whisper-files <model> <vad-model> <audio>...")
+        }
+        do {
+            let engine = try WhisperSpeechEngine(
+                modelURL: URL(fileURLWithPath: arguments[0]),
+                vadModelURL: URL(fileURLWithPath: arguments[1])
+            )
+            for audioPath in arguments.dropFirst(2) {
+                let audioURL = URL(fileURLWithPath: audioPath)
+                let samples = try DictationArchive.loadRecordingAudio(from: audioURL)
+                let text = try engine.transcribe(samples: samples, language: .auto)
+                let quality = whisperTranscriptQuality(text)
+                print("BEGIN \(audioURL.lastPathComponent)")
+                print(text)
+                print("QUALITY \(quality.logDescription)")
+                print("END \(audioURL.lastPathComponent)")
+            }
+            return EXIT_SUCCESS
+        } catch {
+            return fail("whisper-files: \(error)")
+        }
+    }
+
     private static func testAll() throws {
         try testHotkey()
         try testReadiness()
@@ -16867,6 +17192,7 @@ private enum ParakeySelfTest {
         try testAudioConversion()
         try testAudioInputDeviceFiltering()
         try testSpeechModelStartupStatus()
+        try testWhisperTranscriptQuality()
         try testAudioRouteChangeDecision()
         try testRecordingLifecycle()
         try testPowerStateRecoveryDecision()
@@ -18889,6 +19215,61 @@ private enum ParakeySelfTest {
             audioInputDevice(matching: "Yeti Nano", in: [real])?.uid,
             equals: "real-yeti-nano",
             "named microphone preferences should still resolve by display name"
+        )
+    }
+
+    private static func testWhisperTranscriptQuality() throws {
+        let punctuated = whisperTranscriptQuality(
+            "Это первое предложение. Здесь есть запятая, а затем вопрос: всё работает?"
+        )
+        try expect(
+            punctuated.shouldRetry,
+            equals: false,
+            "normally punctuated Whisper text should not trigger a retry"
+        )
+
+        let unpunctuated = whisperTranscriptQuality(
+            String(repeating: "это длинная диктовка без единого знака препинания ", count: 12)
+        )
+        try expect(
+            unpunctuated.hasSparsePunctuation,
+            equals: true,
+            "long punctuation-free Whisper text should trigger a retry"
+        )
+
+        let hallucinated = whisperTranscriptQuality(
+            "Обычный текст. Редактор субтитров А. Синецкая Корректор А. Кулакова"
+        )
+        try expect(
+            hallucinated.hasKnownHallucination,
+            equals: true,
+            "known subtitle-credit hallucinations should trigger a retry"
+        )
+
+        let shortFragment = whisperTranscriptQuality("да хорошо сделаем")
+        try expect(
+            shortFragment.hasSparsePunctuation,
+            equals: false,
+            "short conversational fragments should not be retried only for missing punctuation"
+        )
+
+        let truncatedLongRecording = whisperTranscriptQuality(
+            "Короткий обрывок длинной записи. Здесь есть пунктуация.",
+            audioDurationSeconds: 5 * 60
+        )
+        try expect(
+            truncatedLongRecording.isUnexpectedlyShort,
+            equals: true,
+            "implausibly short output from a long recording should trigger a retry"
+        )
+
+        let repeatedLoop = whisperTranscriptQuality(
+            "Нормальное начало текста. " + String(repeating: "Да, в чате, ", count: 12)
+        )
+        try expect(
+            repeatedLoop.hasExcessiveRepetition,
+            equals: true,
+            "decoder loops should trigger a safer retry"
         )
     }
 
