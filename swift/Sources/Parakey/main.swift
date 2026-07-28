@@ -75,6 +75,10 @@ let INSTALLED_APP_BUNDLE_PATH = "/Applications/MyDictate.app"
 let AGENT_ARGUMENT = "--agent"
 let AGENT_LABEL = "com.local.mydictate.agent"
 let APP_SUPPORT_DIR_NAME = "MyDictate"
+let CONTENT_STORAGE_DIR_NAME = "MyDictate Content"
+let LEGACY_CONTENT_STORAGE_DIR_NAME = "Saved Dictations"
+let EMERGENCY_RECOVERY_DIR_NAME = "Emergency Recovery"
+let CONTENT_STORAGE_CLEANUP_INTERVAL_SECONDS: TimeInterval = 24 * 60 * 60
 let AGENT_STATUS_FILE_NAME = "AgentStatus.json"
 let CONTROL_PANEL_PID_FILE_NAME = "ControlPanel.pid"
 let UPDATE_HELPER_LOG_PATH = (NSHomeDirectory() as NSString)
@@ -2647,6 +2651,59 @@ enum DictationCompletionSound: String, CaseIterable, Sendable {
     }
 }
 
+enum AudioRetentionPolicy: String, CaseIterable, Sendable {
+    case sevenDays = "7_days"
+    case thirtyDays = "30_days"
+    case forever = "forever"
+
+    var maximumAge: TimeInterval? {
+        switch self {
+        case .sevenDays:
+            return 7 * 24 * 60 * 60
+        case .thirtyDays:
+            return 30 * 24 * 60 * 60
+        case .forever:
+            return nil
+        }
+    }
+
+    var days: Int? {
+        switch self {
+        case .sevenDays: return 7
+        case .thirtyDays: return 30
+        case .forever: return nil
+        }
+    }
+}
+
+private func localizedAudioRetentionName(
+    _ policy: AudioRetentionPolicy,
+    language: InterfaceLanguage
+) -> String {
+    switch (policy, language) {
+    case (.sevenDays, .russian): return "7 дней"
+    case (.sevenDays, .english): return "7 days"
+    case (.thirtyDays, .russian): return "30 дней"
+    case (.thirtyDays, .english): return "30 days"
+    case (.forever, .russian): return "Бессрочно"
+    case (.forever, .english): return "Forever"
+    }
+}
+
+private func localizedAudioRetentionPhrase(
+    _ policy: AudioRetentionPolicy,
+    language: InterfaceLanguage
+) -> String {
+    switch (policy, language) {
+    case (.sevenDays, .russian): return "на 7 дней"
+    case (.sevenDays, .english): return "for 7 days"
+    case (.thirtyDays, .russian): return "на 30 дней"
+    case (.thirtyDays, .english): return "for 30 days"
+    case (.forever, .russian): return "бессрочно"
+    case (.forever, .english): return "indefinitely"
+    }
+}
+
 final class Settings: @unchecked Sendable {
     private static let keyHotkeyKeycode = "hotkey_keycode"
     private static let keyHotkeyModifiers = "hotkey_modifiers"
@@ -2681,6 +2738,10 @@ final class Settings: @unchecked Sendable {
     private static let keyQualityRecognitionCompletionSound = "quality_recognition_completion_sound"
     private static let keyCompletionSoundVolume = "completion_sound_volume"
     private static let keyClipboardCompletionVisibleSeconds = "clipboard_completion_visible_seconds"
+    private static let keyContentStorageBookmark = "content_storage_bookmark_v1"
+    private static let keyContentStoragePath = "content_storage_path_v1"
+    private static let keyAudioRetentionPolicy = "audio_retention_policy_v1"
+    private static let keyLastContentCleanupAt = "last_content_cleanup_at_v1"
     private static let keyShowInDock = "show_in_dock"
     private static let keyInputDevice = "input_device"
     private static let keyCheckForUpdates = "check_for_updates"
@@ -3156,6 +3217,73 @@ final class Settings: @unchecked Sendable {
         set {
             defaults.set(min(10, max(0, newValue.rounded())),
                          forKey: Self.keyClipboardCompletionVisibleSeconds)
+        }
+    }
+
+    var contentStorageBookmark: Data? {
+        get { defaults.data(forKey: Self.keyContentStorageBookmark) }
+        set {
+            if let newValue, !newValue.isEmpty {
+                defaults.set(newValue, forKey: Self.keyContentStorageBookmark)
+            } else {
+                defaults.removeObject(forKey: Self.keyContentStorageBookmark)
+            }
+        }
+    }
+
+    var contentStoragePath: String {
+        get {
+            guard let raw = defaults.string(forKey: Self.keyContentStoragePath) else {
+                return ""
+            }
+            let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty,
+                  !trimmed.unicodeScalars.contains(where: { $0.value == 0 }),
+                  (trimmed as NSString).isAbsolutePath else {
+                return ""
+            }
+            return URL(fileURLWithPath: trimmed, isDirectory: true)
+                .standardizedFileURL.path
+        }
+        set {
+            let trimmed = newValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.isEmpty {
+                defaults.removeObject(forKey: Self.keyContentStoragePath)
+            } else {
+                defaults.set(
+                    URL(fileURLWithPath: trimmed, isDirectory: true)
+                        .standardizedFileURL.path,
+                    forKey: Self.keyContentStoragePath
+                )
+            }
+        }
+    }
+
+    func setContentStorage(bookmark: Data?, path: String?) {
+        contentStorageBookmark = bookmark
+        contentStoragePath = path ?? ""
+        defaults.synchronize()
+    }
+
+    var audioRetentionPolicy: AudioRetentionPolicy {
+        get {
+            guard let raw = defaults.string(forKey: Self.keyAudioRetentionPolicy),
+                  let policy = AudioRetentionPolicy(rawValue: raw) else {
+                return .sevenDays
+            }
+            return policy
+        }
+        set { defaults.set(newValue.rawValue, forKey: Self.keyAudioRetentionPolicy) }
+    }
+
+    var lastContentCleanupAt: Date? {
+        get { defaults.object(forKey: Self.keyLastContentCleanupAt) as? Date }
+        set {
+            if let newValue {
+                defaults.set(newValue, forKey: Self.keyLastContentCleanupAt)
+            } else {
+                defaults.removeObject(forKey: Self.keyLastContentCleanupAt)
+            }
         }
     }
 
@@ -4713,23 +4841,394 @@ private struct QualityRecognitionJob: Codable, Equatable, Sendable {
     var error: String?
 }
 
+enum MyDictateContentStorageError: LocalizedError {
+    case unavailable(String)
+    case invalidFolder(String)
+    case nestedLocation
+    case conflictingFile(String)
+    case verificationFailed(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .unavailable(let path):
+            return "The MyDictate Content folder is unavailable: \(path)"
+        case .invalidFolder(let path):
+            return "MyDictate cannot use this storage folder: \(path)"
+        case .nestedLocation:
+            return "The old and new MyDictate Content folders cannot be placed inside one another."
+        case .conflictingFile(let path):
+            return "A different file already exists in the destination: \(path)"
+        case .verificationFailed(let path):
+            return "MyDictate could not verify the copied file: \(path)"
+        }
+    }
+}
+
+struct MyDictateContentMigrationResult: Equatable, Sendable {
+    let copiedFileCount: Int
+    let copiedByteCount: UInt64
+}
+
+private final class MyDictateContentSecurityScope: @unchecked Sendable {
+    static let shared = MyDictateContentSecurityScope()
+
+    private let lock = NSLock()
+    private var activeURL: URL?
+    private var isAccessing = false
+
+    func hold(_ url: URL) {
+        let normalized = url.standardizedFileURL
+        lock.lock()
+        defer { lock.unlock() }
+        if activeURL?.path == normalized.path {
+            return
+        }
+        if isAccessing {
+            activeURL?.stopAccessingSecurityScopedResource()
+        }
+        activeURL = normalized
+        isAccessing = normalized.startAccessingSecurityScopedResource()
+    }
+}
+
+enum MyDictateContentStorage {
+    private static var fm: FileManager { FileManager.default }
+
+    static func defaultRootDirectoryURL() throws -> URL {
+        guard let applicationSupport = fm.urls(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask
+        ).first else {
+            throw MyDictateContentStorageError.unavailable("Application Support")
+        }
+        return applicationSupport
+            .appendingPathComponent(CONTENT_STORAGE_DIR_NAME, isDirectory: true)
+            .standardizedFileURL
+    }
+
+    static func legacyRootDirectoryURL() throws -> URL {
+        try superDictateApplicationSupportDirectory()
+            .appendingPathComponent(LEGACY_CONTENT_STORAGE_DIR_NAME, isDirectory: true)
+            .standardizedFileURL
+    }
+
+    static func emergencyRecoveryDirectoryURL() throws -> URL {
+        let url = try superDictateApplicationSupportDirectory()
+            .appendingPathComponent(EMERGENCY_RECOVERY_DIR_NAME, isDirectory: true)
+        try createDirectoryIfNeeded(url)
+        return url
+    }
+
+    static func selectedContentDirectory(for selectedURL: URL) -> URL {
+        let normalized = selectedURL.standardizedFileURL
+        if normalized.lastPathComponent == CONTENT_STORAGE_DIR_NAME {
+            return normalized
+        }
+        return normalized
+            .appendingPathComponent(CONTENT_STORAGE_DIR_NAME, isDirectory: true)
+            .standardizedFileURL
+    }
+
+    static func configuredDisplayURL(settings: Settings = .shared) -> URL {
+        if !settings.contentStoragePath.isEmpty {
+            return URL(
+                fileURLWithPath: settings.contentStoragePath,
+                isDirectory: true
+            ).standardizedFileURL
+        }
+        return (try? defaultRootDirectoryURL())
+            ?? URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
+                .appendingPathComponent(CONTENT_STORAGE_DIR_NAME, isDirectory: true)
+    }
+
+    static func rootDirectoryURL(settings: Settings = .shared,
+                                 createIfNeeded: Bool = true) throws -> URL {
+        if !settings.contentStoragePath.isEmpty {
+            let resolved = try resolveCustomRoot(settings: settings)
+            guard isExistingDirectory(resolved) else {
+                throw MyDictateContentStorageError.unavailable(resolved.path)
+            }
+            return resolved
+        }
+
+        let destination = try defaultRootDirectoryURL()
+        if DESIGN_PREVIEW_MODE {
+            if isExistingDirectory(destination) {
+                return destination
+            }
+            let legacy = try legacyRootDirectoryURL()
+            return isExistingDirectory(legacy) ? legacy : destination
+        }
+        try migrateLegacyDefaultIfNeeded(to: destination)
+        if createIfNeeded {
+            try createDirectoryIfNeeded(destination)
+        }
+        guard isExistingDirectory(destination) else {
+            throw MyDictateContentStorageError.unavailable(destination.path)
+        }
+        return destination
+    }
+
+    static func isConfiguredStorageAvailable(settings: Settings = .shared) -> Bool {
+        (try? rootDirectoryURL(settings: settings, createIfNeeded: false)) != nil
+    }
+
+    static func makeBookmark(for url: URL) -> Data? {
+        let normalized = url.standardizedFileURL
+        return try? normalized.bookmarkData(
+            options: [.withSecurityScope],
+            includingResourceValuesForKeys: nil,
+            relativeTo: nil
+        )
+    }
+
+    static func migrateContents(from sourceURL: URL,
+                                to destinationURL: URL) throws -> MyDictateContentMigrationResult {
+        let source = sourceURL.standardizedFileURL
+        let destination = destinationURL.standardizedFileURL
+        guard source.path != destination.path else {
+            return MyDictateContentMigrationResult(copiedFileCount: 0, copiedByteCount: 0)
+        }
+        guard !isDescendant(source, of: destination),
+              !isDescendant(destination, of: source) else {
+            throw MyDictateContentStorageError.nestedLocation
+        }
+        guard isExistingDirectory(source) else {
+            try createDirectoryIfNeeded(destination)
+            return MyDictateContentMigrationResult(copiedFileCount: 0, copiedByteCount: 0)
+        }
+
+        try createDirectoryIfNeeded(destination)
+        let sourceFiles = try regularFilesRecursively(in: source)
+        var copiedCount = 0
+        var copiedBytes: UInt64 = 0
+
+        for file in sourceFiles {
+            let destinationFile = destination
+                .appendingPathComponent(file.relativePath, isDirectory: false)
+            try createDirectoryIfNeeded(destinationFile.deletingLastPathComponent())
+            if fm.fileExists(atPath: destinationFile.path) {
+                guard try filesAreIdentical(file.url, destinationFile,
+                                            relativePath: file.relativePath) else {
+                    throw MyDictateContentStorageError.conflictingFile(file.relativePath)
+                }
+                continue
+            }
+            let temporary = destinationFile.deletingLastPathComponent()
+                .appendingPathComponent(
+                    ".\(destinationFile.lastPathComponent).\(UUID().uuidString).migration",
+                    isDirectory: false
+                )
+            do {
+                try fm.copyItem(at: file.url, to: temporary)
+                guard try filesAreIdentical(file.url, temporary,
+                                            relativePath: file.relativePath) else {
+                    throw MyDictateContentStorageError.verificationFailed(file.relativePath)
+                }
+                try fm.moveItem(at: temporary, to: destinationFile)
+                copiedCount += 1
+                copiedBytes += file.size
+            } catch {
+                try? fm.removeItem(at: temporary)
+                throw error
+            }
+        }
+
+        for file in sourceFiles {
+            let destinationFile = destination
+                .appendingPathComponent(file.relativePath, isDirectory: false)
+            guard try filesAreIdentical(file.url, destinationFile,
+                                        relativePath: file.relativePath) else {
+                throw MyDictateContentStorageError.verificationFailed(file.relativePath)
+            }
+        }
+        return MyDictateContentMigrationResult(
+            copiedFileCount: copiedCount,
+            copiedByteCount: copiedBytes
+        )
+    }
+
+    static func contentByteCount(at rootURL: URL) -> UInt64 {
+        (try? regularFilesRecursively(in: rootURL)
+            .reduce(UInt64(0)) { $0 + $1.size }) ?? 0
+    }
+
+    @discardableResult
+    static func moveOldStorageToTrash(_ url: URL) -> Bool {
+        guard isExistingDirectory(url) else { return true }
+        do {
+            var resultingURL: NSURL?
+            try fm.trashItem(at: url, resultingItemURL: &resultingURL)
+            log("old MyDictate content moved to Trash: \(privacySafeLogPath(url))")
+            return true
+        } catch {
+            log("old MyDictate content retained after migration: \(error.localizedDescription)")
+            return false
+        }
+    }
+
+    private static func resolveCustomRoot(settings: Settings) throws -> URL {
+        let storedURL = URL(
+            fileURLWithPath: settings.contentStoragePath,
+            isDirectory: true
+        ).standardizedFileURL
+        guard let bookmark = settings.contentStorageBookmark else {
+            return storedURL
+        }
+        var stale = false
+        do {
+            let resolved = try URL(
+                resolvingBookmarkData: bookmark,
+                options: [.withSecurityScope, .withoutUI],
+                relativeTo: nil,
+                bookmarkDataIsStale: &stale
+            ).standardizedFileURL
+            MyDictateContentSecurityScope.shared.hold(resolved)
+            if stale, let refreshed = makeBookmark(for: resolved) {
+                settings.setContentStorage(bookmark: refreshed, path: resolved.path)
+            }
+            return resolved
+        } catch {
+            log("content storage bookmark resolution failed: \(error.localizedDescription)")
+            return storedURL
+        }
+    }
+
+    private static func migrateLegacyDefaultIfNeeded(to destination: URL) throws {
+        try withMigrationLock {
+            let legacy = try legacyRootDirectoryURL()
+            guard isExistingDirectory(legacy) else { return }
+            // Copy and verify every file before the source is touched. This is
+            // intentionally slower than rename, but survives external-volume
+            // and cross-filesystem migration without risking dictations.
+            _ = try migrateContents(from: legacy, to: destination)
+            _ = moveOldStorageToTrash(legacy)
+        }
+    }
+
+    private static func withMigrationLock<T>(_ body: () throws -> T) throws -> T {
+        let lockURL = try superDictateApplicationSupportDirectory()
+            .appendingPathComponent(".content-migration.lock", isDirectory: false)
+        let fd = Darwin.open(
+            lockURL.path,
+            O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW,
+            mode_t(0o600)
+        )
+        guard fd >= 0 else { throw currentPOSIXError() }
+        defer { _ = Darwin.close(fd) }
+        try validateSingleLinkRegularFileDescriptor(fd)
+        guard Darwin.lockf(fd, F_LOCK, 0) == 0 else { throw currentPOSIXError() }
+        defer { _ = Darwin.lockf(fd, F_ULOCK, 0) }
+        return try body()
+    }
+
+    private static func createDirectoryIfNeeded(_ url: URL) throws {
+        var isDirectory: ObjCBool = false
+        if fm.fileExists(atPath: url.path, isDirectory: &isDirectory) {
+            guard isDirectory.boolValue else {
+                throw MyDictateContentStorageError.invalidFolder(url.path)
+            }
+            var st = stat()
+            guard lstat(url.path, &st) == 0,
+                  (st.st_mode & S_IFMT) == S_IFDIR else {
+                throw MyDictateContentStorageError.invalidFolder(url.path)
+            }
+            return
+        }
+        try fm.createDirectory(at: url, withIntermediateDirectories: true)
+        // External FAT/exFAT volumes do not support POSIX permissions. Keep
+        // the privacy hardening where the filesystem supports it.
+        try? fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: url.path)
+    }
+
+    private static func isExistingDirectory(_ url: URL) -> Bool {
+        var isDirectory: ObjCBool = false
+        guard fm.fileExists(atPath: url.path, isDirectory: &isDirectory),
+              isDirectory.boolValue else { return false }
+        var st = stat()
+        return lstat(url.path, &st) == 0 && (st.st_mode & S_IFMT) == S_IFDIR
+    }
+
+    private static func isDescendant(_ child: URL, of parent: URL) -> Bool {
+        let childPath = child.standardizedFileURL.path
+        let parentPath = parent.standardizedFileURL.path
+        let prefix = parentPath.hasSuffix("/") ? parentPath : "\(parentPath)/"
+        return childPath.hasPrefix(prefix)
+    }
+
+    private static func regularFilesRecursively(
+        in root: URL
+    ) throws -> [(url: URL, relativePath: String, size: UInt64)] {
+        guard isExistingDirectory(root) else { return [] }
+        guard let enumerator = fm.enumerator(
+            at: root,
+            includingPropertiesForKeys: [
+                .isRegularFileKey,
+                .isDirectoryKey,
+                .isSymbolicLinkKey,
+                .fileSizeKey,
+            ],
+            options: []
+        ) else {
+            throw MyDictateContentStorageError.unavailable(root.path)
+        }
+        let rootPath = root.standardizedFileURL.path
+        let prefix = rootPath.hasSuffix("/") ? rootPath : "\(rootPath)/"
+        var files: [(URL, String, UInt64)] = []
+        for case let url as URL in enumerator {
+            let values = try url.resourceValues(forKeys: [
+                .isRegularFileKey,
+                .isDirectoryKey,
+                .isSymbolicLinkKey,
+                .fileSizeKey,
+            ])
+            if values.isSymbolicLink == true {
+                throw MyDictateContentStorageError.invalidFolder(url.path)
+            }
+            if values.isDirectory == true { continue }
+            guard values.isRegularFile == true,
+                  let size = values.fileSize,
+                  size >= 0 else {
+                throw MyDictateContentStorageError.invalidFolder(url.path)
+            }
+            let path = url.standardizedFileURL.path
+            guard path.hasPrefix(prefix) else {
+                throw MyDictateContentStorageError.invalidFolder(path)
+            }
+            files.append((url, String(path.dropFirst(prefix.count)), UInt64(size)))
+        }
+        return files
+    }
+
+    private static func filesAreIdentical(_ lhs: URL,
+                                          _ rhs: URL,
+                                          relativePath: String) throws -> Bool {
+        let leftValues = try lhs.resourceValues(forKeys: [.fileSizeKey, .isRegularFileKey])
+        let rightValues = try rhs.resourceValues(forKeys: [.fileSizeKey, .isRegularFileKey])
+        guard leftValues.isRegularFile == true,
+              rightValues.isRegularFile == true,
+              leftValues.fileSize == rightValues.fileSize else {
+            return false
+        }
+        let leftDigest = try ModelIntegrity.sha256Hex(of: lhs, relativePath: relativePath)
+        let rightDigest = try ModelIntegrity.sha256Hex(of: rhs, relativePath: relativePath)
+        return leftDigest == rightDigest
+    }
+}
+
 // Every completed transcript is written here before MyDictate attempts to
 // paste it. Text files are intentionally kept without an automatic limit:
 // they are tiny, user-readable, and serve as the durable source of truth when
 // a target app rejects a paste. Audio is journaled separately while recording;
 // only failed recognitions are additionally exported as ordinary WAV files.
 private enum DictationArchive {
-    private static let rootDirectoryName = "Saved Dictations"
     private static let transcriptsDirectoryName = "Transcripts"
     private static let recordingsDirectoryName = "Audio Recordings"
     private static let failedAudioDirectoryName = "Failed Audio"
     private static let pendingAudioDirectoryName = "Pending Audio"
     private static let qualityJobsDirectoryName = "Quality Recognition"
-    static let audioRetentionDays = 7
-
     static func rootDirectoryURL() throws -> URL {
-        let url = try superDictateApplicationSupportDirectory()
-            .appendingPathComponent(rootDirectoryName, isDirectory: true)
+        let url = try MyDictateContentStorage.rootDirectoryURL()
         try createPrivateDirectory(url)
         return url
     }
@@ -4998,7 +5497,7 @@ private enum DictationArchive {
 
     /// Removes the legacy failure marker after a retry for the same source
     /// recording succeeds.  The normal source WAV is deliberately retained
-    /// in Audio Recordings until its seven-day expiry.
+    /// in Audio Recordings until the user-selected retention period expires.
     static func clearFailedAudioArtifacts(sourceAudioURL: URL?) {
         guard let sourceAudioURL else { return }
         do {
@@ -5076,13 +5575,17 @@ private enum DictationArchive {
         return samples
     }
 
-    /// Source audio is intentionally temporary. Text transcripts remain
-    /// permanent; every WAV and its error note are removed after a week so
-    /// MyDictate does not silently fill the disk.
+    /// Source audio is temporary unless the user explicitly chooses to keep
+    /// it forever. Text transcripts remain permanent. Files used by an active
+    /// quality-recognition job are never deleted underneath that job.
     static func removeExpiredRecoverableAudio(now: Date = Date(),
-                                              maximumAge: TimeInterval = TimeInterval(audioRetentionDays * 24 * 60 * 60)) {
-        let fm = FileManager.default
-        let cutoff = now.addingTimeInterval(-maximumAge)
+                                              policy: AudioRetentionPolicy = Settings.shared.audioRetentionPolicy) {
+        guard let maximumAge = policy.maximumAge else { return }
+        let protectedStems = Set(
+            qualityRecognitionJobs()
+                .filter { $0.state.isPending }
+                .map(\.stem)
+        )
         let directories = [
             try? audioRecordingsDirectoryURL(),
             try? failedAudioDirectoryURL(),
@@ -5090,6 +5593,22 @@ private enum DictationArchive {
             try? qualityJobsDirectoryURL(),
         ]
             .compactMap { $0 }
+        _ = removeExpiredFiles(
+            in: directories,
+            now: now,
+            maximumAge: maximumAge,
+            protectedStems: protectedStems
+        )
+    }
+
+    @discardableResult
+    static func removeExpiredFiles(in directories: [URL],
+                                   now: Date,
+                                   maximumAge: TimeInterval,
+                                   protectedStems: Set<String> = []) -> Int {
+        let fm = FileManager.default
+        let cutoff = now.addingTimeInterval(-maximumAge)
+        var removedCount = 0
         for directory in directories {
             guard let urls = try? fm.contentsOfDirectory(
                 at: directory,
@@ -5099,24 +5618,36 @@ private enum DictationArchive {
             for url in urls {
                 guard let values = try? url.resourceValues(forKeys: [.contentModificationDateKey, .creationDateKey, .isRegularFileKey]),
                       values.isRegularFile == true else { continue }
+                let stem = url.deletingPathExtension().lastPathComponent
+                    .replacingOccurrences(of: "pending-", with: "")
+                guard !protectedStems.contains(stem) else { continue }
                 let date = values.contentModificationDate ?? values.creationDate ?? now
                 guard date < cutoff else { continue }
                 do {
                     try fm.removeItem(at: url)
+                    removedCount += 1
                     log("expired recoverable dictation audio removed: \(privacySafeLogPath(url))")
                 } catch {
                     log("recoverable dictation audio cleanup failed: \(error.localizedDescription)")
                 }
             }
         }
+        return removedCount
     }
 
     private static func createPrivateDirectory(_ url: URL) throws {
         try FileManager.default.createDirectory(at: url,
                                                 withIntermediateDirectories: true,
-                                                attributes: [.posixPermissions: 0o700])
-        try FileManager.default.setAttributes([.posixPermissions: 0o700],
-                                              ofItemAtPath: url.path)
+                                                attributes: nil)
+        var st = stat()
+        guard lstat(url.path, &st) == 0,
+              (st.st_mode & S_IFMT) == S_IFDIR else {
+            throw MyDictateContentStorageError.invalidFolder(url.path)
+        }
+        // FAT/exFAT volumes do not expose POSIX mode bits. The selected
+        // directory is still protected by the user's security-scoped grant.
+        try? FileManager.default.setAttributes([.posixPermissions: 0o700],
+                                               ofItemAtPath: url.path)
     }
 
     private static func archiveBaseName(sourceAudioURL: URL?, fallbackDate: Date) -> String {
@@ -5266,7 +5797,7 @@ private enum PendingDictationRecovery {
     private static let magic = Data("SDAR".utf8)
 
     static func directoryURL() throws -> URL {
-        try DictationArchive.pendingAudioDirectoryURL()
+        try MyDictateContentStorage.emergencyRecoveryDirectoryURL()
     }
 
     static func createJournal(identifier: String? = nil) throws -> PendingDictationJournal {
@@ -5293,6 +5824,11 @@ private enum PendingDictationRecovery {
         if let current = try? directoryURL() {
             directories.append(current)
         }
+        // Read journals created by versions before emergency recovery moved
+        // to internal Application Support.
+        if let archived = try? DictationArchive.pendingAudioDirectoryURL() {
+            directories.append(archived)
+        }
         if let support = try? superDictateApplicationSupportDirectory() {
             let legacy = support.appendingPathComponent(legacyDirectoryName, isDirectory: true)
             if FileManager.default.fileExists(atPath: legacy.path) {
@@ -5300,7 +5836,12 @@ private enum PendingDictationRecovery {
             }
         }
 
-        let urls = directories.flatMap { directory in
+        var seenDirectoryPaths = Set<String>()
+        let uniqueDirectories = directories.compactMap { directory -> URL? in
+            let normalized = directory.standardizedFileURL
+            return seenDirectoryPaths.insert(normalized.path).inserted ? normalized : nil
+        }
+        let urls = uniqueDirectories.flatMap { directory in
             (try? FileManager.default.contentsOfDirectory(
                 at: directory,
                 includingPropertiesForKeys: [.creationDateKey, .isRegularFileKey],
@@ -10956,6 +11497,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var startupFailure: StartupFailure?
     private var didTouchAudioEngine = false
     private var permissionReadinessTimer: Timer?
+    private var emergencyRecoveryTimer: Timer?
     private var lastPermissionReadinessMissingKey: String?
     /// Recording-time system-audio mute state machine. Main-actor
     /// only; transitions are driven by muteIfNeededForRecording /
@@ -11173,7 +11715,16 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         settings.enableMyDictateUpdatesIfNeeded()
         pendingUpdate = nil
-        DictationArchive.removeExpiredRecoverableAudio()
+        let now = Date()
+        if settings.lastContentCleanupAt.map({
+            now.timeIntervalSince($0) >= CONTENT_STORAGE_CLEANUP_INTERVAL_SECONDS
+        }) ?? true {
+            DictationArchive.removeExpiredRecoverableAudio(
+                now: now,
+                policy: settings.audioRetentionPolicy
+            )
+            settings.lastContentCleanupAt = now
+        }
         DictationArchive.requeueInterruptedQualityRecognitionJobs()
         if settings.normalizeSpeechModelProfileForCurrentBuild() {
             log("ASR: reset unsupported saved speech model selection to \(settings.speechModelProfile.shortName)")
@@ -11195,6 +11746,14 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         setMenuBarState(.loading)
         startCorrectionSyncIfConfigured()
         rebuildMenu()
+        emergencyRecoveryTimer = Timer.scheduledTimer(
+            timeInterval: 30,
+            target: self,
+            selector: #selector(emergencyRecoveryTimerFired(_:)),
+            userInfo: nil,
+            repeats: true
+        )
+        emergencyRecoveryTimer?.tolerance = 5
 
         audio.onConfigurationChange = { [weak self] in
             Task { @MainActor in
@@ -11292,6 +11851,8 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         manualUpdateCheckTask?.cancel()
         manualUpdateCheckTask = nil
         stopPermissionReadinessMonitor()
+        emergencyRecoveryTimer?.invalidate()
+        emergencyRecoveryTimer = nil
         stopSetupChecklistRefreshTimer()
         removeWorkspacePowerObservers()
         removeGlobalMouseMonitor()
@@ -13050,6 +13611,28 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         flashErrorMenuBarIcon()
     }
 
+    private func presentUnavailableContentStorageNotification() {
+        let notification = UNMutableNotificationContent()
+        notification.title = "MyDictate: хранилище недоступно"
+        notification.body = "Подключите выбранный диск или измените папку «MyDictate Content» в настройках. Новая запись не началась."
+        let request = UNNotificationRequest(
+            identifier: "content-storage-unavailable",
+            content: notification,
+            trigger: nil
+        )
+        let center = UNUserNotificationCenter.current()
+        Task { @MainActor [weak self] in
+            guard let self, !self.isTerminating else { return }
+            do {
+                let granted = try await center.requestAuthorization(options: [.alert])
+                guard granted else { return }
+                try await center.add(request)
+            } catch {
+                log("content storage notification failed: \(error.localizedDescription)")
+            }
+        }
+    }
+
     private func activeApplicationDescription() -> String {
         guard let application = NSWorkspace.shared.frontmostApplication else {
             return "unavailable"
@@ -13062,7 +13645,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private func presentInsertionRecoveryNotice() {
         let notification = UNMutableNotificationContent()
         notification.title = "MyDictate: текст сохранён"
-        notification.body = "Не удалось безопасно вставить диктовку. Текст уже скопирован — вернитесь в нужное поле и нажмите ⌘V. Исходное аудио сохранено на 7 дней."
+        notification.body = "Не удалось безопасно вставить диктовку. Текст уже скопирован — вернитесь в нужное поле и нажмите ⌘V. Исходное аудио сохранено \(localizedAudioRetentionPhrase(settings.audioRetentionPolicy, language: .russian))."
         let request = UNNotificationRequest(identifier: "dictation-insertion-\(UUID().uuidString)",
                                             content: notification,
                                             trigger: nil)
@@ -13094,7 +13677,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             guard let self, !self.isTerminating else { return }
             let alert = NSAlert()
             alert.messageText = "Не удалось вставить диктовку"
-            alert.informativeText = "Текст сохранён в «Сохранённых диктовках» и уже скопирован в буфер обмена. Вернитесь в нужное поле и нажмите ⌘V. Исходное аудио сохранено на 7 дней."
+            alert.informativeText = "Текст сохранён в «Сохранённых диктовках» и уже скопирован в буфер обмена. Вернитесь в нужное поле и нажмите ⌘V. Исходное аудио сохранено \(localizedAudioRetentionPhrase(settings.audioRetentionPolicy, language: .russian))."
             alert.addButton(withTitle: "Понятно")
             self.showAppForModal()
             alert.runModal()
@@ -13125,6 +13708,12 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let missing = missingPermissions()
         guard missing.isEmpty else {
             enterPermissionBlockedState(missing: missing, reason: "hotkey press")
+            return
+        }
+        guard MyDictateContentStorage.isConfiguredStorageAvailable(settings: settings) else {
+            log("recording start blocked: configured MyDictate Content storage is unavailable")
+            signalDictationFailure()
+            presentUnavailableContentStorageNotification()
             return
         }
         let initialInsertionContext = insertionTargetQueryContext()
@@ -13966,6 +14555,12 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             scheduleAudioIdleStop(reason: "manual pending recovery finished")
             log("manual pending dictation recovery finished; remaining=\(stillPending ? "yes" : "no")")
         }
+    }
+
+    @objc private func emergencyRecoveryTimerFired(_ timer: Timer) {
+        guard MyDictateContentStorage.isConfiguredStorageAvailable(settings: settings),
+              !PendingDictationRecovery.pendingURLs().isEmpty else { return }
+        retryPendingDictationsClicked(timer)
     }
 
     @objc private func clearHistoryClicked(_ sender: NSMenuItem) {
@@ -17766,6 +18361,8 @@ private enum ParakeySelfTest {
             return runSuite("whisper-quality", testWhisperTranscriptQuality)
         case "completion-sounds":
             return runSuite("completion-sounds", testCompletionSoundCatalog)
+        case "content-storage":
+            return runSuite("content-storage", testContentStorage)
         case "audio-route":
             return runSuite("audio-route", testAudioRouteChangeDecision)
         case "recording-lifecycle":
@@ -17851,6 +18448,7 @@ private enum ParakeySelfTest {
         try testSpeechModelStartupStatus()
         try testWhisperTranscriptQuality()
         try testCompletionSoundCatalog()
+        try testContentStorage()
         try testAudioRouteChangeDecision()
         try testRecordingLifecycle()
         try testPowerStateRecoveryDecision()
@@ -17873,6 +18471,90 @@ private enum ParakeySelfTest {
             try expect(FileManager.default.fileExists(atPath: path), equals: true,
                        "completion sound should exist: \(sound.rawValue)")
         }
+    }
+
+    private static func testContentStorage() throws {
+        let fm = FileManager.default
+        let root = fm.temporaryDirectory
+            .appendingPathComponent("mydictate-content-test-\(UUID().uuidString)",
+                                    isDirectory: true)
+        defer { try? fm.removeItem(at: root) }
+        let selectedParent = root.appendingPathComponent("External", isDirectory: true)
+        let selectedContent = MyDictateContentStorage.selectedContentDirectory(
+            for: selectedParent
+        )
+        try expect(
+            selectedContent.lastPathComponent,
+            equals: CONTENT_STORAGE_DIR_NAME,
+            "selected storage should be named MyDictate Content"
+        )
+        try expect(
+            MyDictateContentStorage.selectedContentDirectory(for: selectedContent).path,
+            equals: selectedContent.path,
+            "selecting MyDictate Content itself must not create double nesting"
+        )
+
+        let source = root.appendingPathComponent("Source", isDirectory: true)
+        let nested = source.appendingPathComponent("Transcripts", isDirectory: true)
+        try fm.createDirectory(at: nested, withIntermediateDirectories: true)
+        let sourceFile = nested.appendingPathComponent("dictation.txt")
+        try Data("important dictation".utf8).write(to: sourceFile)
+        let destination = root.appendingPathComponent(CONTENT_STORAGE_DIR_NAME,
+                                                      isDirectory: true)
+        let migrated = try MyDictateContentStorage.migrateContents(
+            from: source,
+            to: destination
+        )
+        try expect(migrated.copiedFileCount, equals: 1,
+                   "migration should copy every source file")
+        try expect(fm.fileExists(atPath: sourceFile.path), equals: true,
+                   "verified migration must leave the source untouched")
+        let destinationFile = destination
+            .appendingPathComponent("Transcripts/dictation.txt")
+        try expect(try Data(contentsOf: destinationFile),
+                   equals: Data("important dictation".utf8),
+                   "migrated data should match byte-for-byte")
+
+        try Data("conflict".utf8).write(to: destinationFile, options: .atomic)
+        do {
+            _ = try MyDictateContentStorage.migrateContents(
+                from: source,
+                to: destination
+            )
+            throw SelfTestFailure.failed("conflicting destination should stop migration")
+        } catch MyDictateContentStorageError.conflictingFile {
+            // Expected: source is still the authoritative copy.
+        }
+        try expect(try Data(contentsOf: sourceFile),
+                   equals: Data("important dictation".utf8),
+                   "failed migration must not modify the source")
+
+        let cleanup = root.appendingPathComponent("Cleanup", isDirectory: true)
+        try fm.createDirectory(at: cleanup, withIntermediateDirectories: true)
+        let expired = cleanup.appendingPathComponent("expired.wav")
+        let protected = cleanup.appendingPathComponent("protected.wav")
+        let current = cleanup.appendingPathComponent("current.wav")
+        try Data([1]).write(to: expired)
+        try Data([2]).write(to: protected)
+        try Data([3]).write(to: current)
+        let now = Date()
+        let old = now.addingTimeInterval(-(31 * 24 * 60 * 60))
+        try fm.setAttributes([.modificationDate: old], ofItemAtPath: expired.path)
+        try fm.setAttributes([.modificationDate: old], ofItemAtPath: protected.path)
+        let removed = DictationArchive.removeExpiredFiles(
+            in: [cleanup],
+            now: now,
+            maximumAge: AudioRetentionPolicy.thirtyDays.maximumAge!,
+            protectedStems: ["protected"]
+        )
+        try expect(removed, equals: 1,
+                   "cleanup should remove only expired unprotected audio")
+        try expect(fm.fileExists(atPath: protected.path), equals: true,
+                   "active quality-recognition audio must be protected")
+        try expect(fm.fileExists(atPath: current.path), equals: true,
+                   "current audio must remain")
+        try expect(AudioRetentionPolicy.forever.maximumAge, equals: nil,
+                   "forever retention should disable automatic deletion")
     }
 
     private static func testInsertionTargetTracking() throws {
@@ -21388,7 +22070,8 @@ private enum ParakeySelfTest {
             transcriptsDirectory: transcriptDirectory,
             recordingsDirectory: recordingsDirectory,
             failedAudioDirectory: failedAudioDirectory,
-            pendingAudioDirectory: pendingAudioDirectory
+            pendingAudioDirectory: pendingAudioDirectory,
+            qualityJobsOverride: []
         )
         try expect(
             archiveSnapshot.totalTranscriptCount,
@@ -22263,6 +22946,7 @@ private enum ControlPanelServiceOperation: String, Sendable {
     case stopping
     case applyingSettings
     case switchingModel
+    case movingStorage
 }
 
 private struct ControlPanelServicePresentation {
@@ -22309,6 +22993,7 @@ private struct ControlPanelSettingsDraft: Equatable {
     var qualityRecognitionCompletionSound: DictationCompletionSound
     var completionSoundVolume: Double
     var clipboardCompletionVisibleSeconds: TimeInterval
+    var audioRetentionPolicy: AudioRetentionPolicy
 
     init(settings: Settings) {
         hotkeyWithoutEnter = settings.configuredHotkey
@@ -22329,6 +23014,7 @@ private struct ControlPanelSettingsDraft: Equatable {
         qualityRecognitionCompletionSound = settings.qualityRecognitionCompletionSound
         completionSoundVolume = settings.completionSoundVolume
         clipboardCompletionVisibleSeconds = settings.clipboardCompletionVisibleSeconds
+        audioRetentionPolicy = settings.audioRetentionPolicy
     }
 }
 
@@ -22394,6 +23080,7 @@ private func savedDictationArchiveSnapshot(transcriptsDirectory: URL,
                                            recordingsDirectory: URL,
                                            failedAudioDirectory: URL,
                                            pendingAudioDirectory: URL,
+                                           qualityJobsOverride: [QualityRecognitionJob]? = nil,
                                            maximumLoadedTranscripts: Int = 200) -> SavedDictationArchiveSnapshot {
     let fm = FileManager.default
 
@@ -22453,7 +23140,7 @@ private func savedDictationArchiveSnapshot(transcriptsDirectory: URL,
             ($0.deletingPathExtension().lastPathComponent.replacingOccurrences(of: "pending-", with: ""), $0)
         }
     )
-    let qualityJobs = DictationArchive.qualityRecognitionJobs()
+    let qualityJobs = qualityJobsOverride ?? DictationArchive.qualityRecognitionJobs()
     let qualityJobsByStem = Dictionary(uniqueKeysWithValues: qualityJobs.map { ($0.stem, $0) })
 
     func archiveDate(_ url: URL) -> Date {
@@ -22896,6 +23583,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
     private var serviceOperation: ControlPanelServiceOperation?
     private var serviceOperationStartedAt: TimeInterval?
     private var serviceOperationFailure: String?
+    private var storageMigrationTask: Task<Void, Never>?
     private var updateTask: Task<Void, Never>?
     private var updateState: ControlPanelUpdateState = .checking
     private var lastRenderFingerprint = ""
@@ -23017,6 +23705,8 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         refreshTimer = nil
         updateTask?.cancel()
         updateTask = nil
+        storageMigrationTask?.cancel()
+        storageMigrationTask = nil
         guard !DESIGN_PREVIEW_MODE else { return }
         if stopAgentWhenControlPanelTerminates,
            SuperDictateAgentService.isAgentRunning() {
@@ -23218,6 +23908,9 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                 settings.recordingHUDTranscribingColor.rawValue,
                 settings.recordingHUDBackgroundStyle.rawValue,
                 settings.recordingHUDSize.rawValue,
+                settings.contentStoragePath,
+                settings.audioRetentionPolicy.rawValue,
+                MyDictateContentStorage.isConfiguredStorageAvailable(settings: settings) ? "storage-ready" : "storage-missing",
                 savedDictationArchiveFingerprint(),
                 permissionClickCount.description].joined(separator: "::")
     }
@@ -23506,8 +24199,8 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                 $0.qualityRecognitionJob?.state == .failed && !$0.needsRecognitionRetry
             }.count
         let archiveSummary = panelLabel(
-            t("\(snapshot.totalTranscriptCount) текстов · \(snapshot.retainedAudioCount) аудиозаписей на 7 дней · \(retryCount) требуют внимания",
-              "\(snapshot.totalTranscriptCount) texts · \(snapshot.retainedAudioCount) recordings kept for 7 days · \(retryCount) need attention"),
+            t("\(snapshot.totalTranscriptCount) текстов · \(snapshot.retainedAudioCount) аудиозаписей \(localizedAudioRetentionPhrase(settings.audioRetentionPolicy, language: .russian)) · \(retryCount) требуют внимания",
+              "\(snapshot.totalTranscriptCount) texts · \(snapshot.retainedAudioCount) recordings kept \(localizedAudioRetentionPhrase(settings.audioRetentionPolicy, language: .english)) · \(retryCount) need attention"),
             size: 11.5,
             color: .secondaryLabelColor
         )
@@ -23621,8 +24314,8 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         let audioFolder = panelButton(
             t("Аудиозаписи", "Audio Recordings"),
             action: #selector(openAudioRecordingsFolderClicked(_:)),
-            toolTip: t("Открыть в Finder все исходные WAV-записи за последние 7 дней",
-                       "Open every source WAV recording retained for the last 7 days in Finder")
+            toolTip: t("Открыть в Finder исходные WAV-записи, сохранённые \(localizedAudioRetentionPhrase(settings.audioRetentionPolicy, language: .russian))",
+                       "Open source WAV recordings kept \(localizedAudioRetentionPhrase(settings.audioRetentionPolicy, language: .english)) in Finder")
         )
         footer.addArrangedSubview(audioFolder)
         if retryCount > 0 {
@@ -23892,8 +24585,8 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             root.addArrangedSubview(status)
         } else if transcript.needsRecognitionRetry {
             let warning = panelLabel(
-                t("Распознавание не завершено. Аудио сохранено на 7 дней.",
-                  "Recognition was not completed. Audio is saved for 7 days."),
+                t("Распознавание не завершено. Аудио сохранено \(localizedAudioRetentionPhrase(settings.audioRetentionPolicy, language: .russian)).",
+                  "Recognition was not completed. Audio is saved \(localizedAudioRetentionPhrase(settings.audioRetentionPolicy, language: .english))."),
                 size: 11,
                 weight: .medium,
                 color: .systemOrange
@@ -24269,6 +24962,43 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             action: #selector(selectRecordingHUDBackgroundStyle(_:)),
             toolTip: t("Выбрать фон плавающего индикатора диктовки.",
                        "Choose the floating dictation indicator background.")
+        ))
+        form.addArrangedSubview(separator())
+        let storageHeader = NSStackView()
+        storageHeader.orientation = .vertical
+        storageHeader.alignment = .leading
+        storageHeader.spacing = 3
+        storageHeader.addArrangedSubview(panelLabel(
+            t("Хранение данных", "Data storage"),
+            size: 13,
+            weight: .semibold
+        ))
+        storageHeader.addArrangedSubview(panelLabel(
+            t("Тексты хранятся бессрочно. Для аудио можно выбрать срок хранения и другой диск.",
+              "Transcripts are kept permanently. Audio retention and the storage disk are configurable."),
+            size: 12,
+            color: .secondaryLabelColor
+        ))
+        form.addArrangedSubview(storageHeader)
+        form.addArrangedSubview(storageLocationRow())
+        form.addArrangedSubview(popupRow(
+            title: t("Хранить исходное аудио", "Keep source audio"),
+            detail: t("Просроченные записи очищаются не чаще одного раза в сутки.",
+                      "Expired recordings are cleaned at most once per day."),
+            selectedValue: draft.audioRetentionPolicy.rawValue,
+            options: AudioRetentionPolicy.allCases.map {
+                (localizedAudioRetentionName($0, language: language), $0.rawValue)
+            },
+            action: #selector(selectAudioRetentionPolicy(_:))
+        ))
+        form.addArrangedSubview(statusRow(
+            title: t("Использование хранилища", "Storage usage"),
+            detail: formattedContentStorageUsage(),
+            status: "",
+            statusColor: .secondaryLabelColor,
+            buttonTitle: t("Очистить просроченные", "Clean expired"),
+            action: #selector(cleanExpiredAudioClicked(_:)),
+            buttonEnabled: serviceOperation == nil
         ))
         let formSurface = compactCard()
         formSurface.layer?.cornerRadius = 16
@@ -24732,6 +25462,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         case .applyingSettings: return t("Сохраняю настройки…",
                                          "Saving settings…")
         case .switchingModel: return t("Переключаю модель", "Switching model")
+        case .movingStorage: return t("Переношу данные", "Moving data")
         }
     }
 
@@ -24826,6 +25557,16 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                 color: .systemBlue,
                 detailColor: .systemRed,
                 showsSpinner: true
+            )
+        }
+        if !MyDictateContentStorage.isConfiguredStorageAvailable(settings: settings) {
+            return ControlPanelServicePresentation(
+                status: t("Хранилище недоступно", "Storage unavailable"),
+                detail: t("Подключите выбранный диск или измените папку MyDictate Content в настройках.",
+                          "Connect the selected disk or change the MyDictate Content folder in Settings."),
+                color: .systemRed,
+                detailColor: .systemRed,
+                showsSpinner: false
             )
         }
         if let serviceOperationFailure, !running {
@@ -25098,6 +25839,68 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             row.addArrangedSubview(button)
         }
         return row
+    }
+
+    private func storageLocationRow() -> NSView {
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 10
+
+        let displayURL = MyDictateContentStorage.configuredDisplayURL(settings: settings)
+        let available = MyDictateContentStorage.isConfiguredStorageAvailable(settings: settings)
+        let text = NSStackView()
+        text.orientation = .vertical
+        text.alignment = .leading
+        text.spacing = 3
+        text.addArrangedSubview(panelLabel(
+            t("Папка MyDictate Content", "MyDictate Content folder"),
+            size: 13,
+            weight: .semibold
+        ))
+        let path = panelLabel(displayURL.path, size: 11.5,
+                              color: available ? .secondaryLabelColor : .systemRed)
+        path.lineBreakMode = .byTruncatingMiddle
+        path.maximumNumberOfLines = 1
+        path.toolTip = displayURL.path
+        path.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        text.addArrangedSubview(path)
+        row.addArrangedSubview(text)
+        row.addArrangedSubview(NSView())
+
+        let choose = panelButton(
+            t("Выбрать…", "Choose…"),
+            action: #selector(chooseContentStorageClicked(_:)),
+            enabled: serviceOperation == nil,
+            toolTip: t("Выбрать диск или папку для MyDictate Content.",
+                       "Choose a disk or folder for MyDictate Content.")
+        )
+        row.addArrangedSubview(choose)
+        let finder = panelButton(
+            "Finder",
+            action: #selector(openContentStorageClicked(_:)),
+            enabled: available && serviceOperation == nil
+        )
+        row.addArrangedSubview(finder)
+        let reset = panelButton(
+            t("Стандартная", "Default"),
+            action: #selector(resetContentStorageClicked(_:)),
+            enabled: !settings.contentStoragePath.isEmpty && serviceOperation == nil
+        )
+        row.addArrangedSubview(reset)
+        return row
+    }
+
+    private func formattedContentStorageUsage() -> String {
+        guard let url = try? MyDictateContentStorage.rootDirectoryURL(settings: settings) else {
+            return t("Папка сейчас недоступна.", "The folder is currently unavailable.")
+        }
+        let formatter = ByteCountFormatter()
+        formatter.allowedUnits = [.useKB, .useMB, .useGB, .useTB]
+        formatter.countStyle = .file
+        let bytes = MyDictateContentStorage.contentByteCount(at: url)
+        return t("Сейчас занято \(formatter.string(fromByteCount: Int64(clamping: bytes))).",
+                 "Currently using \(formatter.string(fromByteCount: Int64(clamping: bytes))).")
     }
 
     private func popupRow(title: String,
@@ -25698,6 +26501,8 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                         try SuperDictateAgentService.restart()
                     case .stopping:
                         SuperDictateAgentService.stop()
+                    case .movingStorage:
+                        break
                     }
                     return nil
                 } catch {
@@ -26498,6 +27303,230 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         refreshSettingsWindow()
     }
 
+    @objc private func selectAudioRetentionPolicy(_ sender: NSPopUpButton) {
+        guard let raw = sender.selectedItem?.representedObject as? String,
+              let policy = AudioRetentionPolicy(rawValue: raw) else { return }
+        var draft = settingsDraft ?? ControlPanelSettingsDraft(settings: settings)
+        draft.audioRetentionPolicy = policy
+        settingsDraft = draft
+        refreshSettingsWindow()
+    }
+
+    @objc private func openContentStorageClicked(_ sender: NSButton) {
+        do {
+            let url = try MyDictateContentStorage.rootDirectoryURL(settings: settings)
+            NSWorkspace.shared.activateFileViewerSelecting([url])
+        } catch {
+            showError(
+                title: t("Хранилище недоступно", "Storage unavailable"),
+                detail: error.localizedDescription
+            )
+        }
+    }
+
+    @objc private func chooseContentStorageClicked(_ sender: NSButton) {
+        guard serviceOperation == nil, storageMigrationTask == nil else { return }
+        let state = AgentRuntimeStateStore.read()
+        guard state?.isRecording != true,
+              state?.isTranscribing != true,
+              !DictationArchive.qualityRecognitionJobs().contains(where: { $0.state.isPending }) else {
+            showError(
+                title: t("Сначала завершите диктовку", "Finish Dictation First"),
+                detail: t("Папку нельзя менять во время записи, обычного или качественного распознавания.",
+                          "The folder cannot be changed during recording or recognition.")
+            )
+            return
+        }
+        let panel = NSOpenPanel()
+        panel.title = t("Выберите место для MyDictate Content",
+                        "Choose a location for MyDictate Content")
+        panel.prompt = t("Выбрать", "Choose")
+        panel.message = t("В выбранном месте MyDictate создаст папку «MyDictate Content».",
+                          "MyDictate will create a “MyDictate Content” folder in the selected location.")
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.canCreateDirectories = true
+        panel.allowsMultipleSelection = false
+        guard panel.runModal() == .OK, let selected = panel.url else { return }
+        MyDictateContentSecurityScope.shared.hold(selected)
+        let target = MyDictateContentStorage.selectedContentDirectory(for: selected)
+        confirmAndBeginContentStorageMigration(to: target, custom: true)
+    }
+
+    @objc private func resetContentStorageClicked(_ sender: NSButton) {
+        guard serviceOperation == nil, storageMigrationTask == nil,
+              !settings.contentStoragePath.isEmpty else { return }
+        let state = AgentRuntimeStateStore.read()
+        guard state?.isRecording != true,
+              state?.isTranscribing != true,
+              !DictationArchive.qualityRecognitionJobs().contains(where: { $0.state.isPending }) else {
+            showError(
+                title: t("Сначала завершите диктовку", "Finish Dictation First"),
+                detail: t("Папку нельзя менять во время записи или распознавания.",
+                          "The folder cannot be changed during recording or recognition.")
+            )
+            return
+        }
+        do {
+            confirmAndBeginContentStorageMigration(
+                to: try MyDictateContentStorage.defaultRootDirectoryURL(),
+                custom: false
+            )
+        } catch {
+            showError(
+                title: t("Не удалось открыть стандартную папку", "Could Not Open Default Folder"),
+                detail: error.localizedDescription
+            )
+        }
+    }
+
+    private func confirmAndBeginContentStorageMigration(to targetURL: URL,
+                                                        custom: Bool) {
+        let target = targetURL.standardizedFileURL
+        if target.path == MyDictateContentStorage.configuredDisplayURL(settings: settings).path {
+            return
+        }
+        let alert = NSAlert()
+        alert.alertStyle = .informational
+        alert.messageText = t("Перенести данные MyDictate?",
+                              "Move MyDictate data?")
+        alert.informativeText = t(
+            "Тексты и аудиозаписи будут скопированы и проверены. Только после успешной проверки MyDictate переключится на новую папку.",
+            "Transcripts and audio will be copied and verified. MyDictate will switch folders only after verification succeeds."
+        )
+        alert.addButton(withTitle: t("Перенести", "Move"))
+        alert.addButton(withTitle: t("Отмена", "Cancel"))
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        let source: URL
+        do {
+            source = try MyDictateContentStorage.rootDirectoryURL(settings: settings)
+        } catch {
+            showError(
+                title: t("Исходная папка недоступна", "Source Folder Unavailable"),
+                detail: t("Подключите прежний диск, чтобы безопасно перенести все данные.",
+                          "Connect the previous disk so all data can be moved safely.")
+            )
+            return
+        }
+
+        serviceOperation = .movingStorage
+        serviceOperationStartedAt = Date().timeIntervalSince1970
+        serviceOperationFailure = nil
+        refresh(force: true)
+        let wasRunning = SuperDictateAgentService.isAgentRunning()
+        storageMigrationTask = Task { [weak self] in
+            let outcome = await Task.detached(priority: .userInitiated) {
+                () -> Result<MyDictateContentMigrationResult, Error> in
+                do {
+                    if wasRunning {
+                        SuperDictateAgentService.stop()
+                        for _ in 0..<60 {
+                            if !SuperDictateAgentService.isAgentRunning() { break }
+                            try await Task.sleep(nanoseconds: 50_000_000)
+                        }
+                        guard !SuperDictateAgentService.isAgentRunning() else {
+                            throw NSError(
+                                domain: "MyDictate.ContentStorage",
+                                code: -2,
+                                userInfo: [
+                                    NSLocalizedDescriptionKey:
+                                        "The dictation service did not stop before migration."
+                                ]
+                            )
+                        }
+                    }
+                    let migration = try MyDictateContentStorage.migrateContents(
+                        from: source,
+                        to: target
+                    )
+                    return .success(migration)
+                } catch {
+                    return .failure(error)
+                }
+            }.value
+            guard let self else { return }
+            switch outcome {
+            case .success:
+                if custom {
+                    guard let bookmark = MyDictateContentStorage.makeBookmark(for: target) else {
+                        self.serviceOperation = nil
+                        self.serviceOperationStartedAt = nil
+                        self.storageMigrationTask = nil
+                        if wasRunning {
+                            try? SuperDictateAgentService.installAndStart()
+                        }
+                        self.showError(
+                            title: self.t("Не удалось сохранить доступ к папке",
+                                          "Could Not Save Folder Access"),
+                            detail: self.t("Исходные данные не удалены. Выберите папку ещё раз.",
+                                           "The original data was not deleted. Choose the folder again.")
+                        )
+                        self.refresh(force: true)
+                        return
+                    }
+                    self.settings.setContentStorage(bookmark: bookmark, path: target.path)
+                } else {
+                    self.settings.setContentStorage(bookmark: nil, path: nil)
+                }
+                let trashed = MyDictateContentStorage.moveOldStorageToTrash(source)
+                self.settings.lastContentCleanupAt = nil
+                _ = self.settings.refreshFromDisk()
+                if wasRunning {
+                    try? SuperDictateAgentService.installAndStart()
+                }
+                self.settingsDraft = ControlPanelSettingsDraft(settings: self.settings)
+                self.serviceOperation = nil
+                self.serviceOperationStartedAt = nil
+                self.storageMigrationTask = nil
+                self.lastRenderFingerprint = ""
+                self.refresh(force: true)
+                let message = trashed
+                    ? self.t("Данные проверены, прежняя папка перемещена в Корзину.",
+                             "Data was verified and the previous folder was moved to Trash.")
+                    : self.t("Данные проверены. Прежнюю папку не удалось переместить в Корзину — она оставлена на месте.",
+                             "Data was verified. The previous folder could not be moved to Trash and was left in place.")
+                let alert = NSAlert()
+                alert.messageText = self.t("Хранилище перенесено", "Storage moved")
+                alert.informativeText = message
+                alert.addButton(withTitle: self.t("ОК", "OK"))
+                alert.runModal()
+            case .failure(let error):
+                if wasRunning {
+                    try? SuperDictateAgentService.installAndStart()
+                }
+                self.serviceOperation = nil
+                self.serviceOperationStartedAt = nil
+                self.storageMigrationTask = nil
+                self.serviceOperationFailure = error.localizedDescription
+                self.refresh(force: true)
+                self.showError(
+                    title: self.t("Не удалось перенести хранилище", "Storage Move Failed"),
+                    detail: self.t("Исходные файлы не изменены. \(error.localizedDescription)",
+                                   "The source files were not changed. \(error.localizedDescription)")
+                )
+            }
+        }
+    }
+
+    @objc private func cleanExpiredAudioClicked(_ sender: NSButton) {
+        guard MyDictateContentStorage.isConfiguredStorageAvailable(settings: settings) else {
+            showError(
+                title: t("Хранилище недоступно", "Storage unavailable"),
+                detail: t("Подключите выбранный диск перед очисткой.",
+                          "Connect the selected disk before cleaning.")
+            )
+            return
+        }
+        let policy = settingsDraft?.audioRetentionPolicy ?? settings.audioRetentionPolicy
+        DictationArchive.removeExpiredRecoverableAudio(policy: policy)
+        settings.lastContentCleanupAt = Date()
+        refreshSettingsWindow()
+        if savedDictationsWindow?.isVisible == true {
+            refresh(force: true)
+        }
+    }
+
     @objc private func discardSettingsClicked(_ sender: NSButton) {
         settingsDraft = ControlPanelSettingsDraft(settings: settings)
         refreshSettingsWindow()
@@ -26524,6 +27553,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         settings.qualityRecognitionCompletionSound = draft.qualityRecognitionCompletionSound
         settings.completionSoundVolume = draft.completionSoundVolume
         settings.clipboardCompletionVisibleSeconds = draft.clipboardCompletionVisibleSeconds
+        settings.audioRetentionPolicy = draft.audioRetentionPolicy
         settings.agentEnabled = true
         _ = settings.refreshFromDisk()
         settingsDraft = ControlPanelSettingsDraft(settings: settings)

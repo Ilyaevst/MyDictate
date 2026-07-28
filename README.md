@@ -41,7 +41,7 @@
 ## Сохранённые диктовки и вставка
 
 Перед вставкой каждая успешная расшифровка сохраняется в
-`~/Library/Application Support/MyDictate/Saved Dictations/Transcripts`.
+`~/Library/Application Support/MyDictate Content/Transcripts`.
 Карточка «Сохранённые диктовки» открывает компактный список: можно открыть
 полный текст, скопировать его или показать исходный файл в Finder.
 
@@ -92,7 +92,11 @@ codesign --verify --deep --strict ./dist/MyDictate.app
 
 ## Данные и удаление
 
-- тексты, журналы, настройки: `~/Library/Application Support/MyDictate`;
+- тексты и исходное аудио: `~/Library/Application Support/MyDictate Content`;
+- папку `MyDictate Content` и срок хранения аудио (7 дней, 30 дней или
+  бессрочно) можно изменить в настройках; тексты сохраняются бессрочно;
+- настройки, модели, журналы и аварийное восстановление:
+  `~/Library/Application Support/MyDictate`;
 - модель: `~/Library/Application Support/FluidAudio/Models`;
 - фоновой процесс: `~/Library/LaunchAgents/com.local.mydictate.agent.plist`.
 
