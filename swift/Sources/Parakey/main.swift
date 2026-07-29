@@ -4471,10 +4471,11 @@ private struct HotkeyTransitionState {
                                                   modifiers: .maskControl),
         triggerMode: TriggerMode,
         isRecording: Bool,
+        canCancelActiveWork: Bool = false,
         canStartRecording: Bool = true
     ) -> HotkeyTransitionResult {
         if let cancellation = transitionCancelShortcut(for: event,
-                                                       isRecording: isRecording,
+                                                       canCancel: isRecording || canCancelActiveWork,
                                                        cancelHotkey: cancelHotkey) {
             return cancellation
         }
@@ -4568,12 +4569,12 @@ private struct HotkeyTransitionState {
 
     private mutating func transitionCancelShortcut(
         for event: HotkeyEventSnapshot,
-        isRecording: Bool,
+        canCancel: Bool,
         cancelHotkey: HotkeyChoice
     ) -> HotkeyTransitionResult? {
-        guard isRecording || cancelShortcutState.isEngaged else { return nil }
+        guard canCancel || cancelShortcutState.isEngaged else { return nil }
         switch cancelShortcutState.consume(event, shortcut: cancelHotkey) {
-        case .press where isRecording:
+        case .press where canCancel:
             standardShortcutState.reset()
             enterShortcutState.reset()
             clipboardShortcutState.reset()
@@ -4614,6 +4615,9 @@ final class HotkeyListener {
     var onReleaseClipboard: ((TimeInterval) -> Void)?
     var onCancel: (() -> Void)?
     var isRecordingActive: (() -> Bool)?
+    /// True while Control + the configured cancel key should stop either
+    /// capture or the ordinary transcription created from that capture.
+    var canCancelActiveWork: (() -> Bool)?
     /// Asks the app whether a new recording would actually start if
     /// onPress fired right now (ready, idle, not transcribing, not
     /// terminating). Toggle mode uses it so a press the app would
@@ -4731,6 +4735,7 @@ final class HotkeyListener {
                                                 cancelHotkey: cancelHotkey,
                                                 triggerMode: triggerMode,
                                                 isRecording: isRecordingActive?() ?? false,
+                                                canCancelActiveWork: canCancelActiveWork?() ?? false,
                                                 canStartRecording: canStartRecording?() ?? true)
         dispatchHotkeyActions(result.actions)
         return result.suppress
@@ -5461,6 +5466,32 @@ private enum DictationArchive {
         } catch {
             log("dictation source audio archive failed: \(error.localizedDescription)")
             return nil
+        }
+    }
+
+    /// Removes only the exact regular WAV returned by `saveRecordingAudio`.
+    /// Used by deliberate full cancellation after recognition has started.
+    @discardableResult
+    static func removeRecordingAudio(at url: URL?) -> Bool {
+        guard let url else { return true }
+        do {
+            let values = try url.resourceValues(forKeys: [
+                .isRegularFileKey,
+                .isSymbolicLinkKey,
+            ])
+            guard url.pathExtension.lowercased() == "wav",
+                  values.isRegularFile == true,
+                  values.isSymbolicLink != true else {
+                throw posixError(EINVAL)
+            }
+            try FileManager.default.removeItem(at: url)
+            log("canceled dictation audio removed: \(privacySafeLogPath(url))")
+            return true
+        } catch CocoaError.fileNoSuchFile {
+            return true
+        } catch {
+            log("canceled dictation audio cleanup failed: \(error.localizedDescription)")
+            return false
         }
     }
 
@@ -6485,6 +6516,26 @@ private final class WhisperProgressReporter: @unchecked Sendable {
     }
 }
 
+/// Bridges Swift task cancellation into whisper.cpp's synchronous decoder.
+/// `Task.cancel()` alone cannot interrupt `whisper_full()` while that C call is
+/// running, so the decoder polls this token through `abort_callback`.
+private final class TranscriptionCancellationToken: @unchecked Sendable {
+    private let lock = NSLock()
+    private var cancelled = false
+
+    var isCancelled: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return cancelled
+    }
+
+    func cancel() {
+        lock.lock()
+        cancelled = true
+        lock.unlock()
+    }
+}
+
 private struct WhisperTranscriptQualityAssessment: Equatable {
     let characterCount: Int
     let punctuationCount: Int
@@ -6608,7 +6659,8 @@ private final class WhisperSpeechEngine: @unchecked Sendable {
 
     func transcribe(samples: [Float],
                     language: DictationLanguage,
-                    progressHandler: (@Sendable (Int) -> Void)? = nil) throws -> String {
+                    progressHandler: (@Sendable (Int) -> Void)? = nil,
+                    cancellationToken: TranscriptionCancellationToken? = nil) throws -> String {
         guard samples.count <= Int(Int32.max) else {
             throw NSError(
                 domain: "SuperDictate.Whisper",
@@ -6625,7 +6677,8 @@ private final class WhisperSpeechEngine: @unchecked Sendable {
             languageCode: language.whisperLanguageCode,
             prompt: nil,
             useBeamSearch: false,
-            progressReporter: reporter
+            progressReporter: reporter,
+            cancellationToken: cancellationToken
         )
         progressHandler?(100)
         return text
@@ -6653,7 +6706,8 @@ private final class WhisperSpeechEngine: @unchecked Sendable {
             languageCode: language.whisperLanguageCode,
             prompt: nil,
             useBeamSearch: true,
-            progressReporter: firstReporter
+            progressReporter: firstReporter,
+            cancellationToken: nil
         )
         let firstQuality = whisperTranscriptQuality(
             first,
@@ -6682,7 +6736,8 @@ private final class WhisperSpeechEngine: @unchecked Sendable {
             // punctuation instruction itself from leaking into output.
             prompt: WHISPER_TECHNICAL_TERMS,
             useBeamSearch: true,
-            progressReporter: secondReporter
+            progressReporter: secondReporter,
+            cancellationToken: nil
         )
         let secondQuality = whisperTranscriptQuality(
             second,
@@ -6703,7 +6758,8 @@ private final class WhisperSpeechEngine: @unchecked Sendable {
                         languageCode: String,
                         prompt: String?,
                         useBeamSearch: Bool,
-                        progressReporter: WhisperProgressReporter?) throws -> String {
+                        progressReporter: WhisperProgressReporter?,
+                        cancellationToken: TranscriptionCancellationToken?) throws -> String {
         var params = whisper_full_default_params(
             useBeamSearch ? WHISPER_SAMPLING_BEAM_SEARCH : WHISPER_SAMPLING_GREEDY
         )
@@ -6759,6 +6815,18 @@ private final class WhisperSpeechEngine: @unchecked Sendable {
                 .passUnretained(progressReporter)
                 .toOpaque()
         }
+        if let cancellationToken {
+            params.abort_callback = { userData in
+                guard let userData else { return false }
+                return Unmanaged<TranscriptionCancellationToken>
+                    .fromOpaque(userData)
+                    .takeUnretainedValue()
+                    .isCancelled
+            }
+            params.abort_callback_user_data = Unmanaged
+                .passUnretained(cancellationToken)
+                .toOpaque()
+        }
 
         let runWhisper: (UnsafePointer<CChar>?) -> Int32 = { promptPointer in
             languageCode.withCString { languagePointer in
@@ -6787,6 +6855,9 @@ private final class WhisperSpeechEngine: @unchecked Sendable {
             resultCode = prompt.withCString { runWhisper($0) }
         } else {
             resultCode = runWhisper(nil)
+        }
+        if cancellationToken?.isCancelled == true {
+            throw CancellationError()
         }
         guard resultCode == 0 else {
             throw NSError(
@@ -7069,8 +7140,13 @@ actor TranscriptionWorker {
     fileprivate func transcribe(samples: [Float],
                                language: DictationLanguage = .auto,
                                requestedAt: TimeInterval,
-                               progressHandler: (@Sendable (Int) -> Void)? = nil) async throws -> TranscriptionWorkerResult {
+                               progressHandler: (@Sendable (Int) -> Void)? = nil,
+                               cancellationToken: TranscriptionCancellationToken? = nil) async throws -> TranscriptionWorkerResult {
         let workerEnteredAt = ProcessInfo.processInfo.systemUptime
+        try Task.checkCancellation()
+        if cancellationToken?.isCancelled == true {
+            throw CancellationError()
+        }
         guard let engine else { throw NSError(domain: "Parakey", code: -2) }
         guard !inFlight else {
             log("ASR: transcribe re-entered while another transcription is in flight — refusing (ParakeyApp.isBusy should make this impossible)")
@@ -7090,6 +7166,7 @@ actor TranscriptionWorker {
             let result = try await asr.transcribe(samples,
                                                   decoderState: &state,
                                                   language: language.fluidLanguage)
+            try Task.checkCancellation()
             let fluidCallCompletedAt = ProcessInfo.processInfo.systemUptime
             return TranscriptionWorkerResult(
                 text: result.text,
@@ -7102,7 +7179,9 @@ actor TranscriptionWorker {
             let whisperStartedAt = ProcessInfo.processInfo.systemUptime
             let text = try whisperEngine.transcribe(samples: samples,
                                                      language: language,
-                                                     progressHandler: progressHandler)
+                                                     progressHandler: progressHandler,
+                                                     cancellationToken: cancellationToken)
+            try Task.checkCancellation()
             let whisperCompletedAt = ProcessInfo.processInfo.systemUptime
             let elapsed = whisperCompletedAt - whisperStartedAt
             return TranscriptionWorkerResult(
@@ -11489,6 +11568,8 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var isSwitchingSpeechModel = false
     private var fallbackSpeechModelProfileAfterStartupFailure: SpeechModelProfile?
     private var startupTask: Task<Void, Never>?
+    private var activeDictationTranscriptionTask: Task<CompletedTranscriptionWorkerResult, Error>?
+    private var activeDictationTranscriptionCancellation: TranscriptionCancellationToken?
     private var qualityRecognitionTask: Task<Void, Never>?
     private var updateCheckLoopTask: Task<Void, Never>?
     private var manualUpdateCheckTask: Task<Void, Never>?
@@ -11659,9 +11740,13 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             self?.handleRelease(shortcut: .clipboardOnly, hotkeyDetectedAt: detectedAt)
         }
         hotkey.onCancel = { [weak self] in
-            self?.discardActiveRecording(reason: "cancel hotkey")
+            self?.handleCancelHotkey()
         }
         hotkey.isRecordingActive = { [weak self] in self?.isRecording == true }
+        hotkey.canCancelActiveWork = { [weak self] in
+            guard let self else { return false }
+            return self.isRecording || self.activeDictationTranscriptionTask != nil
+        }
         // Mirrors the first guard in handlePress — if this returns
         // false the press would be silently discarded, so toggle mode
         // must not flip state for it. The missing-permissions case is
@@ -11685,6 +11770,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             hotkey.onReleaseClipboard = nil
             hotkey.onCancel = nil
             hotkey.isRecordingActive = nil
+            hotkey.canCancelActiveWork = nil
             hotkey.canStartRecording = nil
             hotkey.resetToggleState()
             hotkey.stop()
@@ -12397,6 +12483,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         hotkey.onReleaseClipboard = nil
         hotkey.onCancel = nil
         hotkey.isRecordingActive = nil
+        hotkey.canCancelActiveWork = nil
         hotkey.canStartRecording = nil
         hotkey.resetToggleState()
         hotkey.stop()
@@ -12467,6 +12554,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         hotkey.onReleaseClipboard = nil
         hotkey.onCancel = nil
         hotkey.isRecordingActive = nil
+        hotkey.canCancelActiveWork = nil
         hotkey.canStartRecording = nil
         hotkey.resetToggleState()
         hotkey.stop()
@@ -12574,6 +12662,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         hotkey.onReleaseClipboard = nil
         hotkey.onCancel = nil
         hotkey.isRecordingActive = nil
+        hotkey.canCancelActiveWork = nil
         hotkey.canStartRecording = nil
         hotkey.resetToggleState()
         hotkey.stop()
@@ -12634,6 +12723,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         hotkey.onReleaseClipboard = nil
         hotkey.onCancel = nil
         hotkey.isRecordingActive = nil
+        hotkey.canCancelActiveWork = nil
         hotkey.canStartRecording = nil
         hotkey.resetToggleState()
         hotkey.stop()
@@ -12689,6 +12779,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         hotkey.onReleaseClipboard = nil
         hotkey.onCancel = nil
         hotkey.isRecordingActive = nil
+        hotkey.canCancelActiveWork = nil
         hotkey.canStartRecording = nil
         hotkey.resetToggleState()
         hotkey.stop()
@@ -13826,18 +13917,22 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         } else {
             hudProgressHandler = nil
         }
+        let cancellationToken = TranscriptionCancellationToken()
         let transcriptionTask = Task.detached(priority: .userInitiated) {
             let transcription = try await transcriptionWorker.transcribe(
                 samples: samples,
                 language: language,
                 requestedAt: asrRequestedAt,
-                progressHandler: hudProgressHandler
+                progressHandler: hudProgressHandler,
+                cancellationToken: cancellationToken
             )
             return CompletedTranscriptionWorkerResult(
                 transcription: transcription,
                 completedAt: ProcessInfo.processInfo.systemUptime
             )
         }
+        activeDictationTranscriptionTask = transcriptionTask
+        activeDictationTranscriptionCancellation = cancellationToken
 
         let transcribingUIStartedAt = ProcessInfo.processInfo.systemUptime
         setMenuBarState(.busy)
@@ -13850,9 +13945,13 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         Task { @MainActor in
             let taskStartedAt = ProcessInfo.processInfo.systemUptime
             var dictationFailed = false
+            var dictationCancelled = false
             var shouldShowClipboardCompletion = false
             do {
                 let completed = try await transcriptionTask.value
+                if cancellationToken.isCancelled {
+                    throw CancellationError()
+                }
                 let transcription = completed.transcription
                 let asrTiming = transcription.timing(
                     totalSeconds: completed.completedAt - asrRequestedAt
@@ -14000,14 +14099,47 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                         dictationFailed = true
                     }
                 }
+            } catch is CancellationError {
+                dictationCancelled = true
+                log("ordinary transcription canceled by user")
             } catch {
-                DictationArchive.preserveFailedAudio(
-                    samples,
-                    sourceAudioURL: captured.recoveryURL,
-                    errorDescription: error.localizedDescription
+                if cancellationToken.isCancelled {
+                    dictationCancelled = true
+                    log("ordinary transcription aborted by user")
+                } else {
+                    DictationArchive.preserveFailedAudio(
+                        samples,
+                        sourceAudioURL: captured.recoveryURL,
+                        errorDescription: error.localizedDescription
+                    )
+                    log("transcribe failed: \(error)")
+                    dictationFailed = true
+                }
+            }
+            if activeDictationTranscriptionCancellation === cancellationToken {
+                activeDictationTranscriptionTask = nil
+                activeDictationTranscriptionCancellation = nil
+            }
+            if dictationCancelled {
+                _ = DictationArchive.removeRecordingAudio(at: archivedAudioURL)
+                PendingDictationRecovery.remove(captured.recoveryURL)
+                isBusy = false
+                recordingHUDTranscribingStartedAt = nil
+                showTransientHUDCompletion(
+                    settings.interfaceLanguage == .english ? "Canceled" : "Отменено",
+                    visibleSeconds: RECORDING_HUD_TRANSIENT_STATUS_VISIBLE_SECONDS
                 )
-                log("transcribe failed: \(error)")
-                dictationFailed = true
+                Sounds.play(settings.cancellationSound,
+                            volume: settings.completionSoundVolume)
+                setMenuBarState(.idle)
+                rebuildMenu()
+                let didRestartAudio = runDeferredAudioRouteRefreshIfNeeded()
+                recoverRuntimeAfterWakeIfNeeded(reason: "transcription canceled")
+                if !didRestartAudio {
+                    scheduleAudioIdleStop(reason: "transcription canceled")
+                }
+                startQualityRecognitionIfPossible()
+                return
             }
             isBusy = false
             finishBusyHUD(showCompletion: shouldShowClipboardCompletion && !dictationFailed)
@@ -14164,6 +14296,31 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                                         runDeferredRefresh: runDeferredRefresh)
     }
 
+    private func handleCancelHotkey() {
+        if isRecording || audio.isRunning {
+            discardActiveRecording(reason: "cancel hotkey")
+            return
+        }
+        cancelActiveDictationTranscription(reason: "cancel hotkey")
+    }
+
+    private func cancelActiveDictationTranscription(reason: String) {
+        guard let task = activeDictationTranscriptionTask,
+              let cancellation = activeDictationTranscriptionCancellation else {
+            hotkey.resetToggleState()
+            return
+        }
+        guard !cancellation.isCancelled else { return }
+
+        cancellation.cancel()
+        task.cancel()
+        recordingHUDTranscribingStartedAt = nil
+        showCompletedHUD(
+            text: settings.interfaceLanguage == .english ? "Canceling…" : "Отменяю…"
+        )
+        log("ordinary transcription cancellation requested (\(reason))")
+    }
+
     /// A deliberate user cancellation is different from recovery after sleep,
     /// permission loss or termination. It discards the in-flight journal and
     /// never creates a WAV, transcript, history entry or clipboard value.
@@ -14208,6 +14365,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         hotkey.onReleaseClipboard = nil
         hotkey.onCancel = nil
         hotkey.isRecordingActive = nil
+        hotkey.canCancelActiveWork = nil
         hotkey.canStartRecording = nil
         hotkey.stop()
 
@@ -18332,6 +18490,9 @@ private enum ParakeySelfTest {
             return runWhisperFiles(arguments: Array(arguments.dropFirst(2)),
                                    qualityMode: true)
         }
+        if arguments[1] == "whisper-cancel-file" {
+            return runWhisperCancellation(arguments: Array(arguments.dropFirst(2)))
+        }
         guard arguments.count == 2 else { return fail("usage") }
 
         switch arguments[1] {
@@ -18431,6 +18592,40 @@ private enum ParakeySelfTest {
             return EXIT_SUCCESS
         } catch {
             return fail("whisper-files: \(error)")
+        }
+    }
+
+    private static func runWhisperCancellation(arguments: [String]) -> Int32 {
+        guard arguments.count == 3 else {
+            return fail("usage: --self-test whisper-cancel-file <model> <vad-model> <audio>")
+        }
+        do {
+            let engine = try WhisperSpeechEngine(
+                modelURL: URL(fileURLWithPath: arguments[0]),
+                vadModelURL: URL(fileURLWithPath: arguments[1])
+            )
+            let samples = try DictationArchive.loadRecordingAudio(
+                from: URL(fileURLWithPath: arguments[2])
+            )
+            let token = TranscriptionCancellationToken()
+            DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 0.2) {
+                token.cancel()
+            }
+            let startedAt = ProcessInfo.processInfo.systemUptime
+            do {
+                _ = try engine.transcribe(
+                    samples: samples,
+                    language: .auto,
+                    cancellationToken: token
+                )
+                return fail("whisper-cancel-file: decoder completed instead of canceling")
+            } catch is CancellationError {
+                let elapsed = ProcessInfo.processInfo.systemUptime - startedAt
+                print("PASS whisper-cancel-file (\(String(format: "%.2f", elapsed)) s)")
+                return EXIT_SUCCESS
+            }
+        } catch {
+            return fail("whisper-cancel-file: \(error)")
         }
     }
 
@@ -18884,6 +19079,7 @@ private enum ParakeySelfTest {
         try testConfigurableEnterShortcut()
         try testConfigurableClipboardShortcut()
         try testConfigurableCancelShortcut()
+        try testTranscriptionCancellationToken()
         try testFKeyAutoRepeatSuppressesWithoutAction()
         try testRightModifierReleaseWithLeftFlagStillSet()
         try testShiftCommandClipboardChord()
@@ -21904,6 +22100,11 @@ private enum ParakeySelfTest {
 
     private static func testRecordingLifecycle() throws {
         try expect(
+            MAX_RECORDING_SECONDS,
+            equals: 20 * 60,
+            "recording safety limit should auto-release after 20 minutes"
+        )
+        try expect(
             DictationArchive.hasMeaningfulTranscriptContent(". . . ."),
             equals: false,
             "punctuation-only transcript must retain recovery audio"
@@ -22061,6 +22262,27 @@ private enum ParakeySelfTest {
             restoredSamples.count,
             equals: expectedSamples.count,
             "archived source WAV should retain every captured sample"
+        )
+        let canceledArchiveSource = archiveRoot
+            .appendingPathComponent("pending-canceled-transcription")
+            .appendingPathExtension("sdaudio")
+        try Data().write(to: canceledArchiveSource)
+        guard let canceledRecordingURL = DictationArchive.saveRecordingAudio(
+            expectedSamples,
+            sourceAudioURL: canceledArchiveSource,
+            directoryOverride: recordingsDirectory
+        ) else {
+            throw SelfTestFailure.failed("transcription cancellation test should archive source audio first")
+        }
+        try expect(
+            DictationArchive.removeRecordingAudio(at: canceledRecordingURL),
+            equals: true,
+            "full cancellation should remove the exact archived source WAV"
+        )
+        try expect(
+            FileManager.default.fileExists(atPath: canceledRecordingURL.path),
+            equals: false,
+            "canceled transcription audio should not remain in the archive"
         )
 
         let pendingAudioDirectory = archiveRoot.appendingPathComponent("Pending Audio", isDirectory: true)
@@ -22624,6 +22846,53 @@ private enum ParakeySelfTest {
             equals: .pass,
             "the cancel shortcut should never start a recording while idle"
         )
+
+        var transcribingState = HotkeyTransitionState()
+        try expect(
+            transcribingState.transition(
+                for: event(.flagsChanged,
+                           keycode: CGKeyCode(59),
+                           flags: control),
+                hotkey: standard,
+                enterHotkey: enterShortcut,
+                clipboardHotkey: clipboardShortcut,
+                cancelHotkey: cancelShortcut,
+                triggerMode: .toggle,
+                isRecording: false,
+                canCancelActiveWork: true,
+                canStartRecording: false
+            ),
+            equals: .suppressOnly,
+            "Control should be reserved while a transcription cancel chord is forming"
+        )
+        try expect(
+            transcribingState.transition(
+                for: event(.flagsChanged,
+                           keycode: RIGHT_COMMAND_KEYCODE,
+                           flags: commandControl),
+                hotkey: standard,
+                enterHotkey: enterShortcut,
+                clipboardHotkey: clipboardShortcut,
+                cancelHotkey: cancelShortcut,
+                triggerMode: .toggle,
+                isRecording: false,
+                canCancelActiveWork: true,
+                canStartRecording: false
+            ),
+            equals: HotkeyTransitionResult(suppress: true, actions: [.cancel]),
+            "Control + Right Command should cancel active transcription"
+        )
+    }
+
+    private static func testTranscriptionCancellationToken() throws {
+        let token = TranscriptionCancellationToken()
+        try expect(token.isCancelled,
+                   equals: false,
+                   "a new transcription cancellation token should be active")
+        token.cancel()
+        try expect(token.isCancelled,
+                   equals: true,
+                   "cancel should make the token visible to whisper.cpp")
     }
 
     private static func testFKeyAutoRepeatSuppressesWithoutAction() throws {
@@ -24799,8 +25068,8 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         ))
         form.addArrangedSubview(statusRow(
             title: t("Отменить диктовку", "Cancel dictation"),
-            detail: t("Немедленно удаляет текущую запись без распознавания и сохранения: ",
-                      "Immediately deletes the current recording without recognition or saving: ")
+            detail: t("Во время записи или обычного распознавания полностью удаляет текущую диктовку: ",
+                      "During recording or ordinary recognition, permanently deletes the current dictation: ")
                 + localizedHotkeyName(draft.hotkeyCancel, language: language),
             status: "",
             statusColor: .secondaryLabelColor,
@@ -24808,8 +25077,8 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             action: #selector(recordDictationShortcutClicked(_:)),
             tag: ControlPanelShortcutKind.cancel.rawValue,
             buttonEnabled: serviceOperation == nil,
-            toolTip: t("Назначить отдельное сочетание для полной безвозвратной отмены.",
-                       "Assign a separate shortcut that permanently cancels the current recording.")
+            toolTip: t("Назначить отдельное сочетание для полной отмены записи или идущего обычного распознавания.",
+                       "Assign a separate shortcut that fully cancels recording or ordinary recognition in progress.")
         ))
         form.addArrangedSubview(separator())
         let soundsHeader = NSStackView()
@@ -27024,8 +27293,8 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         ))
         shortcutStack.addArrangedSubview(dictationHelpShortcutRow(
             hotkey: localizedHotkeyName(settings.configuredCancelHotkey, language: language),
-            description: t("Полностью отменить · удалить текущую запись без сохранения",
-                           "Cancel completely · delete the current recording without saving")
+            description: t("Полностью отменить запись или обычное распознавание · ничего не сохранять",
+                           "Cancel recording or ordinary recognition completely · save nothing")
         ))
         root.addArrangedSubview(shortcutStack)
 
@@ -27041,8 +27310,8 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                                                     description: nil,
                                                     pointSize: 15))
         let insertionInfo = panelLabel(
-            t("После обычного завершения результат остаётся в буфере и «Сохранённых диктовках». Команда отмены безвозвратно удаляет текущую запись.",
-              "After a normal finish, the result remains in the clipboard and Saved Dictations. Cancel permanently deletes the current recording."),
+            t("После обычного завершения результат остаётся в буфере и «Сохранённых диктовках». Полная отмена во время записи или обычного распознавания удаляет текущую диктовку.",
+              "After a normal finish, the result remains in the clipboard and Saved Dictations. Full cancellation during recording or ordinary recognition deletes the current dictation."),
             size: 11,
             color: .secondaryLabelColor
         )
