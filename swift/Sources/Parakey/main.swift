@@ -23243,6 +23243,14 @@ private enum ControlPanelCompletionSoundKind: Int {
     case qualityRecognition = 6
 }
 
+private enum ControlPanelSettingsSection: Int, CaseIterable {
+    case general = 0
+    case shortcuts = 1
+    case sounds = 2
+    case indicator = 3
+    case storage = 4
+}
+
 private struct ControlPanelSettingsDraft: Equatable {
     var hotkeyWithoutEnter: HotkeyChoice
     var hotkeyWithEnter: HotkeyChoice
@@ -23859,12 +23867,22 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
     private let settings = Settings.shared
     private var permissionClickCount: [Permission: Int] = [:]
     private var settingsDraft: ControlPanelSettingsDraft?
+    private var selectedSettingsSection: ControlPanelSettingsSection = .general
     // A normal Dock/Cmd-Q termination is the user's explicit request to stop
     // MyDictate completely, including its separate LaunchAgent. Internal
     // hand-offs (opening a second panel or installing an update) opt out.
     private var stopAgentWhenControlPanelTerminates = true
 
-    private var language: InterfaceLanguage { settings.interfaceLanguage }
+    private var language: InterfaceLanguage {
+        if DESIGN_PREVIEW_MODE,
+           let rawLanguage = ProcessInfo.processInfo.environment[
+               "MYDICTATE_DESIGN_PREVIEW_LANGUAGE"
+           ],
+           let previewLanguage = InterfaceLanguage(rawValue: rawLanguage) {
+            return previewLanguage
+        }
+        return settings.interfaceLanguage
+    }
 
     private var usesDarkPanelAppearance: Bool {
         // The window honours the user's per-window appearance, while the
@@ -23936,6 +23954,20 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                 serviceOperationStartedAt = Date().timeIntervalSince1970 - elapsed
             }
             showWindow()
+            if let rawSection = ProcessInfo.processInfo.environment[
+                "MYDICTATE_DESIGN_PREVIEW_SETTINGS_SECTION"
+            ],
+               let sectionIndex = Int(rawSection),
+               let section = ControlPanelSettingsSection(rawValue: sectionIndex) {
+                selectedSettingsSection = section
+            }
+            if ProcessInfo.processInfo.environment[
+                "MYDICTATE_DESIGN_PREVIEW_SETTINGS"
+            ] == "1" {
+                DispatchQueue.main.async { [weak self] in
+                    self?.openSettingsClicked(NSButton())
+                }
+            }
             startRefreshTimer()
             if UPDATE_FEATURE_ENABLED {
                 checkForUpdates()
@@ -25011,6 +25043,9 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         form.translatesAutoresizingMaskIntoConstraints = false
 
         root.addArrangedSubview(settingsHeaderView())
+        root.addArrangedSubview(settingsSectionPicker())
+        switch selectedSettingsSection {
+        case .general:
         form.addArrangedSubview(popupRow(
             title: t("Модель распознавания", "Speech recognition model"),
             detail: t("Локальная модель. При первом выборе она загрузится; затем работает без облака.",
@@ -25023,7 +25058,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             toolTip: t("Выберите модель и нажмите «Сохранить и перезапустить».",
                        "Choose a model, then click Save & Restart.")
         ))
-        form.addArrangedSubview(separator())
+        case .shortcuts:
         form.addArrangedSubview(statusRow(
             title: t("Диктовка без Enter", "Dictation without Enter"),
             detail: t("Запускает запись; повторное нажатие вставляет текст без Enter: ",
@@ -25080,7 +25115,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             toolTip: t("Назначить отдельное сочетание для полной отмены записи или идущего обычного распознавания.",
                        "Assign a separate shortcut that fully cancels recording or ordinary recognition in progress.")
         ))
-        form.addArrangedSubview(separator())
+        case .sounds:
         let soundsHeader = NSStackView()
         soundsHeader.orientation = .vertical
         soundsHeader.alignment = .leading
@@ -25192,7 +25227,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             valueText: language == .russian ? "\(visibleSeconds) с" : "\(visibleSeconds) s",
             action: #selector(changeClipboardCompletionDuration(_:))
         ))
-        form.addArrangedSubview(separator())
+        case .indicator:
         form.addArrangedSubview(popupRow(
             title: t("Размер капсулы", "Capsule size"),
             detail: t("Размер плавающего индикатора записи.",
@@ -25232,7 +25267,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             toolTip: t("Выбрать фон плавающего индикатора диктовки.",
                        "Choose the floating dictation indicator background.")
         ))
-        form.addArrangedSubview(separator())
+        case .storage:
         let storageHeader = NSStackView()
         storageHeader.orientation = .vertical
         storageHeader.alignment = .leading
@@ -25269,9 +25304,16 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             action: #selector(cleanExpiredAudioClicked(_:)),
             buttonEnabled: serviceOperation == nil
         ))
+        }
         let formSurface = compactCard()
         formSurface.layer?.cornerRadius = 16
-        pin(form, inside: formSurface, horizontal: 14, vertical: 12)
+        formSurface.addSubview(form)
+        NSLayoutConstraint.activate([
+            form.leadingAnchor.constraint(equalTo: formSurface.leadingAnchor, constant: 14),
+            form.trailingAnchor.constraint(equalTo: formSurface.trailingAnchor, constant: -14),
+            form.topAnchor.constraint(equalTo: formSurface.topAnchor, constant: 12),
+            form.bottomAnchor.constraint(lessThanOrEqualTo: formSurface.bottomAnchor, constant: -12),
+        ])
 
         let formScroll = NSScrollView()
         formScroll.translatesAutoresizingMaskIntoConstraints = false
@@ -25281,15 +25323,23 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         formScroll.horizontalScrollElasticity = .none
         formScroll.drawsBackground = false
         formScroll.borderType = .noBorder
+        formScroll.setContentHuggingPriority(.defaultLow, for: .vertical)
+        formScroll.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
         formSurface.translatesAutoresizingMaskIntoConstraints = false
         formScroll.documentView = formSurface
+        let fillsVisibleHeight = formSurface.heightAnchor.constraint(
+            greaterThanOrEqualTo: formScroll.contentView.heightAnchor
+        )
+        fillsVisibleHeight.priority = .defaultHigh
         NSLayoutConstraint.activate([
             formSurface.leadingAnchor.constraint(equalTo: formScroll.contentView.leadingAnchor),
             formSurface.trailingAnchor.constraint(equalTo: formScroll.contentView.trailingAnchor),
             formSurface.topAnchor.constraint(equalTo: formScroll.contentView.topAnchor),
-            formSurface.bottomAnchor.constraint(equalTo: formScroll.contentView.bottomAnchor),
             formSurface.widthAnchor.constraint(equalTo: formScroll.contentView.widthAnchor),
-            formScroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 320),
+            fillsVisibleHeight,
+            // Keep the settings usable on short laptop displays. The form is
+            // the only flexible region; header, tabs and actions stay fixed.
+            formScroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 180),
         ])
         root.addArrangedSubview(formScroll)
         root.addArrangedSubview(settingsActionsRow(draft: draft))
@@ -25392,6 +25442,70 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         row.addArrangedSubview(NSView())
         row.addArrangedSubview(panelLabel("v\(currentBundleVersion())", size: 11, color: .tertiaryLabelColor))
         return row
+    }
+
+    private func settingsSectionPicker() -> NSView {
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 6
+        row.distribution = .fillEqually
+
+        for section in ControlPanelSettingsSection.allCases {
+            let button = panelButton(
+                settingsSectionTitle(section),
+                action: #selector(selectSettingsSection(_:)),
+                toolTip: settingsSectionToolTip(section),
+                style: section == selectedSettingsSection ? .primary : .secondary
+            )
+            button.tag = section.rawValue
+            button.image = NSImage(
+                systemSymbolName: settingsSectionSymbol(section),
+                accessibilityDescription: settingsSectionTitle(section)
+            )
+            button.imagePosition = .imageLeading
+            button.imageScaling = .scaleProportionallyDown
+            button.translatesAutoresizingMaskIntoConstraints = false
+            button.heightAnchor.constraint(equalToConstant: 30).isActive = true
+            button.setAccessibilityLabel(settingsSectionTitle(section))
+            row.addArrangedSubview(button)
+        }
+        return row
+    }
+
+    private func settingsSectionTitle(_ section: ControlPanelSettingsSection) -> String {
+        switch section {
+        case .general: return t("Основные", "General")
+        case .shortcuts: return t("Клавиши", "Shortcuts")
+        case .sounds: return t("Звуки", "Sounds")
+        case .indicator: return t("Индикатор", "Indicator")
+        case .storage: return t("Хранение", "Storage")
+        }
+    }
+
+    private func settingsSectionSymbol(_ section: ControlPanelSettingsSection) -> String {
+        switch section {
+        case .general: return "slider.horizontal.3"
+        case .shortcuts: return "keyboard"
+        case .sounds: return "speaker.wave.2.fill"
+        case .indicator: return "waveform"
+        case .storage: return "externaldrive.fill"
+        }
+    }
+
+    private func settingsSectionToolTip(_ section: ControlPanelSettingsSection) -> String {
+        switch section {
+        case .general:
+            return t("Модель распознавания речи", "Speech recognition model")
+        case .shortcuts:
+            return t("Горячие клавиши диктовки", "Dictation keyboard shortcuts")
+        case .sounds:
+            return t("Звуки событий и подтверждения", "Event sounds and confirmations")
+        case .indicator:
+            return t("Вид плавающего индикатора", "Floating indicator appearance")
+        case .storage:
+            return t("Папка и срок хранения исходников", "Source folder and retention")
+        }
     }
 
     private func compactServiceCard() -> NSView {
@@ -27204,20 +27318,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         settingsWindow.delegate = self
         settingsWindow.contentView = makeSettingsContentView()
         resizeSettingsWindow(settingsWindow)
-        if let mainWindow = window, let visibleFrame = mainWindow.screen?.visibleFrame {
-            let mainFrame = mainWindow.frame
-            let preferredRight = mainFrame.maxX + 14
-            let preferredLeft = mainFrame.minX - settingsWindow.frame.width - 14
-            let x = preferredRight + settingsWindow.frame.width <= visibleFrame.maxX
-                ? preferredRight
-                : max(visibleFrame.minX, preferredLeft)
-            let y = min(max(visibleFrame.minY,
-                            mainFrame.maxY - settingsWindow.frame.height),
-                        visibleFrame.maxY - settingsWindow.frame.height)
-            settingsWindow.setFrameOrigin(NSPoint(x: x, y: y))
-        } else {
-            settingsWindow.center()
-        }
+        positionSecondaryWindow(settingsWindow)
         self.settingsWindow = settingsWindow
         settingsWindow.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
@@ -27229,7 +27330,15 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
     }
 
     private func resizeSettingsWindow(_ settingsWindow: NSWindow) {
-        let size = fittedSecondarySize(NSSize(width: 500, height: 580))
+        var preferred = NSSize(width: 500, height: 580)
+        if DESIGN_PREVIEW_MODE,
+           let rawHeight = ProcessInfo.processInfo.environment[
+               "MYDICTATE_DESIGN_PREVIEW_SETTINGS_HEIGHT"
+           ],
+           let previewHeight = Double(rawHeight) {
+            preferred.height = min(580, max(360, previewHeight))
+        }
+        let size = fittedSecondarySize(preferred)
         let oldTop = settingsWindow.frame.maxY
         settingsWindow.contentMinSize = size
         settingsWindow.contentMaxSize = size
@@ -27794,6 +27903,13 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         if savedDictationsWindow?.isVisible == true {
             refresh(force: true)
         }
+    }
+
+    @objc private func selectSettingsSection(_ sender: NSButton) {
+        guard let section = ControlPanelSettingsSection(rawValue: sender.tag),
+              section != selectedSettingsSection else { return }
+        selectedSettingsSection = section
+        refreshSettingsWindow()
     }
 
     @objc private func discardSettingsClicked(_ sender: NSButton) {
