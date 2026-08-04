@@ -4,3 +4,4 @@ swift/.build/
 dist/
 vendor/whisper/
 *.xcuserstate
+ui-prototype/
