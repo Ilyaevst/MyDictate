@@ -116,8 +116,8 @@ let RECORDING_HUD_PROGRESS_MINIMUM_RECORDING_SECONDS: TimeInterval = 60
 let RECORDING_HUD_TARGET_REFRESH_INTERVAL: TimeInterval = 0.16
 let RECORDING_HUD_TARGET_FOLLOW_RESPONSE: CGFloat = 22
 let RECORDING_HUD_TARGET_CACHE_MAX_AGE: TimeInterval = 10 * 60
-let RECORDING_HUD_DISPLAY_LINK_MIN_FPS: Float = 60
-let RECORDING_HUD_DISPLAY_LINK_MAX_FPS: Float = 120
+let RECORDING_HUD_RECORDING_FPS: Float = 60
+let RECORDING_HUD_TRANSCRIBING_FPS: Float = 30
 let RECORDING_HUD_RECORDING_BASE_PHASE_SPEED: CGFloat = 16.96
 let RECORDING_HUD_RECORDING_LEVEL_PHASE_SPEED: CGFloat = 10.08
 let RECORDING_HUD_TRANSCRIBING_PHASE_SPEED: CGFloat = 10.2
@@ -163,6 +163,19 @@ enum RecordingHUDMode {
     case paused
     case transcribing
     case completed
+}
+
+func recordingHUDFramesPerSecond(mode: RecordingHUDMode?,
+                                 isRevealAnimating: Bool) -> Float {
+    if isRevealAnimating { return RECORDING_HUD_RECORDING_FPS }
+    switch mode {
+    case .recording:
+        return RECORDING_HUD_RECORDING_FPS
+    case .transcribing:
+        return RECORDING_HUD_TRANSCRIBING_FPS
+    case .paused, .completed, .none:
+        return 0
+    }
 }
 
 enum HotkeyPressPattern: String, CaseIterable {
@@ -5146,7 +5159,7 @@ final class HotkeyListener {
 // the observer and that clears `onConfigurationChange` at
 // termination.
 
-private struct CapturedAudioSegments {
+private struct CapturedAudioSegments: Sendable {
     let segments: [[Float]]
     let sampleCount: Int
 
@@ -5161,12 +5174,35 @@ private struct CapturedAudioSegments {
     }
 }
 
-private struct CapturedRecording {
+private struct DetachedRecording: Sendable {
+    let segments: CapturedAudioSegments
+    let recoveryJournal: PendingDictationJournal?
+    let detachSeconds: TimeInterval
+
+    var sampleCount: Int { segments.sampleCount }
+}
+
+private struct CapturedRecording: Sendable {
     let samples: [Float]
     let recoveryURL: URL?
     let detachSeconds: TimeInterval
     let journalFlushSeconds: TimeInterval
     let flattenSeconds: TimeInterval
+}
+
+private func finalizeDetachedRecording(_ detached: DetachedRecording) -> CapturedRecording {
+    let flushStartedAt = ProcessInfo.processInfo.systemUptime
+    detached.recoveryJournal?.finish()
+    let journalFlushedAt = ProcessInfo.processInfo.systemUptime
+    let samples = detached.segments.flattened()
+    let flattenedAt = ProcessInfo.processInfo.systemUptime
+    return CapturedRecording(
+        samples: samples,
+        recoveryURL: detached.recoveryJournal?.url,
+        detachSeconds: detached.detachSeconds,
+        journalFlushSeconds: journalFlushedAt - flushStartedAt,
+        flattenSeconds: flattenedAt - journalFlushedAt
+    )
 }
 
 private enum QualityRecognitionJobState: String, Codable, Sendable {
@@ -6629,8 +6665,10 @@ final class AudioCapture: @unchecked Sendable {
         }
     }
 
-    /// Stops recording, flushes its crash-recovery journal, and returns the captured samples.
-    fileprivate func endRecording() -> CapturedRecording {
+    /// Stops accepting frames and detaches the current buffers while holding
+    /// the render-thread lock only briefly. Journal flush and flattening are
+    /// deliberately separate so normal completion can perform them off-main.
+    fileprivate func detachRecording() -> DetachedRecording {
         let startedAt = ProcessInfo.processInfo.systemUptime
         lock.lock()
         _isRunning = false
@@ -6643,17 +6681,18 @@ final class AudioCapture: @unchecked Sendable {
         self.recoveryJournal = nil
         lock.unlock()
         let detachedAt = ProcessInfo.processInfo.systemUptime
-        recoveryJournal?.finish()
-        let journalFlushedAt = ProcessInfo.processInfo.systemUptime
-        let flattened = captured.flattened()
-        let flattenedAt = ProcessInfo.processInfo.systemUptime
-        return CapturedRecording(
-            samples: flattened,
-            recoveryURL: recoveryJournal?.url,
-            detachSeconds: detachedAt - startedAt,
-            journalFlushSeconds: journalFlushedAt - detachedAt,
-            flattenSeconds: flattenedAt - journalFlushedAt
+        return DetachedRecording(
+            segments: captured,
+            recoveryJournal: recoveryJournal,
+            detachSeconds: detachedAt - startedAt
         )
+    }
+
+    /// Synchronous safety path used during termination and legacy recovery.
+    /// The ordinary hotkey completion path uses `detachRecording()` and the
+    /// serial I/O worker below instead.
+    fileprivate func endRecording() -> CapturedRecording {
+        finalizeDetachedRecording(detachRecording())
     }
 
     func latestRecordingLevelSnapshot() -> (level: Float, sequence: UInt64) {
@@ -6830,6 +6869,76 @@ final class AudioCapture: @unchecked Sendable {
             return
         }
         log("AudioCapture: selected input \(device.name)")
+    }
+}
+
+private actor DictationAudioIOWorker {
+    func pendingRecoveryURLs() -> [URL] {
+        PendingDictationRecovery.pendingURLs()
+    }
+
+    func loadPendingSamples(from url: URL) throws -> [Float] {
+        try PendingDictationRecovery.loadSamples(from: url)
+    }
+
+    func finalize(_ detached: DetachedRecording) -> CapturedRecording {
+        finalizeDetachedRecording(detached)
+    }
+
+    func archiveSourceAudio(_ captured: CapturedRecording) -> URL? {
+        DictationArchive.saveRecordingAudio(
+            captured.samples,
+            sourceAudioURL: captured.recoveryURL
+        )
+    }
+
+    func archiveSourceAudio(_ samples: [Float], sourceAudioURL: URL?) -> URL? {
+        DictationArchive.saveRecordingAudio(samples, sourceAudioURL: sourceAudioURL)
+    }
+
+    func saveTranscript(_ text: String, sourceAudioURL: URL?) -> URL? {
+        DictationArchive.saveTranscript(text, sourceAudioURL: sourceAudioURL)
+    }
+
+    func preserveFailedAudio(_ captured: CapturedRecording,
+                             errorDescription: String) {
+        DictationArchive.preserveFailedAudio(
+            captured.samples,
+            sourceAudioURL: captured.recoveryURL,
+            errorDescription: errorDescription
+        )
+    }
+
+    func preserveFailedAudio(_ samples: [Float],
+                             sourceAudioURL: URL?,
+                             errorDescription: String) {
+        DictationArchive.preserveFailedAudio(
+            samples,
+            sourceAudioURL: sourceAudioURL,
+            errorDescription: errorDescription
+        )
+    }
+
+    func clearFailedAudioArtifacts(sourceAudioURL: URL) {
+        DictationArchive.clearFailedAudioArtifacts(sourceAudioURL: sourceAudioURL)
+    }
+
+    func discard(_ captured: CapturedRecording, archivedAudioURL: URL?) {
+        _ = DictationArchive.removeRecordingAudio(at: archivedAudioURL)
+        PendingDictationRecovery.remove(captured.recoveryURL)
+    }
+
+    func discard(_ detached: DetachedRecording) {
+        detached.recoveryJournal?.finish()
+        PendingDictationRecovery.remove(detached.recoveryJournal?.url)
+    }
+
+    func removeRecoveryJournal(_ recoveryURL: URL?) {
+        PendingDictationRecovery.remove(recoveryURL)
+    }
+
+    func loadRecordingAudio(from url: URL) throws -> [Float] {
+        try DictationArchive.loadRecordingAudio(from: url)
     }
 }
 
@@ -12007,6 +12116,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var recordingImage: NSImage?
     private var errorImage: NSImage?
     private let audio = AudioCapture()
+    private let dictationAudioIO = DictationAudioIOWorker()
     private let hotkey = HotkeyListener()
     private let asr = TranscriptionWorker()
     private let insertionTargetTracker = FocusedInsertionTargetTracker()
@@ -12206,7 +12316,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         hotkey.isRecordingActive = { [weak self] in self?.isRecording == true }
         hotkey.canCancelActiveWork = { [weak self] in
             guard let self else { return false }
-            return self.isRecording || self.activeDictationTranscriptionTask != nil
+            return self.isRecording || self.activeDictationTranscriptionCancellation != nil
         }
         // Mirrors the first guard in handlePress — if this returns
         // false the press would be silently discarded, so toggle mode
@@ -12550,7 +12660,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
 
         do {
-            let samples = try DictationArchive.loadRecordingAudio(from: audioURL)
+            let samples = try await dictationAudioIO.loadRecordingAudio(from: audioURL)
             guard !samples.isEmpty else { throw posixError(EINVAL) }
             DictationArchive.updateQualityRecognitionJob(stem: job.stem) {
                 $0.state = .recognizing
@@ -12830,7 +12940,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     private func recoverPendingDictationsAfterStartup() async {
-        let pendingURLs = PendingDictationRecovery.pendingURLs()
+        let pendingURLs = await dictationAudioIO.pendingRecoveryURLs()
         guard !pendingURLs.isEmpty else { return }
 
         settings.refreshFromDisk()
@@ -12843,13 +12953,13 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             var recoverySamples: [Float] = []
             var archivedAudioURL: URL?
             do {
-                let samples = try PendingDictationRecovery.loadSamples(from: url)
+                let samples = try await dictationAudioIO.loadPendingSamples(from: url)
                 recoverySamples = samples
                 guard !samples.isEmpty else {
-                    PendingDictationRecovery.remove(url)
+                    await dictationAudioIO.removeRecoveryJournal(url)
                     continue
                 }
-                archivedAudioURL = DictationArchive.saveRecordingAudio(
+                archivedAudioURL = await dictationAudioIO.archiveSourceAudio(
                     samples,
                     sourceAudioURL: url
                 )
@@ -12868,9 +12978,9 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 let cleaned = ordinaryDictationText(transcription.text)
                 guard DictationArchive.hasMeaningfulTranscriptContent(cleaned) else {
                     if !cleaned.isEmpty {
-                        _ = DictationArchive.saveTranscript(cleaned, sourceAudioURL: url)
+                        _ = await dictationAudioIO.saveTranscript(cleaned, sourceAudioURL: url)
                     }
-                    DictationArchive.preserveFailedAudio(
+                    await dictationAudioIO.preserveFailedAudio(
                         samples,
                         sourceAudioURL: url,
                         errorDescription: cleaned.isEmpty
@@ -12878,14 +12988,16 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                             : "The speech model returned only punctuation or no readable words."
                     )
                     if archivedAudioURL != nil {
-                        PendingDictationRecovery.remove(url)
+                        await dictationAudioIO.removeRecoveryJournal(url)
                     }
                     log("pending dictation recovery returned no meaningful text; audio retained")
                     continue
                 }
 
-                let archivedURL = DictationArchive.saveTranscript(cleaned,
-                                                                  sourceAudioURL: url)
+                let archivedURL = await dictationAudioIO.saveTranscript(
+                    cleaned,
+                    sourceAudioURL: url
+                )
                 addToHistory(
                     cleaned,
                     transcriptionDurationSeconds: timing.totalSeconds,
@@ -12895,20 +13007,20 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                                      audioSeconds: duration,
                                      asrSeconds: timing.totalSeconds)
                 if archivedURL != nil, archivedAudioURL != nil {
-                    PendingDictationRecovery.remove(url)
-                    DictationArchive.clearFailedAudioArtifacts(sourceAudioURL: url)
+                    await dictationAudioIO.removeRecoveryJournal(url)
+                    await dictationAudioIO.clearFailedAudioArtifacts(sourceAudioURL: url)
                 } else {
                     log("pending dictation retained because its transcript or source WAV could not be archived")
                 }
                 log("pending dictation recovered: \(String(format: "%.2f", duration)) s audio → \(String(format: "%.2f", timing.totalSeconds)) s → \(cleaned.count) chars")
             } catch {
-                DictationArchive.preserveFailedAudio(
+                await dictationAudioIO.preserveFailedAudio(
                     recoverySamples,
                     sourceAudioURL: url,
                     errorDescription: error.localizedDescription
                 )
                 if archivedAudioURL != nil {
-                    PendingDictationRecovery.remove(url)
+                    await dictationAudioIO.removeRecoveryJournal(url)
                     log("pending dictation recovery failed once; source WAV retained for manual retry: \(error.localizedDescription)")
                 } else {
                     log("pending dictation recovery deferred because source WAV could not be archived: \(error.localizedDescription)")
@@ -13677,20 +13789,38 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     private func startRecordingHUDMotion() {
-        guard recordingHUDDisplayLink == nil,
-              let view = recordingHUDView else {
+        guard let view = recordingHUDView else { return }
+        let preferredFPS = recordingHUDPreferredFramesPerSecond()
+        guard preferredFPS > 0 else {
+            stopRecordingHUDMotion()
+            return
+        }
+        if let displayLink = recordingHUDDisplayLink {
+            configureRecordingHUDDisplayLink(displayLink, preferredFPS: preferredFPS)
             return
         }
         lastRecordingHUDMotionAt = ProcessInfo.processInfo.systemUptime
         let displayLink = view.displayLink(target: self,
                                            selector: #selector(recordingHUDDisplayLinkFired(_:)))
-        displayLink.preferredFrameRateRange = CAFrameRateRange(
-            minimum: RECORDING_HUD_DISPLAY_LINK_MIN_FPS,
-            maximum: RECORDING_HUD_DISPLAY_LINK_MAX_FPS,
-            preferred: RECORDING_HUD_DISPLAY_LINK_MAX_FPS
-        )
+        configureRecordingHUDDisplayLink(displayLink, preferredFPS: preferredFPS)
         displayLink.add(to: .main, forMode: .common)
         recordingHUDDisplayLink = displayLink
+    }
+
+    private func recordingHUDPreferredFramesPerSecond() -> Float {
+        recordingHUDFramesPerSecond(
+            mode: recordingHUDView?.mode,
+            isRevealAnimating: recordingHUDRevealStartedAt != nil
+        )
+    }
+
+    private func configureRecordingHUDDisplayLink(_ displayLink: CADisplayLink,
+                                                   preferredFPS: Float) {
+        displayLink.preferredFrameRateRange = CAFrameRateRange(
+            minimum: preferredFPS,
+            maximum: preferredFPS,
+            preferred: preferredFPS
+        )
     }
 
     private func stopRecordingHUDMotion() {
@@ -13713,6 +13843,11 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         advanceRecordingHUDRevealAnimation(at: now)
         let mode = recordingHUDView?.mode
             ?? ((isBusy && !isRecording) ? .transcribing : .recording)
+        if recordingHUDRevealStartedAt == nil,
+           (mode == .paused || mode == .completed) {
+            stopRecordingHUDMotion()
+            return
+        }
         let speed = recordingHUDPhaseSpeed(mode: mode, level: recordingVisualLevel)
         recordingHUDPhase += CGFloat(dt) * speed
         recordingHUDView?.phase = recordingHUDPhase
@@ -13810,7 +13945,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         recordingHUDRevealFrom = max(0, min(1, from))
         recordingHUDRevealTo = max(0, min(1, to))
         let distance = abs(recordingHUDRevealTo - recordingHUDRevealFrom)
-        recordingHUDRevealDuration = max(1.0 / Double(RECORDING_HUD_DISPLAY_LINK_MAX_FPS),
+        recordingHUDRevealDuration = max(1.0 / Double(RECORDING_HUD_RECORDING_FPS),
                                          duration * Double(distance))
         recordingHUDRevealCompletion = completion
         recordingHUDView?.revealProgress = recordingHUDRevealFrom
@@ -14404,42 +14539,12 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         unmuteIfWeMuted()
 
         let audioFinalizeStartedAt = ProcessInfo.processInfo.systemUptime
-        let captured = audio.endRecording()
-        let audioFinalizedAt = ProcessInfo.processInfo.systemUptime
-        let samples = captured.samples
+        let detached = audio.detachRecording()
         let dur: Double
-        switch recordingReleaseAction(capturedSampleCount: samples.count) {
-        case .discardTooShort(let duration):
-            dur = duration
-            log("release: clip too short (\(String(format: "%.2f", dur)) s), discarding")
-            PendingDictationRecovery.remove(captured.recoveryURL)
-            hideRecordingHUD()
-            signalDictationFailure()
-            rebuildMenu()
-            if !runDeferredAudioRouteRefreshIfNeeded() {
-                scheduleAudioIdleStop(reason: "short clip")
-            }
-            return
-        case .transcribe(let duration):
+        switch recordingReleaseAction(capturedSampleCount: detached.sampleCount) {
+        case .discardTooShort(let duration), .transcribe(let duration):
             dur = duration
         }
-        // Keep a user-playable 16 kHz WAV before inference starts.  The
-        // journal is still retained until this archive and the text file are
-        // both safely on disk, so a full disk can never turn into lost audio.
-        let archivedAudioURL = DictationArchive.saveRecordingAudio(
-            samples,
-            sourceAudioURL: captured.recoveryURL
-        )
-        if archivedAudioURL == nil {
-            log("release: source WAV archive unavailable; keeping recovery journal")
-        }
-        isBusy = true
-
-        // Start CoreML before AppKit/menu work. The UI still transitions
-        // immediately, but its disk/menu updates now overlap inference.
-        let asrRequestedAt = ProcessInfo.processInfo.systemUptime
-        let transcriptionWorker = asr
-        let language = settings.dictationLanguage
         let selectedProfile = settings.speechModelProfile.productionProfile
         let showDecoderProgress = dur >= RECORDING_HUD_PROGRESS_MINIMUM_RECORDING_SECONDS
             && (selectedProfile == .whisperSmall
@@ -14456,22 +14561,8 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             hudProgressHandler = nil
         }
         let cancellationToken = TranscriptionCancellationToken()
-        let transcriptionTask = Task.detached(priority: .userInitiated) {
-            let transcription = try await transcriptionWorker.transcribe(
-                samples: samples,
-                language: language,
-                requestedAt: asrRequestedAt,
-                progressHandler: hudProgressHandler,
-                cancellationToken: cancellationToken
-            )
-            return CompletedTranscriptionWorkerResult(
-                transcription: transcription,
-                completedAt: ProcessInfo.processInfo.systemUptime
-            )
-        }
-        activeDictationTranscriptionTask = transcriptionTask
         activeDictationTranscriptionCancellation = cancellationToken
-
+        isBusy = true
         let transcribingUIStartedAt = ProcessInfo.processInfo.systemUptime
         setMenuBarState(.busy)
         showTranscribingHUD(showsProgress: showDecoderProgress)
@@ -14482,6 +14573,69 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let taskEnqueuedAt = ProcessInfo.processInfo.systemUptime
         Task { @MainActor in
             let taskStartedAt = ProcessInfo.processInfo.systemUptime
+            let captured = await dictationAudioIO.finalize(detached)
+            let audioFinalizedAt = ProcessInfo.processInfo.systemUptime
+            let samples = captured.samples
+
+            if cancellationToken.isCancelled {
+                await finishCanceledDictation(
+                    captured,
+                    archivedAudioURL: nil,
+                    cancellationToken: cancellationToken
+                )
+                return
+            }
+
+            if case .discardTooShort = recordingReleaseAction(
+                capturedSampleCount: samples.count
+            ) {
+                await dictationAudioIO.removeRecoveryJournal(captured.recoveryURL)
+                if activeDictationTranscriptionCancellation === cancellationToken {
+                    activeDictationTranscriptionCancellation = nil
+                }
+                isBusy = false
+                log("release: clip too short (\(String(format: "%.2f", dur)) s), discarding")
+                hideRecordingHUD()
+                signalDictationFailure()
+                rebuildMenu()
+                if !runDeferredAudioRouteRefreshIfNeeded() {
+                    scheduleAudioIdleStop(reason: "short clip")
+                }
+                return
+            }
+
+            // The source WAV is durable before ASR starts. Journal flush,
+            // flattening and WAV encoding all ran on the serial I/O actor.
+            let archivedAudioURL = await dictationAudioIO.archiveSourceAudio(captured)
+            if archivedAudioURL == nil {
+                log("release: source WAV archive unavailable; keeping recovery journal")
+            }
+            if cancellationToken.isCancelled {
+                await finishCanceledDictation(
+                    captured,
+                    archivedAudioURL: archivedAudioURL,
+                    cancellationToken: cancellationToken
+                )
+                return
+            }
+
+            let asrRequestedAt = ProcessInfo.processInfo.systemUptime
+            let transcriptionWorker = asr
+            let language = settings.dictationLanguage
+            let transcriptionTask = Task.detached(priority: .userInitiated) {
+                let transcription = try await transcriptionWorker.transcribe(
+                    samples: samples,
+                    language: language,
+                    requestedAt: asrRequestedAt,
+                    progressHandler: hudProgressHandler,
+                    cancellationToken: cancellationToken
+                )
+                return CompletedTranscriptionWorkerResult(
+                    transcription: transcription,
+                    completedAt: ProcessInfo.processInfo.systemUptime
+                )
+            }
+            activeDictationTranscriptionTask = transcriptionTask
             var dictationFailed = false
             var dictationCancelled = false
             var shouldShowClipboardCompletion = false
@@ -14507,7 +14661,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                         // The durable text file is written before history and
                         // before paste. A target-app or pasteboard failure can
                         // therefore never destroy a completed transcription.
-                        let archivedURL = DictationArchive.saveTranscript(
+                        let archivedURL = await dictationAudioIO.saveTranscript(
                             cleaned,
                             sourceAudioURL: captured.recoveryURL
                         )
@@ -14555,7 +14709,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                         let journalCleanupStartedAt = ProcessInfo.processInfo.systemUptime
                         if deliverySucceeded {
                             if archivedURL != nil, archivedAudioURL != nil {
-                                PendingDictationRecovery.remove(captured.recoveryURL)
+                                await dictationAudioIO.removeRecoveryJournal(captured.recoveryURL)
                             } else {
                                 log("pending dictation retained because its transcript or source WAV could not be archived")
                             }
@@ -14578,14 +14732,13 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                             log(shouldInsertAfterRecognition
                                 ? "text insertion or persistent clipboard copy failed"
                                 : "persistent clipboard copy failed")
-                            DictationArchive.preserveFailedAudio(
-                                samples,
-                                sourceAudioURL: captured.recoveryURL,
+                            await dictationAudioIO.preserveFailedAudio(
+                                captured,
                                 errorDescription: shouldInsertAfterRecognition
                                     ? "Text could not be inserted into the active field. MyDictate attempted to keep the transcript in the clipboard."
                                     : "The transcript could not be copied to the clipboard."
                             )
-                            PendingDictationRecovery.remove(captured.recoveryURL)
+                            await dictationAudioIO.removeRecoveryJournal(captured.recoveryURL)
                             if copied {
                                 presentInsertionRecoveryNotice()
                             }
@@ -14621,14 +14774,13 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                         // the source audio and retry journal rather than accepting
                         // punctuation-only output as a successful dictation.
                         if !cleaned.isEmpty {
-                            _ = DictationArchive.saveTranscript(
+                            _ = await dictationAudioIO.saveTranscript(
                                 cleaned,
                                 sourceAudioURL: captured.recoveryURL
                             )
                         }
-                        DictationArchive.preserveFailedAudio(
-                            samples,
-                            sourceAudioURL: captured.recoveryURL,
+                        await dictationAudioIO.preserveFailedAudio(
+                            captured,
                             errorDescription: cleaned.isEmpty
                                 ? "The speech model returned an empty transcript."
                                 : "The speech model returned only punctuation or no readable words."
@@ -14645,9 +14797,8 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     dictationCancelled = true
                     log("ordinary transcription aborted by user")
                 } else {
-                    DictationArchive.preserveFailedAudio(
-                        samples,
-                        sourceAudioURL: captured.recoveryURL,
+                    await dictationAudioIO.preserveFailedAudio(
+                        captured,
                         errorDescription: error.localizedDescription
                     )
                     log("transcribe failed: \(error)")
@@ -14659,24 +14810,11 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 activeDictationTranscriptionCancellation = nil
             }
             if dictationCancelled {
-                _ = DictationArchive.removeRecordingAudio(at: archivedAudioURL)
-                PendingDictationRecovery.remove(captured.recoveryURL)
-                isBusy = false
-                recordingHUDTranscribingStartedAt = nil
-                showTransientHUDCompletion(
-                    settings.interfaceLanguage == .english ? "Canceled" : "Отменено",
-                    visibleSeconds: RECORDING_HUD_TRANSIENT_STATUS_VISIBLE_SECONDS
+                await finishCanceledDictation(
+                    captured,
+                    archivedAudioURL: archivedAudioURL,
+                    cancellationToken: cancellationToken
                 )
-                Sounds.play(settings.cancellationSound,
-                            volume: settings.completionSoundVolume)
-                setMenuBarState(.idle)
-                rebuildMenu()
-                let didRestartAudio = runDeferredAudioRouteRefreshIfNeeded()
-                recoverRuntimeAfterWakeIfNeeded(reason: "transcription canceled")
-                if !didRestartAudio {
-                    scheduleAudioIdleStop(reason: "transcription canceled")
-                }
-                startQualityRecognitionIfPossible()
                 return
             }
             isBusy = false
@@ -14706,30 +14844,25 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
 
         cancelMaxDurationAutoRelease()
-        let captured = audio.endRecording()
-        let duration = Double(captured.samples.count) / SAMPLE_RATE
+        let detached = audio.detachRecording()
+        let duration = Double(detached.sampleCount) / SAMPLE_RATE
         isRecording = false
         isRecordingPaused = false
         stopRecordingLevelMeter(hideHUD: false)
         hotkey.resetToggleState()
         unmuteIfWeMuted()
 
-        guard !captured.samples.isEmpty else {
-            PendingDictationRecovery.remove(captured.recoveryURL)
-            hideRecordingHUD()
-            setMenuBarState(.idle)
-            rebuildMenu()
-            log("recording ended without audio (\(reason))")
-            completion?()
+        guard detached.sampleCount > 0 else {
+            Task { @MainActor in
+                let captured = await dictationAudioIO.finalize(detached)
+                await dictationAudioIO.removeRecoveryJournal(captured.recoveryURL)
+                hideRecordingHUD()
+                setMenuBarState(.idle)
+                rebuildMenu()
+                log("recording ended without audio (\(reason))")
+                completion?()
+            }
             return
-        }
-
-        let archivedAudioURL = DictationArchive.saveRecordingAudio(
-            captured.samples,
-            sourceAudioURL: captured.recoveryURL
-        )
-        if archivedAudioURL == nil {
-            log("dictation recovery: source WAV archive unavailable; keeping recovery journal")
         }
 
         isBusy = true
@@ -14739,6 +14872,11 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         log("recording ended nonstandard (\(reason)); recovering \(String(format: "%.2f", duration)) s to history")
 
         Task { @MainActor in
+            let captured = await dictationAudioIO.finalize(detached)
+            let archivedAudioURL = await dictationAudioIO.archiveSourceAudio(captured)
+            if archivedAudioURL == nil {
+                log("dictation recovery: source WAV archive unavailable; keeping recovery journal")
+            }
             var recoveryFailed = false
             do {
                 let requestedAt = ProcessInfo.processInfo.systemUptime
@@ -14752,7 +14890,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 if !isTerminating {
                     let cleaned = ordinaryDictationText(transcription.text)
                     if DictationArchive.hasMeaningfulTranscriptContent(cleaned) {
-                        let archivedURL = DictationArchive.saveTranscript(
+                        let archivedURL = await dictationAudioIO.saveTranscript(
                             cleaned,
                             sourceAudioURL: captured.recoveryURL
                         )
@@ -14765,12 +14903,11 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                                              audioSeconds: duration,
                                              asrSeconds: timing.totalSeconds)
                         if archivedURL != nil, archivedAudioURL != nil {
-                            DictationArchive.preserveFailedAudio(
-                                captured.samples,
-                                sourceAudioURL: captured.recoveryURL,
+                            await dictationAudioIO.preserveFailedAudio(
+                                captured,
                                 errorDescription: "Recording ended before MyDictate could insert the text into the active field (\(reason))."
                             )
-                            PendingDictationRecovery.remove(captured.recoveryURL)
+                            await dictationAudioIO.removeRecoveryJournal(captured.recoveryURL)
                         } else {
                             recoveryFailed = true
                             log("pending dictation retained because its transcript or source WAV could not be archived")
@@ -14778,14 +14915,13 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     } else {
                         recoveryFailed = true
                         if !cleaned.isEmpty {
-                            _ = DictationArchive.saveTranscript(
+                            _ = await dictationAudioIO.saveTranscript(
                                 cleaned,
                                 sourceAudioURL: captured.recoveryURL
                             )
                         }
-                        DictationArchive.preserveFailedAudio(
-                            captured.samples,
-                            sourceAudioURL: captured.recoveryURL,
+                        await dictationAudioIO.preserveFailedAudio(
+                            captured,
                             errorDescription: cleaned.isEmpty
                                 ? "The speech model returned an empty transcript."
                                 : "The speech model returned only punctuation or no readable words."
@@ -14796,9 +14932,8 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 }
             } catch {
                 recoveryFailed = true
-                DictationArchive.preserveFailedAudio(
-                    captured.samples,
-                    sourceAudioURL: captured.recoveryURL,
+                await dictationAudioIO.preserveFailedAudio(
+                    captured,
                     errorDescription: error.localizedDescription
                 )
                 log("dictation recovery failed; audio retained for next launch: \(error.localizedDescription)")
@@ -14844,20 +14979,47 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     private func cancelActiveDictationTranscription(reason: String) {
-        guard let task = activeDictationTranscriptionTask,
-              let cancellation = activeDictationTranscriptionCancellation else {
+        guard let cancellation = activeDictationTranscriptionCancellation else {
             hotkey.resetToggleState()
             return
         }
         guard !cancellation.isCancelled else { return }
 
         cancellation.cancel()
-        task.cancel()
+        activeDictationTranscriptionTask?.cancel()
         recordingHUDTranscribingStartedAt = nil
         showCompletedHUD(
             text: settings.interfaceLanguage == .english ? "Canceling…" : "Отменяю…"
         )
         log("ordinary transcription cancellation requested (\(reason))")
+    }
+
+    private func finishCanceledDictation(
+        _ captured: CapturedRecording,
+        archivedAudioURL: URL?,
+        cancellationToken: TranscriptionCancellationToken
+    ) async {
+        await dictationAudioIO.discard(captured, archivedAudioURL: archivedAudioURL)
+        if activeDictationTranscriptionCancellation === cancellationToken {
+            activeDictationTranscriptionTask = nil
+            activeDictationTranscriptionCancellation = nil
+        }
+        isBusy = false
+        recordingHUDTranscribingStartedAt = nil
+        showTransientHUDCompletion(
+            settings.interfaceLanguage == .english ? "Canceled" : "Отменено",
+            visibleSeconds: RECORDING_HUD_TRANSIENT_STATUS_VISIBLE_SECONDS
+        )
+        Sounds.play(settings.cancellationSound,
+                    volume: settings.completionSoundVolume)
+        setMenuBarState(.idle)
+        rebuildMenu()
+        let didRestartAudio = runDeferredAudioRouteRefreshIfNeeded()
+        recoverRuntimeAfterWakeIfNeeded(reason: "transcription canceled after wake")
+        if !didRestartAudio {
+            scheduleAudioIdleStop(reason: "transcription canceled")
+        }
+        startQualityRecognitionIfPossible()
     }
 
     /// A deliberate user cancellation is different from recovery after sleep,
@@ -14870,14 +15032,13 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
 
         cancelMaxDurationAutoRelease()
-        let captured = audio.endRecording()
+        let detached = audio.detachRecording()
         isRecording = false
         isRecordingPaused = false
         recordingStartApplicationDescription = nil
         stopRecordingLevelMeter(hideHUD: false)
         hotkey.resetToggleState()
         unmuteIfWeMuted()
-        PendingDictationRecovery.remove(captured.recoveryURL)
 
         setMenuBarState(.idle)
         rebuildMenu()
@@ -14887,7 +15048,11 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         )
         Sounds.play(settings.cancellationSound,
                     volume: settings.completionSoundVolume)
-        log("recording canceled deliberately (\(reason)); \(captured.samples.count) samples discarded")
+        log("recording canceled deliberately (\(reason)); \(detached.sampleCount) samples discarded")
+
+        Task {
+            await dictationAudioIO.discard(detached)
+        }
 
         let didRestartAudio = runDeferredAudioRouteRefreshIfNeeded()
         if !didRestartAudio {
@@ -20698,6 +20863,41 @@ private enum ParakeySelfTest {
             equals: RECORDING_HUD_TRANSCRIBING_PHASE_SPEED,
             "transcribing animation speed should not depend on stale microphone level"
         )
+        try expect(
+            RECORDING_HUD_RECORDING_FPS,
+            equals: 60,
+            "recording HUD should not render above 60 FPS"
+        )
+        try expect(
+            RECORDING_HUD_TRANSCRIBING_FPS,
+            equals: 30,
+            "transcribing HUD should yield GPU time to local inference"
+        )
+        try expect(
+            recordingHUDFramesPerSecond(mode: .recording, isRevealAnimating: false),
+            equals: 60,
+            "visible recording motion should run at 60 FPS"
+        )
+        try expect(
+            recordingHUDFramesPerSecond(mode: .transcribing, isRevealAnimating: false),
+            equals: 30,
+            "visible transcription motion should run at 30 FPS"
+        )
+        try expect(
+            recordingHUDFramesPerSecond(mode: .paused, isRevealAnimating: false),
+            equals: 0,
+            "paused HUD should stop its display link"
+        )
+        try expect(
+            recordingHUDFramesPerSecond(mode: .completed, isRevealAnimating: false),
+            equals: 0,
+            "completed HUD should stop its display link"
+        )
+        try expect(
+            recordingHUDFramesPerSecond(mode: nil, isRevealAnimating: true),
+            equals: 60,
+            "HUD reveal transitions should retain their existing smoothness"
+        )
     }
 
     private static func testAudioConversion() throws {
@@ -22895,6 +23095,38 @@ private enum ParakeySelfTest {
             recoveryMode.intValue,
             equals: 0o600,
             "pending dictation journal should be private"
+        )
+
+        let detachedRecoveryURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mydictate-detached-finalize-test-\(UUID().uuidString)")
+            .appendingPathExtension("sdaudio")
+        defer { try? FileManager.default.removeItem(at: detachedRecoveryURL) }
+        let detachedJournal = try PendingDictationJournal(url: detachedRecoveryURL)
+        detachedJournal.append(Array(expectedSamples.prefix(2)))
+        detachedJournal.append(Array(expectedSamples.dropFirst(2)))
+        let detached = DetachedRecording(
+            segments: CapturedAudioSegments(
+                segments: [Array(expectedSamples.prefix(2)), Array(expectedSamples.dropFirst(2))],
+                sampleCount: expectedSamples.count
+            ),
+            recoveryJournal: detachedJournal,
+            detachSeconds: 0.001
+        )
+        let finalized = finalizeDetachedRecording(detached)
+        try expect(
+            finalized.samples,
+            equals: expectedSamples,
+            "off-main finalization should preserve segmented sample order"
+        )
+        try expect(
+            finalized.recoveryURL,
+            equals: Optional(detachedRecoveryURL),
+            "off-main finalization should keep the recovery journal identity"
+        )
+        try expect(
+            try PendingDictationRecovery.loadSamples(from: detachedRecoveryURL),
+            equals: expectedSamples,
+            "off-main finalization should flush the recovery journal before ASR"
         )
 
         let canceledRecoveryURL = FileManager.default.temporaryDirectory
