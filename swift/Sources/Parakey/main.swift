@@ -124,6 +124,8 @@ let RECORDING_HUD_TRANSCRIBING_PHASE_SPEED: CGFloat = 10.2
 let HOTKEY_CAPTURE_BEGIN_NOTIFICATION = Notification.Name("com.local.mydictate.hotkey-capture-begin")
 let HOTKEY_CAPTURE_END_NOTIFICATION = Notification.Name("com.local.mydictate.hotkey-capture-end")
 let QUALITY_RECOGNITION_QUEUE_CHANGED_NOTIFICATION = Notification.Name("com.local.mydictate.quality-recognition-queue-changed")
+let QUALITY_RECOGNITION_JOB_CHANGED_NOTIFICATION = Notification.Name("com.local.mydictate.quality-recognition-job-changed")
+let SAVED_DICTATION_ARCHIVE_CHANGED_NOTIFICATION = Notification.Name("com.local.mydictate.saved-dictation-archive-changed")
 let HOTKEY_CAPTURE_FAILSAFE_SECONDS: TimeInterval = 45
 let DICTATION_ERROR_FLASH_SECONDS: TimeInterval = 1.5  // how long the menu-bar icon flags a dropped dictation before returning to idle
 let AUDIO_START_RETRY_DELAYS_SECONDS: [UInt64] = [1, 3, 8]
@@ -2457,13 +2459,23 @@ enum SuperDictateAgentService {
     }
 
     static func isAgentRunning() -> Bool {
+        if isAgentRunningFromPublishedState() {
+            return true
+        }
+        return !agentProcessIDs().isEmpty
+    }
+
+    /// Safe for AppKit rendering and other main-thread status reads. The
+    /// agent publishes its pid atomically; `kill(pid, 0)` is non-blocking and
+    /// avoids launching `pgrep` or waiting for a child process from the UI.
+    static func isAgentRunningFromPublishedState() -> Bool {
         if let state = AgentRuntimeStateStore.read(),
            state.pid > 0,
            state.pid != getpid(),
            processIsAlive(pid: state.pid) {
             return true
         }
-        return !agentProcessIDs().isEmpty
+        return false
     }
 
     static func agentProcessIDs() -> [Int32] {
@@ -2565,6 +2577,25 @@ func privacySafeBundlePath(_ path: String) -> String {
     default:
         return privacySafeLogPath(path)
     }
+}
+
+private func notifySavedDictationArchiveChanged() {
+    DistributedNotificationCenter.default().postNotificationName(
+        SAVED_DICTATION_ARCHIVE_CHANGED_NOTIFICATION,
+        object: nil,
+        userInfo: nil,
+        deliverImmediately: true
+    )
+}
+
+private func notifyQualityRecognitionJobChanged(_ job: QualityRecognitionJob) {
+    guard let data = try? JSONEncoder().encode(job) else { return }
+    DistributedNotificationCenter.default().postNotificationName(
+        QUALITY_RECOGNITION_JOB_CHANGED_NOTIFICATION,
+        object: data.base64EncodedString(),
+        userInfo: nil,
+        deliverImmediately: true
+    )
 }
 
 private let PRIVATE_LOG_FILE_MODE = mode_t(S_IRUSR | S_IWUSR)
@@ -5693,6 +5724,7 @@ private enum DictationArchive {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
         try writePrivateFile(try encoder.encode(job), to: qualityJobURL(stem: job.stem))
+        notifyQualityRecognitionJobChanged(job)
     }
 
     static func updateQualityRecognitionJob(
@@ -5751,6 +5783,7 @@ private enum DictationArchive {
                 .appendingPathExtension("txt")
             try writePrivateFile(Data((text + "\n").utf8), to: url)
             log("dictation transcript archived: \(privacySafeLogPath(url))")
+            notifySavedDictationArchiveChanged()
             return url
         } catch {
             log("dictation transcript archive failed: \(error.localizedDescription)")
@@ -5775,6 +5808,7 @@ private enum DictationArchive {
             if !FileManager.default.fileExists(atPath: url.path) {
                 try writePCM16WAV(samples, to: url)
                 log("dictation source audio archived: \(privacySafeLogPath(url))")
+                notifySavedDictationArchiveChanged()
             }
             return url
         } catch {
@@ -5800,6 +5834,7 @@ private enum DictationArchive {
             }
             try FileManager.default.removeItem(at: url)
             log("canceled dictation audio removed: \(privacySafeLogPath(url))")
+            notifySavedDictationArchiveChanged()
             return true
         } catch CocoaError.fileNoSuchFile {
             return true
@@ -5835,6 +5870,7 @@ private enum DictationArchive {
                 """
             try writePrivateFile(Data((message + "\n").utf8), to: errorURL)
             log("failed dictation audio archived: \(privacySafeLogPath(wavURL))")
+            notifySavedDictationArchiveChanged()
         } catch {
             log("failed dictation audio archive failed: \(error.localizedDescription)")
         }
@@ -5849,6 +5885,7 @@ private enum DictationArchive {
             let directory = try failedAudioDirectoryURL()
             let baseName = archiveBaseName(sourceAudioURL: sourceAudioURL,
                                            fallbackDate: Date())
+            var removedAny = false
             for suffix in ["wav", "txt"] {
                 let url: URL
                 if suffix == "wav" {
@@ -5858,8 +5895,10 @@ private enum DictationArchive {
                 }
                 if FileManager.default.fileExists(atPath: url.path) {
                     try FileManager.default.removeItem(at: url)
+                    removedAny = true
                 }
             }
+            if removedAny { notifySavedDictationArchiveChanged() }
         } catch {
             log("failed dictation artifact cleanup failed: \(error.localizedDescription)")
         }
@@ -5938,12 +5977,13 @@ private enum DictationArchive {
             try? qualityJobsDirectoryURL(),
         ]
             .compactMap { $0 }
-        _ = removeExpiredFiles(
+        let removed = removeExpiredFiles(
             in: directories,
             now: now,
             maximumAge: maximumAge,
             protectedStems: protectedStems
         )
+        if removed > 0 { notifySavedDictationArchiveChanged() }
     }
 
     @discardableResult
@@ -19082,6 +19122,10 @@ private enum ParakeySelfTest {
             return runSuite("completion-sounds", testCompletionSoundCatalog)
         case "content-storage":
             return runSuite("content-storage", testContentStorage)
+        case "archive-index":
+            return runSuite("archive-index", testArchiveIndex)
+        case "control-panel-refresh":
+            return runSuite("control-panel-refresh", testControlPanelRefreshLifecycle)
         case "audio-route":
             return runSuite("audio-route", testAudioRouteChangeDecision)
         case "recording-lifecycle":
@@ -19202,6 +19246,8 @@ private enum ParakeySelfTest {
         try testWhisperTranscriptQuality()
         try testCompletionSoundCatalog()
         try testContentStorage()
+        try testArchiveIndex()
+        try testControlPanelRefreshLifecycle()
         try testAudioRouteChangeDecision()
         try testRecordingLifecycle()
         try testPowerStateRecoveryDecision()
@@ -19308,6 +19354,127 @@ private enum ParakeySelfTest {
                    "current audio must remain")
         try expect(AudioRetentionPolicy.forever.maximumAge, equals: nil,
                    "forever retention should disable automatic deletion")
+    }
+
+    private static func testArchiveIndex() throws {
+        let fm = FileManager.default
+        let root = fm.temporaryDirectory
+            .appendingPathComponent("mydictate-archive-index-test-\(UUID().uuidString)",
+                                    isDirectory: true)
+        defer { try? fm.removeItem(at: root) }
+        let transcripts = root.appendingPathComponent("Transcripts", isDirectory: true)
+        let recordings = root.appendingPathComponent("Audio Recordings", isDirectory: true)
+        let failed = root.appendingPathComponent("Failed Audio", isDirectory: true)
+        let pending = root.appendingPathComponent("Pending Audio", isDirectory: true)
+        for directory in [transcripts, recordings, failed, pending] {
+            try fm.createDirectory(at: directory, withIntermediateDirectories: true)
+        }
+
+        let commonDate = Date(timeIntervalSince1970: 1_700_000_000)
+        for index in 0..<1_000 {
+            let name = String(format: "dictation-%04d.txt", index)
+            let url = transcripts.appendingPathComponent(name)
+            try Data("Transcript \(index)".utf8).write(to: url)
+            try fm.setAttributes([.modificationDate: commonDate],
+                                 ofItemAtPath: url.path)
+        }
+
+        let countDiagnostics = SavedDictationArchiveScanDiagnostics()
+        let countOnly = savedDictationArchiveSnapshot(
+            transcriptsDirectory: transcripts,
+            recordingsDirectory: recordings,
+            failedAudioDirectory: failed,
+            pendingAudioDirectory: pending,
+            qualityJobsOverride: [],
+            maximumLoadedTranscripts: 0,
+            diagnostics: countDiagnostics
+        )
+        try expect(countOnly.totalTranscriptCount, equals: 1_000,
+                   "count-only archive index should count every transcript")
+        try expect(countOnly.transcripts.isEmpty, equals: true,
+                   "count-only archive index should not materialize transcript rows")
+        try expect(countDiagnostics.transcriptContentReadCount, equals: 0,
+                   "count-only archive index must not read transcript contents")
+        try expect(countDiagnostics.metadataReadCount, equals: 1_000,
+                   "archive index should read each file's metadata exactly once")
+        try expect(countDiagnostics.comparatorMetadataReadCount, equals: 0,
+                   "archive sorting must not read metadata inside its comparator")
+
+        let fullDiagnostics = SavedDictationArchiveScanDiagnostics()
+        let full = savedDictationArchiveSnapshot(
+            transcriptsDirectory: transcripts,
+            recordingsDirectory: recordings,
+            failedAudioDirectory: failed,
+            pendingAudioDirectory: pending,
+            qualityJobsOverride: [],
+            maximumLoadedTranscripts: 1_000,
+            diagnostics: fullDiagnostics
+        )
+        try expect(full.transcripts.count, equals: 1_000,
+                   "full archive index should load requested transcript rows")
+        try expect(full.transcripts.first?.url.lastPathComponent,
+                   equals: Optional("dictation-0000.txt"),
+                   "archive sorting should be stable when dates match")
+        try expect(full.transcripts.last?.url.lastPathComponent,
+                   equals: Optional("dictation-0999.txt"),
+                   "archive sorting should retain deterministic filename order")
+        try expect(fullDiagnostics.transcriptContentReadCount, equals: 1_000,
+                   "full archive index should read each requested transcript once")
+        try expect(fullDiagnostics.metadataReadCount, equals: 1_000,
+                   "full archive index should not repeat file metadata reads")
+        try expect(fullDiagnostics.comparatorMetadataReadCount, equals: 0,
+                   "full archive sorting must use preloaded dates")
+    }
+
+    private static func testControlPanelRefreshLifecycle() throws {
+        let callbackQueue = DispatchQueue(label: "com.local.mydictate.archive-index-test-callback")
+        let scanStarted = DispatchSemaphore(value: 0)
+        let allowScanToFinish = DispatchSemaphore(value: 0)
+        let completion = DispatchSemaphore(value: 0)
+        let index = SavedDictationArchiveIndex(callbackQueue: callbackQueue) { _ in
+            scanStarted.signal()
+            _ = allowScanToFinish.wait(timeout: .now() + 2)
+            return .empty
+        }
+
+        index.requestRefresh(maximumLoadedTranscripts: 0) { _ in completion.signal() }
+        try expect(scanStarted.wait(timeout: .now() + 0.1), equals: .timedOut,
+                   "hidden control panel must not start archive scans")
+        try expect(index.scanCount, equals: 0,
+                   "hidden refresh events should be ignored")
+
+        index.setActive(true)
+        index.requestRefresh(maximumLoadedTranscripts: 0) { _ in completion.signal() }
+        try expect(scanStarted.wait(timeout: .now() + 1), equals: .success,
+                   "reopening the panel should start one archive scan")
+        index.requestRefresh(maximumLoadedTranscripts: 0) { _ in completion.signal() }
+        index.requestRefresh(maximumLoadedTranscripts: 0) { _ in completion.signal() }
+        allowScanToFinish.signal()
+        for _ in 0..<3 {
+            try expect(completion.wait(timeout: .now() + 1), equals: .success,
+                       "coalesced refresh callers should receive the shared snapshot")
+        }
+        try expect(index.scanCount, equals: 1,
+                   "several archive events should coalesce into one scan")
+        try expect(index.maximumConcurrentScanCount, equals: 1,
+                   "archive index must never run two scans concurrently")
+
+        index.setActive(false)
+        index.requestRefresh(maximumLoadedTranscripts: 0) { _ in completion.signal() }
+        try expect(scanStarted.wait(timeout: .now() + 0.1), equals: .timedOut,
+                   "closing the panel should stop future archive scans")
+
+        index.setActive(true)
+        index.requestRefresh(maximumLoadedTranscripts: 0) { _ in completion.signal() }
+        try expect(scanStarted.wait(timeout: .now() + 1), equals: .success,
+                   "a second reopen should schedule exactly one fresh scan")
+        allowScanToFinish.signal()
+        try expect(completion.wait(timeout: .now() + 1), equals: .success,
+                   "reopen scan should deliver its snapshot")
+        try expect(index.scanCount, equals: 2,
+                   "each reopen should cause one fresh archive scan")
+        try expect(index.maximumConcurrentScanCount, equals: 1,
+                   "reopen must not overlap an earlier archive scan")
     }
 
     private static func testInsertionTargetTracking() throws {
@@ -24037,7 +24204,7 @@ private enum ControlPanelUpdateState: Equatable, Sendable {
     case failed(String)
 }
 
-private struct SavedDictationTranscript {
+private struct SavedDictationTranscript: Sendable {
     let url: URL
     let text: String
     let date: Date
@@ -24050,7 +24217,7 @@ private struct SavedDictationTranscript {
     let qualityRecognitionJob: QualityRecognitionJob?
 }
 
-private struct SavedDictationAudioIssue {
+private struct SavedDictationAudioIssue: Sendable {
     let audioURL: URL
     let retryAudioURL: URL
     let date: Date
@@ -24058,7 +24225,7 @@ private struct SavedDictationAudioIssue {
     let qualityRecognitionJob: QualityRecognitionJob?
 }
 
-private struct SavedDictationArchiveSnapshot {
+private struct SavedDictationArchiveSnapshot: Sendable {
     let transcripts: [SavedDictationTranscript]
     let audioIssues: [SavedDictationAudioIssue]
     let totalTranscriptCount: Int
@@ -24070,6 +24237,67 @@ private struct SavedDictationArchiveSnapshot {
     let failedAudioCount: Int
     let pendingAudioCount: Int
     let qualityRecognitionJobs: [QualityRecognitionJob]
+
+    static let empty = SavedDictationArchiveSnapshot(
+        transcripts: [],
+        audioIssues: [],
+        totalTranscriptCount: 0,
+        retainedAudioCount: 0,
+        recordingAudioCount: 0,
+        failedAudioCount: 0,
+        pendingAudioCount: 0,
+        qualityRecognitionJobs: []
+    )
+
+    var fingerprint: String {
+        let jobs = qualityRecognitionJobs.map {
+            "\($0.stem):\($0.state.rawValue):\($0.progress):\($0.updatedAt.timeIntervalSince1970)"
+        }.joined(separator: "|")
+        let transcriptsToken = transcripts.map {
+            "\($0.url.lastPathComponent):\($0.date.timeIntervalSince1970):\($0.needsRecognitionRetry)"
+        }.joined(separator: "|")
+        let issuesToken = audioIssues.map {
+            "\($0.audioURL.lastPathComponent):\($0.date.timeIntervalSince1970):\($0.isPendingJournal)"
+        }.joined(separator: "|")
+        return [
+            String(totalTranscriptCount),
+            String(retainedAudioCount),
+            String(recordingAudioCount),
+            String(failedAudioCount),
+            String(pendingAudioCount),
+            jobs,
+            transcriptsToken,
+            issuesToken,
+        ].joined(separator: ":")
+    }
+}
+
+private struct SavedDictationArchiveFile: Sendable {
+    let url: URL
+    let stem: String
+    let date: Date
+    let size: Int
+}
+
+/// Test-only counters are optional in production. They make the archive-index
+/// contract measurable without adding filesystem reads to the hot path.
+private final class SavedDictationArchiveScanDiagnostics: @unchecked Sendable {
+    private let lock = NSLock()
+    private(set) var metadataReadCount = 0
+    private(set) var transcriptContentReadCount = 0
+    private(set) var comparatorMetadataReadCount = 0
+
+    func recordMetadataRead() {
+        lock.lock()
+        metadataReadCount += 1
+        lock.unlock()
+    }
+
+    func recordTranscriptContentRead() {
+        lock.lock()
+        transcriptContentReadCount += 1
+        lock.unlock()
+    }
 }
 
 private func savedDictationArchiveSnapshot(transcriptsDirectory: URL,
@@ -24077,10 +24305,12 @@ private func savedDictationArchiveSnapshot(transcriptsDirectory: URL,
                                            failedAudioDirectory: URL,
                                            pendingAudioDirectory: URL,
                                            qualityJobsOverride: [QualityRecognitionJob]? = nil,
-                                           maximumLoadedTranscripts: Int = 200) -> SavedDictationArchiveSnapshot {
+                                           maximumLoadedTranscripts: Int = 200,
+                                           diagnostics: SavedDictationArchiveScanDiagnostics? = nil) -> SavedDictationArchiveSnapshot {
     let fm = FileManager.default
 
-    func regularFiles(in directory: URL, extension fileExtension: String) -> [URL] {
+    func regularFiles(in directory: URL,
+                      extension fileExtension: String) -> [SavedDictationArchiveFile] {
         guard let urls = try? fm.contentsOfDirectory(
             at: directory,
             includingPropertiesForKeys: [
@@ -24092,114 +24322,124 @@ private func savedDictationArchiveSnapshot(transcriptsDirectory: URL,
             ],
             options: [.skipsHiddenFiles]
         ) else { return [] }
-        return urls.filter { url in
-            guard url.pathExtension.caseInsensitiveCompare(fileExtension) == .orderedSame,
-                  let values = try? url.resourceValues(forKeys: [
-                    .isRegularFileKey,
-                    .isSymbolicLinkKey,
-                  ]) else { return false }
-            return values.isRegularFile == true && values.isSymbolicLink != true
+        return urls.compactMap { url in
+            guard url.pathExtension.caseInsensitiveCompare(fileExtension) == .orderedSame else {
+                return nil
+            }
+            diagnostics?.recordMetadataRead()
+            guard let values = try? url.resourceValues(forKeys: [
+                .isRegularFileKey,
+                .isSymbolicLinkKey,
+                .contentModificationDateKey,
+                .creationDateKey,
+                .fileSizeKey,
+            ]),
+            values.isRegularFile == true,
+            values.isSymbolicLink != true,
+            let size = values.fileSize,
+            size >= 0 else { return nil }
+            return SavedDictationArchiveFile(
+                url: url,
+                stem: url.deletingPathExtension().lastPathComponent,
+                date: values.contentModificationDate ?? values.creationDate ?? .distantPast,
+                size: size
+            )
         }
     }
 
-    let transcriptURLs = regularFiles(in: transcriptsDirectory, extension: "txt")
-        .sorted { lhs, rhs in
-            let leftValues = try? lhs.resourceValues(forKeys: [
-                .contentModificationDateKey,
-                .creationDateKey,
-            ])
-            let rightValues = try? rhs.resourceValues(forKeys: [
-                .contentModificationDateKey,
-                .creationDateKey,
-            ])
-            let left = leftValues?.contentModificationDate
-                ?? leftValues?.creationDate
-                ?? .distantPast
-            let right = rightValues?.contentModificationDate
-                ?? rightValues?.creationDate
-                ?? .distantPast
-            return left > right
-        }
+    let transcriptFiles = regularFiles(in: transcriptsDirectory, extension: "txt")
+    let recordingAudioFiles = regularFiles(in: recordingsDirectory, extension: "wav")
+    let failedAudioFiles = regularFiles(in: failedAudioDirectory, extension: "wav")
+    let pendingAudioFiles = regularFiles(in: pendingAudioDirectory, extension: "sdaudio")
 
     let recordingAudioByStem = Dictionary(
-        uniqueKeysWithValues: regularFiles(in: recordingsDirectory, extension: "wav").map {
-            ($0.deletingPathExtension().lastPathComponent, $0)
+        uniqueKeysWithValues: recordingAudioFiles.map {
+            ($0.stem, $0)
         }
     )
     let failedAudioByStem = Dictionary(
-        uniqueKeysWithValues: regularFiles(in: failedAudioDirectory, extension: "wav").map {
-            ($0.deletingPathExtension().lastPathComponent, $0)
+        uniqueKeysWithValues: failedAudioFiles.map {
+            ($0.stem, $0)
         }
     )
     let pendingAudioByStem = Dictionary(
-        uniqueKeysWithValues: regularFiles(in: pendingAudioDirectory, extension: "sdaudio").map {
-            ($0.deletingPathExtension().lastPathComponent.replacingOccurrences(of: "pending-", with: ""), $0)
+        uniqueKeysWithValues: pendingAudioFiles.map {
+            ($0.stem.replacingOccurrences(of: "pending-", with: ""), $0)
         }
     )
     let qualityJobs = qualityJobsOverride ?? DictationArchive.qualityRecognitionJobs()
     let qualityJobsByStem = Dictionary(uniqueKeysWithValues: qualityJobs.map { ($0.stem, $0) })
 
-    func archiveDate(_ url: URL) -> Date {
-        let values = try? url.resourceValues(forKeys: [.contentModificationDateKey, .creationDateKey])
-        return values?.contentModificationDate ?? values?.creationDate ?? .distantPast
+    func newestFirst(_ lhs: SavedDictationArchiveFile,
+                     _ rhs: SavedDictationArchiveFile) -> Bool {
+        if lhs.date != rhs.date { return lhs.date > rhs.date }
+        return lhs.url.lastPathComponent.localizedStandardCompare(
+            rhs.url.lastPathComponent
+        ) == .orderedAscending
     }
 
     let loadLimit = max(0, maximumLoadedTranscripts)
-    let transcripts = transcriptURLs.prefix(loadLimit).compactMap { url -> SavedDictationTranscript? in
-        guard let values = try? url.resourceValues(forKeys: [
-            .contentModificationDateKey,
-            .creationDateKey,
-            .fileSizeKey,
-        ]),
-        let fileSize = values.fileSize,
-        fileSize >= 0,
-        fileSize <= 5 * 1024 * 1024,
-        let text = try? String(contentsOf: url, encoding: .utf8) else { return nil }
+    // Count-only callers do not need an ordered transcript list. Avoid an
+    // O(n log n) sort and, critically, never open transcript contents.
+    let transcriptFilesToLoad = loadLimit == 0
+        ? []
+        : Array(transcriptFiles.sorted(by: newestFirst).prefix(loadLimit))
+    let transcripts = transcriptFilesToLoad.compactMap { file -> SavedDictationTranscript? in
+        guard file.size <= 5 * 1024 * 1024 else { return nil }
+        diagnostics?.recordTranscriptContentRead()
+        guard let text = try? String(contentsOf: file.url, encoding: .utf8) else { return nil }
         let cleaned = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !cleaned.isEmpty else { return nil }
-        let stem = url.deletingPathExtension().lastPathComponent
+        let stem = file.stem
         let failedAudio = failedAudioByStem[stem]
         let pendingAudio = pendingAudioByStem[stem]
         let recordingAudio = recordingAudioByStem[stem] ?? failedAudio
         return SavedDictationTranscript(
-            url: url,
+            url: file.url,
             text: cleaned,
-            date: values.contentModificationDate ?? values.creationDate ?? .distantPast,
-            recordingAudioURL: recordingAudio,
-            retryAudioURL: pendingAudio ?? recordingAudio ?? failedAudio,
+            date: file.date,
+            recordingAudioURL: recordingAudio?.url,
+            retryAudioURL: pendingAudio?.url ?? recordingAudio?.url ?? failedAudio?.url,
             needsRecognitionRetry: pendingAudio != nil || failedAudio != nil,
             qualityRecognitionJob: qualityJobsByStem[stem]
         )
     }
 
-    let transcriptStems = Set(transcriptURLs.map { $0.deletingPathExtension().lastPathComponent })
+    let transcriptStems = Set(transcriptFiles.map(\.stem))
     var audioIssues: [SavedDictationAudioIssue] = []
     let issueStems = Set(failedAudioByStem.keys).union(pendingAudioByStem.keys)
     for stem in issueStems where !transcriptStems.contains(stem) {
         if let pending = pendingAudioByStem[stem] {
             audioIssues.append(SavedDictationAudioIssue(
-                audioURL: recordingAudioByStem[stem] ?? failedAudioByStem[stem] ?? pending,
-                retryAudioURL: pending,
-                date: archiveDate(pending),
+                audioURL: recordingAudioByStem[stem]?.url ?? failedAudioByStem[stem]?.url ?? pending.url,
+                retryAudioURL: pending.url,
+                date: pending.date,
                 isPendingJournal: true,
                 qualityRecognitionJob: qualityJobsByStem[stem]
             ))
         } else if let failed = failedAudioByStem[stem] {
             audioIssues.append(SavedDictationAudioIssue(
-                audioURL: recordingAudioByStem[stem] ?? failed,
-                retryAudioURL: recordingAudioByStem[stem] ?? failed,
-                date: archiveDate(failed),
+                audioURL: recordingAudioByStem[stem]?.url ?? failed.url,
+                retryAudioURL: recordingAudioByStem[stem]?.url ?? failed.url,
+                date: failed.date,
                 isPendingJournal: false,
                 qualityRecognitionJob: qualityJobsByStem[stem]
             ))
         }
     }
-    audioIssues.sort { $0.date > $1.date }
+    if loadLimit > 0 {
+        audioIssues.sort {
+            if $0.date != $1.date { return $0.date > $1.date }
+            return $0.audioURL.lastPathComponent.localizedStandardCompare(
+                $1.audioURL.lastPathComponent
+            ) == .orderedAscending
+        }
+    }
 
     return SavedDictationArchiveSnapshot(
         transcripts: transcripts,
         audioIssues: Array(audioIssues.prefix(loadLimit)),
-        totalTranscriptCount: transcriptURLs.count,
+        totalTranscriptCount: transcriptFiles.count,
         retainedAudioCount: Set(recordingAudioByStem.keys)
             .union(failedAudioByStem.keys)
             .union(pendingAudioByStem.keys)
@@ -24209,6 +24449,143 @@ private func savedDictationArchiveSnapshot(transcriptsDirectory: URL,
         pendingAudioCount: pendingAudioByStem.count,
         qualityRecognitionJobs: qualityJobs
     )
+}
+
+private func currentSavedDictationArchiveSnapshot(
+    maximumLoadedTranscripts: Int
+) -> SavedDictationArchiveSnapshot {
+    guard let transcripts = try? DictationArchive.transcriptsDirectoryURL(),
+          let recordings = try? DictationArchive.audioRecordingsDirectoryURL(),
+          let failedAudio = try? DictationArchive.failedAudioDirectoryURL(),
+          let pendingAudio = try? DictationArchive.pendingAudioDirectoryURL() else {
+        return .empty
+    }
+    return savedDictationArchiveSnapshot(
+        transcriptsDirectory: transcripts,
+        recordingsDirectory: recordings,
+        failedAudioDirectory: failedAudio,
+        pendingAudioDirectory: pendingAudio,
+        maximumLoadedTranscripts: maximumLoadedTranscripts
+    )
+}
+
+/// One serial archive index serves the whole control panel. Requests that
+/// arrive while a scan is running join that scan; a single follow-up is made
+/// only when a caller needs a larger transcript payload. The index can be
+/// disabled while the panel is hidden, so filesystem notifications never
+/// resurrect background work after the red close button is used.
+private final class SavedDictationArchiveIndex: @unchecked Sendable {
+    typealias Loader = @Sendable (Int) -> SavedDictationArchiveSnapshot
+    typealias Completion = @Sendable (SavedDictationArchiveSnapshot) -> Void
+
+    private let queue = DispatchQueue(
+        label: "com.local.mydictate.archive-index",
+        qos: .utility
+    )
+    private let callbackQueue: DispatchQueue
+    private let loader: Loader
+    private let lock = NSLock()
+    private var isActive = false
+    private var inFlightLimit: Int?
+    private var inFlightCompletions: [Completion] = []
+    private var pendingLimit: Int?
+    private var pendingCompletions: [Completion] = []
+    private var _scanCount = 0
+    private var activeScanCount = 0
+    private var _maximumConcurrentScanCount = 0
+
+    init(callbackQueue: DispatchQueue = .main,
+         loader: @escaping Loader = currentSavedDictationArchiveSnapshot) {
+        self.callbackQueue = callbackQueue
+        self.loader = loader
+    }
+
+    var scanCount: Int {
+        lock.withLock { _scanCount }
+    }
+
+    var maximumConcurrentScanCount: Int {
+        lock.withLock { _maximumConcurrentScanCount }
+    }
+
+    func setActive(_ active: Bool) {
+        lock.withLock {
+            isActive = active
+            if !active {
+                pendingLimit = nil
+                pendingCompletions.removeAll()
+                inFlightCompletions.removeAll()
+            }
+        }
+    }
+
+    func requestRefresh(maximumLoadedTranscripts: Int,
+                        completion: @escaping Completion) {
+        let requestedLimit = max(0, maximumLoadedTranscripts)
+        var scanLimit: Int?
+        lock.lock()
+        guard isActive else {
+            lock.unlock()
+            return
+        }
+        if let currentLimit = inFlightLimit {
+            if requestedLimit <= currentLimit {
+                inFlightCompletions.append(completion)
+            } else {
+                pendingLimit = max(pendingLimit ?? 0, requestedLimit)
+                pendingCompletions.append(completion)
+            }
+        } else {
+            inFlightLimit = requestedLimit
+            inFlightCompletions = [completion]
+            scanLimit = requestedLimit
+        }
+        lock.unlock()
+        if let scanLimit { startScan(limit: scanLimit) }
+    }
+
+    private func startScan(limit: Int) {
+        queue.async { [self] in
+            lock.withLock {
+                _scanCount += 1
+                activeScanCount += 1
+                _maximumConcurrentScanCount = max(
+                    _maximumConcurrentScanCount,
+                    activeScanCount
+                )
+            }
+            let snapshot = loader(limit)
+            finishScan(snapshot)
+        }
+    }
+
+    private func finishScan(_ snapshot: SavedDictationArchiveSnapshot) {
+        var completions: [Completion] = []
+        var nextLimit: Int?
+        lock.lock()
+        activeScanCount -= 1
+        completions = inFlightCompletions
+        inFlightCompletions.removeAll()
+        inFlightLimit = nil
+        if isActive, let requested = pendingLimit {
+            nextLimit = requested
+            inFlightLimit = requested
+            inFlightCompletions = pendingCompletions
+        }
+        pendingLimit = nil
+        pendingCompletions.removeAll()
+        lock.unlock()
+
+        guard !completions.isEmpty else {
+            if let nextLimit { startScan(limit: nextLimit) }
+            return
+        }
+        let deliveredCompletions = completions
+        callbackQueue.async {
+            for completion in deliveredCompletions { completion(snapshot) }
+        }
+        if let nextLimit { startScan(limit: nextLimit) }
+    }
 }
 
 /// The control panel has three deliberately restrained button roles. Keeping
@@ -24583,6 +24960,15 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
     private var updateTask: Task<Void, Never>?
     private var updateState: ControlPanelUpdateState = .checking
     private var lastRenderFingerprint = ""
+    private var lastSettingsRenderFingerprint = ""
+    private var lastModelRenderFingerprint = ""
+    private var lastSavedDictationsRenderFingerprint = ""
+    private var lastSavedDetailRenderFingerprint = ""
+    private var lastHelpRenderFingerprint = ""
+    private var cachedArchiveSnapshot: SavedDictationArchiveSnapshot = .empty
+    private let archiveIndex = SavedDictationArchiveIndex()
+    private var archiveRefreshWorkItem: DispatchWorkItem?
+    private var panelRefreshIsActive = false
     private let settings = Settings.shared
     private var permissionClickCount: [Permission: Int] = [:]
     private var settingsDraft: ControlPanelSettingsDraft?
@@ -24592,6 +24978,8 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
     // MyDictate completely, including its separate LaunchAgent. Internal
     // hand-offs (opening a second panel or installing an update) opt out.
     private var stopAgentWhenControlPanelTerminates = true
+    private var terminationServiceStopIsPending = false
+    private var terminationServiceStopFinished = false
 
     private var language: InterfaceLanguage {
         if DESIGN_PREVIEW_MODE,
@@ -24673,6 +25061,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                 ] == "1" ? 15.0 : 0
                 serviceOperationStartedAt = Date().timeIntervalSince1970 - elapsed
             }
+            installArchiveChangeObserver()
             showWindow()
             if let rawSection = ProcessInfo.processInfo.environment[
                 "MYDICTATE_DESIGN_PREVIEW_SETTINGS_SECTION"
@@ -24688,7 +25077,6 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                     self?.openSettingsClicked(NSButton())
                 }
             }
-            startRefreshTimer()
             if UPDATE_FEATURE_ENABLED {
                 checkForUpdates()
             }
@@ -24701,12 +25089,12 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             return
         }
         SuperDictateControlPanelRegistry.claimCurrentPanel()
+        installArchiveChangeObserver()
         showWindow()
-        startRefreshTimer()
         if UPDATE_FEATURE_ENABLED {
             checkForUpdates()
         }
-        if settings.agentEnabled && !SuperDictateAgentService.isAgentRunning() {
+        if settings.agentEnabled && !SuperDictateAgentService.isAgentRunningFromPublishedState() {
             beginServiceOperation(.starting)
         }
     }
@@ -24721,6 +25109,30 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
     // the same window. Only an explicit Quit terminates the application.
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
 
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard !DESIGN_PREVIEW_MODE,
+              stopAgentWhenControlPanelTerminates else {
+            return .terminateNow
+        }
+        if terminationServiceStopFinished { return .terminateNow }
+        if terminationServiceStopIsPending { return .terminateLater }
+        terminationServiceStopIsPending = true
+        Task { [weak self, weak sender] in
+            await Task.detached(priority: .userInitiated) {
+                SuperDictateAgentService.stop()
+            }.value
+            guard let self else {
+                sender?.reply(toApplicationShouldTerminate: true)
+                return
+            }
+            self.terminationServiceStopFinished = true
+            self.terminationServiceStopIsPending = false
+            log("control panel quit: background dictation service stopped")
+            sender?.reply(toApplicationShouldTerminate: true)
+        }
+        return .terminateLater
+    }
+
     func applicationWillTerminate(_ notification: Notification) {
         refreshTimer?.invalidate()
         refreshTimer = nil
@@ -24728,12 +25140,25 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         updateTask = nil
         storageMigrationTask?.cancel()
         storageMigrationTask = nil
+        archiveRefreshWorkItem?.cancel()
+        archiveRefreshWorkItem = nil
+        archiveIndex.setActive(false)
+        DistributedNotificationCenter.default().removeObserver(
+            self,
+            name: SAVED_DICTATION_ARCHIVE_CHANGED_NOTIFICATION,
+            object: nil
+        )
+        DistributedNotificationCenter.default().removeObserver(
+            self,
+            name: QUALITY_RECOGNITION_QUEUE_CHANGED_NOTIFICATION,
+            object: nil
+        )
+        DistributedNotificationCenter.default().removeObserver(
+            self,
+            name: QUALITY_RECOGNITION_JOB_CHANGED_NOTIFICATION,
+            object: nil
+        )
         guard !DESIGN_PREVIEW_MODE else { return }
-        if stopAgentWhenControlPanelTerminates,
-           SuperDictateAgentService.isAgentRunning() {
-            SuperDictateAgentService.stop()
-            log("control panel quit: background dictation service stopped")
-        }
         SuperDictateControlPanelRegistry.clearCurrentPanel()
     }
 
@@ -24742,10 +25167,12 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         if closingWindow === settingsWindow {
             settingsWindow = nil
             settingsDraft = nil
+            lastSettingsRenderFingerprint = ""
             return
         }
         if closingWindow === modelWindow {
             modelWindow = nil
+            lastModelRenderFingerprint = ""
             return
         }
         if closingWindow === savedDictationsWindow {
@@ -24753,19 +25180,24 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             savedDictationDetailWindow?.close()
             savedDictationDetailWindow = nil
             savedDictationsWindow = nil
+            cachedArchiveSnapshot = archiveSummary(from: cachedArchiveSnapshot)
+            lastSavedDictationsRenderFingerprint = ""
             return
         }
         if closingWindow === savedDictationDetailWindow {
             savedDictationsWindow?.removeChildWindow(closingWindow)
             savedDictationDetailWindow = nil
             savedDictationDetailTranscript = nil
+            lastSavedDetailRenderFingerprint = ""
             return
         }
         if closingWindow === dictationHelpWindow {
             dictationHelpWindow = nil
+            lastHelpRenderFingerprint = ""
             return
         }
         if closingWindow === window {
+            stopPanelRefreshLifecycle()
             settingsWindow?.orderOut(nil)
             settingsWindow = nil
             modelWindow?.orderOut(nil)
@@ -24786,9 +25218,11 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
 
     private func showWindow() {
         if let window {
+            startPanelRefreshLifecycle()
             refresh(force: true)
             window.makeKeyAndOrderFront(nil)
             NSApp.activate(ignoringOtherApps: true)
+            requestArchiveRefresh(immediately: true)
             return
         }
 
@@ -24809,10 +25243,12 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             window.appearance = NSAppearance(named: .aqua)
         }
         self.window = window
+        startPanelRefreshLifecycle()
         refresh(force: true)
         window.center()
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+        requestArchiveRefresh(immediately: true)
         // Force one more pass after AppKit has attached the window to its
         // screen.  This is essential when macOS launches in dark mode.
         DispatchQueue.main.async { [weak self, weak window] in
@@ -24822,7 +25258,166 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         }
     }
 
+    private var hasVisiblePanelWindow: Bool {
+        [window,
+         settingsWindow,
+         modelWindow,
+         savedDictationsWindow,
+         savedDictationDetailWindow,
+         dictationHelpWindow].contains { $0?.isVisible == true }
+    }
+
+    private func installArchiveChangeObserver() {
+        DistributedNotificationCenter.default().addObserver(
+            self,
+            selector: #selector(savedDictationArchiveChanged(_:)),
+            name: SAVED_DICTATION_ARCHIVE_CHANGED_NOTIFICATION,
+            object: nil
+        )
+        DistributedNotificationCenter.default().addObserver(
+            self,
+            selector: #selector(savedDictationArchiveChanged(_:)),
+            name: QUALITY_RECOGNITION_QUEUE_CHANGED_NOTIFICATION,
+            object: nil
+        )
+        DistributedNotificationCenter.default().addObserver(
+            self,
+            selector: #selector(qualityRecognitionJobChanged(_:)),
+            name: QUALITY_RECOGNITION_JOB_CHANGED_NOTIFICATION,
+            object: nil
+        )
+    }
+
+    private func startPanelRefreshLifecycle() {
+        guard !panelRefreshIsActive else {
+            startRefreshTimer()
+            return
+        }
+        panelRefreshIsActive = true
+        archiveIndex.setActive(true)
+        startRefreshTimer()
+    }
+
+    private func stopPanelRefreshLifecycle() {
+        panelRefreshIsActive = false
+        refreshTimer?.invalidate()
+        refreshTimer = nil
+        archiveRefreshWorkItem?.cancel()
+        archiveRefreshWorkItem = nil
+        archiveIndex.setActive(false)
+        cachedArchiveSnapshot = archiveSummary(from: cachedArchiveSnapshot)
+    }
+
+    @objc private func savedDictationArchiveChanged(_ notification: Notification) {
+        requestArchiveRefresh(immediately: false)
+    }
+
+    @objc private func qualityRecognitionJobChanged(_ notification: Notification) {
+        guard panelRefreshIsActive,
+              let encoded = notification.object as? String,
+              let data = Data(base64Encoded: encoded),
+              let job = try? JSONDecoder().decode(QualityRecognitionJob.self, from: data)
+        else { return }
+        cachedArchiveSnapshot = archiveSnapshot(
+            cachedArchiveSnapshot,
+            updatingQualityRecognitionJob: job
+        )
+        refresh()
+    }
+
+    private func requestArchiveRefresh(immediately: Bool) {
+        guard panelRefreshIsActive else { return }
+        archiveRefreshWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.panelRefreshIsActive else { return }
+            let loadLimit = (self.savedDictationsWindow?.isVisible == true
+                || self.savedDictationDetailWindow?.isVisible == true) ? 200 : 0
+            self.archiveIndex.requestRefresh(
+                maximumLoadedTranscripts: loadLimit
+            ) { [weak self] snapshot in
+                Task { @MainActor [weak self] in
+                    guard let self, self.panelRefreshIsActive else { return }
+                    let oldFingerprint = self.cachedArchiveSnapshot.fingerprint
+                    self.cachedArchiveSnapshot = snapshot
+                    guard oldFingerprint != snapshot.fingerprint else { return }
+                    self.refresh()
+                }
+            }
+        }
+        archiveRefreshWorkItem = work
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + (immediately ? 0 : 0.35),
+            execute: work
+        )
+    }
+
+    private func archiveSummary(
+        from snapshot: SavedDictationArchiveSnapshot
+    ) -> SavedDictationArchiveSnapshot {
+        SavedDictationArchiveSnapshot(
+            transcripts: [],
+            audioIssues: [],
+            totalTranscriptCount: snapshot.totalTranscriptCount,
+            retainedAudioCount: snapshot.retainedAudioCount,
+            recordingAudioCount: snapshot.recordingAudioCount,
+            failedAudioCount: snapshot.failedAudioCount,
+            pendingAudioCount: snapshot.pendingAudioCount,
+            qualityRecognitionJobs: snapshot.qualityRecognitionJobs
+        )
+    }
+
+    private func archiveSnapshot(
+        _ snapshot: SavedDictationArchiveSnapshot,
+        updatingQualityRecognitionJob job: QualityRecognitionJob
+    ) -> SavedDictationArchiveSnapshot {
+        var jobs = snapshot.qualityRecognitionJobs.filter { $0.stem != job.stem }
+        jobs.append(job)
+        jobs.sort {
+            if $0.state.isPending != $1.state.isPending {
+                return $0.state.isPending
+            }
+            return $0.createdAt < $1.createdAt
+        }
+        let transcripts = snapshot.transcripts.map { transcript in
+            guard transcript.url.deletingPathExtension().lastPathComponent == job.stem else {
+                return transcript
+            }
+            return SavedDictationTranscript(
+                url: transcript.url,
+                text: transcript.text,
+                date: transcript.date,
+                recordingAudioURL: transcript.recordingAudioURL,
+                retryAudioURL: transcript.retryAudioURL,
+                needsRecognitionRetry: transcript.needsRecognitionRetry,
+                qualityRecognitionJob: job
+            )
+        }
+        let audioIssues = snapshot.audioIssues.map { issue in
+            let stem = issue.retryAudioURL.deletingPathExtension().lastPathComponent
+                .replacingOccurrences(of: "pending-", with: "")
+            guard stem == job.stem else { return issue }
+            return SavedDictationAudioIssue(
+                audioURL: issue.audioURL,
+                retryAudioURL: issue.retryAudioURL,
+                date: issue.date,
+                isPendingJournal: issue.isPendingJournal,
+                qualityRecognitionJob: job
+            )
+        }
+        return SavedDictationArchiveSnapshot(
+            transcripts: transcripts,
+            audioIssues: audioIssues,
+            totalTranscriptCount: snapshot.totalTranscriptCount,
+            retainedAudioCount: snapshot.retainedAudioCount,
+            recordingAudioCount: snapshot.recordingAudioCount,
+            failedAudioCount: snapshot.failedAudioCount,
+            pendingAudioCount: snapshot.pendingAudioCount,
+            qualityRecognitionJobs: jobs
+        )
+    }
+
     private func startRefreshTimer() {
+        guard panelRefreshIsActive else { return }
         refreshTimer?.invalidate()
         refreshTimer = Timer.scheduledTimer(timeInterval: 0.75,
                                             target: self,
@@ -24833,48 +25428,99 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
     }
 
     @objc private func refreshTimerFired(_ timer: Timer) {
+        guard panelRefreshIsActive, hasVisiblePanelWindow else {
+            stopPanelRefreshLifecycle()
+            return
+        }
         refresh()
     }
 
     private func refresh(force: Bool = false) {
-        guard let window else { return }
-        let fingerprint = renderFingerprint()
-        guard force || fingerprint != lastRenderFingerprint else { return }
-        lastRenderFingerprint = fingerprint
-        window.title = t("MyDictate — панель управления", "MyDictate — Control Panel")
-        window.contentView = makeContentView()
-        // Replacing the content view can make AppKit adopt its fitting width.
-        // Enforce the compact panel size afterwards so long transient status
-        // messages never widen the main window while switching models.
-        resizeCompactPanel(window)
+        guard let window, force || hasVisiblePanelWindow else { return }
+        let baseFingerprint = renderFingerprint()
+        let mainFingerprint = [baseFingerprint, cachedArchiveSnapshot.fingerprint]
+            .joined(separator: "::archive::")
+        if force || (window.isVisible && mainFingerprint != lastRenderFingerprint) {
+            lastRenderFingerprint = mainFingerprint
+            window.title = t("MyDictate — панель управления", "MyDictate — Control Panel")
+            window.contentView = makeContentView()
+            // Replacing the content view can make AppKit adopt its fitting width.
+            // Enforce the compact panel size afterwards so long transient status
+            // messages never widen the main window while switching models.
+            resizeCompactPanel(window)
+        }
         if let settingsWindow, settingsWindow.isVisible {
-            settingsWindow.title = t("Настройки MyDictate", "MyDictate Settings")
-            settingsWindow.contentView = makeSettingsContentView()
-            resizeSettingsWindow(settingsWindow)
+            let fingerprint = [language.rawValue,
+                               usesDarkPanelAppearance ? "dark" : "light",
+                               String(selectedSettingsSection.rawValue)]
+                .joined(separator: "::settings::")
+            if fingerprint != lastSettingsRenderFingerprint {
+                lastSettingsRenderFingerprint = fingerprint
+                settingsWindow.title = t("Настройки MyDictate", "MyDictate Settings")
+                settingsWindow.contentView = makeSettingsContentView()
+                resizeSettingsWindow(settingsWindow)
+            }
         }
         if let modelWindow, modelWindow.isVisible {
-            modelWindow.title = t("Модели распознавания", "Speech Recognition Models")
-            modelWindow.contentView = makeModelSelectionContentView()
+            let fingerprint = [language.rawValue,
+                               usesDarkPanelAppearance ? "dark" : "light",
+                               settings.speechModelProfile.rawValue,
+                               serviceOperation?.rawValue ?? "idle",
+                               serviceOperationFailure ?? ""]
+                .joined(separator: "::model::")
+            if fingerprint != lastModelRenderFingerprint {
+                lastModelRenderFingerprint = fingerprint
+                modelWindow.title = t("Модели распознавания", "Speech Recognition Models")
+                modelWindow.contentView = makeModelSelectionContentView()
+            }
         }
         if let savedDictationsWindow, savedDictationsWindow.isVisible {
-            savedDictationsWindow.title = t("Сохранённые диктовки", "Saved Dictations")
-            savedDictationsWindow.contentView = makeSavedDictationsContentView()
-            resizeSavedDictationsWindow(savedDictationsWindow)
+            let fingerprint = [language.rawValue,
+                               usesDarkPanelAppearance ? "dark" : "light",
+                               cachedArchiveSnapshot.fingerprint]
+                .joined(separator: "::saved::")
+            if fingerprint != lastSavedDictationsRenderFingerprint {
+                lastSavedDictationsRenderFingerprint = fingerprint
+                savedDictationsWindow.title = t("Сохранённые диктовки", "Saved Dictations")
+                savedDictationsWindow.contentView = makeSavedDictationsContentView()
+                resizeSavedDictationsWindow(savedDictationsWindow)
+            }
         }
         if let savedDictationDetailWindow,
            savedDictationDetailWindow.isVisible,
            let transcript = savedDictationDetailTranscript {
-            savedDictationDetailWindow.title = t("Сохранённая диктовка", "Saved Dictation")
-            let current = currentSavedDictationSnapshot().transcripts.first {
+            let current = cachedArchiveSnapshot.transcripts.first {
                 $0.url.standardizedFileURL == transcript.url.standardizedFileURL
             } ?? transcript
-            savedDictationDetailTranscript = current
-            savedDictationDetailWindow.contentView = makeSavedTranscriptDetailContentView(current)
-            resizeSavedTranscriptDetailWindow(savedDictationDetailWindow)
+            let fingerprint = [language.rawValue,
+                               usesDarkPanelAppearance ? "dark" : "light",
+                               current.url.path,
+                               String(current.date.timeIntervalSince1970),
+                               current.text,
+                               String(current.qualityRecognitionJob?.progress ?? -1)]
+                .joined(separator: "::detail::")
+            if fingerprint != lastSavedDetailRenderFingerprint {
+                lastSavedDetailRenderFingerprint = fingerprint
+                savedDictationDetailWindow.title = t("Сохранённая диктовка", "Saved Dictation")
+                savedDictationDetailTranscript = current
+                savedDictationDetailWindow.contentView = makeSavedTranscriptDetailContentView(current)
+                resizeSavedTranscriptDetailWindow(savedDictationDetailWindow)
+            }
         }
         if let dictationHelpWindow, dictationHelpWindow.isVisible {
-            dictationHelpWindow.title = t("Как пользоваться MyDictate", "Using MyDictate")
-            dictationHelpWindow.contentView = makeDictationHelpContentView()
+            let fingerprint = [language.rawValue,
+                               usesDarkPanelAppearance ? "dark" : "light",
+                               settings.configuredHotkey.name,
+                               settings.configuredEnterHotkey.name,
+                               settings.configuredClipboardHotkey.name,
+                               settings.configuredCancelHotkey.name,
+                               settings.configuredPauseHotkey.name]
+                .joined(separator: "::help::")
+            if fingerprint != lastHelpRenderFingerprint {
+                lastHelpRenderFingerprint = fingerprint
+                dictationHelpWindow.title = t("Как пользоваться MyDictate", "Using MyDictate")
+                dictationHelpWindow.contentView = makeDictationHelpContentView()
+            }
         }
     }
 
@@ -24916,7 +25562,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                 serviceOperation?.rawValue ?? "idle",
                 serviceOperationFailure ?? "",
                 updateStateFingerprint(),
-                SuperDictateAgentService.isAgentRunning() ? "running" : "stopped",
+                SuperDictateAgentService.isAgentRunningFromPublishedState() ? "running" : "stopped",
                 stateToken,
                 permissions,
                 settings.configuredHotkey.name,
@@ -24932,7 +25578,6 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                 settings.contentStoragePath,
                 settings.audioRetentionPolicy.rawValue,
                 MyDictateContentStorage.isConfiguredStorageAvailable(settings: settings) ? "storage-ready" : "storage-missing",
-                savedDictationArchiveFingerprint(),
                 permissionClickCount.description].joined(separator: "::")
     }
 
@@ -24949,39 +25594,6 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         case .failed(let message):
             return "failed:\(message)"
         }
-    }
-
-    private func currentSavedDictationSnapshot(maximumLoadedTranscripts: Int = 200) -> SavedDictationArchiveSnapshot {
-        guard let transcripts = try? DictationArchive.transcriptsDirectoryURL(),
-              let recordings = try? DictationArchive.audioRecordingsDirectoryURL(),
-              let failedAudio = try? DictationArchive.failedAudioDirectoryURL(),
-              let pendingAudio = try? DictationArchive.pendingAudioDirectoryURL() else {
-            return SavedDictationArchiveSnapshot(
-                transcripts: [],
-                audioIssues: [],
-                totalTranscriptCount: 0,
-                retainedAudioCount: 0,
-                recordingAudioCount: 0,
-                failedAudioCount: 0,
-                pendingAudioCount: 0,
-                qualityRecognitionJobs: []
-            )
-        }
-        return savedDictationArchiveSnapshot(
-            transcriptsDirectory: transcripts,
-            recordingsDirectory: recordings,
-            failedAudioDirectory: failedAudio,
-            pendingAudioDirectory: pendingAudio,
-            maximumLoadedTranscripts: maximumLoadedTranscripts
-        )
-    }
-
-    private func savedDictationArchiveFingerprint() -> String {
-        let snapshot = currentSavedDictationSnapshot(maximumLoadedTranscripts: 0)
-        let jobs = snapshot.qualityRecognitionJobs.map {
-            "\($0.stem):\($0.state.rawValue):\($0.progress):\($0.updatedAt.timeIntervalSince1970)"
-        }.joined(separator: "|")
-        return "\(snapshot.totalTranscriptCount):\(snapshot.recordingAudioCount):\(snapshot.failedAudioCount):\(snapshot.pendingAudioCount):\(jobs)"
     }
 
     private func makeContentView() -> NSView {
@@ -25191,7 +25803,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
     }
 
     private func makeSavedDictationsContentView() -> NSView {
-        let snapshot = currentSavedDictationSnapshot()
+        let snapshot = cachedArchiveSnapshot
         let root = NSStackView()
         root.orientation = .vertical
         root.alignment = .leading
@@ -26266,7 +26878,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
     }
 
     private func compactServiceCard() -> NSView {
-        let running = SuperDictateAgentService.isAgentRunning()
+        let running = SuperDictateAgentService.isAgentRunningFromPublishedState()
         let state = AgentRuntimeStateStore.read()
         let presentation = servicePresentation(running: running, state: state)
         let card = compactCard()
@@ -26387,7 +26999,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             enabled: serviceOperation == nil
         )
 
-        let snapshot = currentSavedDictationSnapshot(maximumLoadedTranscripts: 0)
+        let snapshot = cachedArchiveSnapshot
         let recoverableAudioCount = snapshot.failedAudioCount + snapshot.pendingAudioCount
         let archiveDetail = t(
             "Текстов: \(snapshot.totalTranscriptCount) · аудио: \(recoverableAudioCount)",
@@ -27796,6 +28408,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             resizeSavedDictationsWindow(savedDictationsWindow)
             savedDictationsWindow.makeKeyAndOrderFront(nil)
             NSApp.activate(ignoringOtherApps: true)
+            requestArchiveRefresh(immediately: true)
             return
         }
 
@@ -27822,6 +28435,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         self.savedDictationsWindow = savedDictationsWindow
         savedDictationsWindow.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+        requestArchiveRefresh(immediately: true)
         // AppKit can perform one last fitting pass while a newly created
         // window is attached to its screen.  Reapply the fixed archive size
         // afterwards so that pass can never collapse the history window.
@@ -27964,7 +28578,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             name: QUALITY_RECOGNITION_QUEUE_CHANGED_NOTIFICATION,
             object: nil
         )
-        if !SuperDictateAgentService.isAgentRunning(), serviceOperation == nil {
+        if !SuperDictateAgentService.isAgentRunningFromPublishedState(), serviceOperation == nil {
             settings.agentEnabled = true
             _ = settings.refreshFromDisk()
             beginServiceOperation(.starting)
@@ -27984,7 +28598,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
     }
 
     @objc private func retryAllSavedAudioRecognitionClicked(_ sender: NSButton) {
-        let snapshot = currentSavedDictationSnapshot()
+        let snapshot = cachedArchiveSnapshot
         let urls = snapshot.transcripts
             .filter {
                 $0.needsRecognitionRetry || $0.qualityRecognitionJob?.state == .failed
@@ -28313,7 +28927,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             )
             return
         }
-        if SuperDictateAgentService.isAgentRunning(), state?.isReady != true {
+        if SuperDictateAgentService.isAgentRunningFromPublishedState(), state?.isReady != true {
             showError(
                 title: t("Служба ещё запускается", "Service Is Still Starting"),
                 detail: t("Дождитесь статуса «Работает» и попробуйте изменить сочетание ещё раз.",
@@ -28588,7 +29202,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         serviceOperationStartedAt = Date().timeIntervalSince1970
         serviceOperationFailure = nil
         refresh(force: true)
-        let wasRunning = SuperDictateAgentService.isAgentRunning()
+        let wasRunning = SuperDictateAgentService.isAgentRunningFromPublishedState()
         storageMigrationTask = Task { [weak self] in
             let outcome = await Task.detached(priority: .userInitiated) {
                 () -> Result<MyDictateContentMigrationResult, Error> in
