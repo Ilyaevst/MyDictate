@@ -25,8 +25,10 @@ flatten_whisper_framework_for_legacy_updaters() {
     # valid flat framework before archiving.  That lets existing installs
     # reach the fixed updater without any manual app replacement.
     local framework_path="$APP_PATH/Contents/Frameworks/whisper.framework"
+    local sign_identity="${SIGN_IDENTITY:--}"
     local source_root
     local source_framework
+    local timestamp_argument="--timestamp"
 
     [[ -L "$framework_path/Versions/Current" ]] || return 0
     [[ -d "$framework_path/Versions/A" ]] || {
@@ -51,7 +53,14 @@ flatten_whisper_framework_for_legacy_updaters() {
         "$APP_PATH/Contents/MacOS/MyDictate"
     rm -rf "$source_root"
 
-    codesign --force --deep --sign - "$APP_PATH"
+    if [[ "$sign_identity" == "-" ]]; then
+        timestamp_argument="--timestamp=none"
+    fi
+    codesign --force --sign "$sign_identity" --options runtime \
+        "$timestamp_argument" "$framework_path"
+    codesign --force --sign "$sign_identity" --options runtime \
+        --entitlements "$ROOT_DIR/entitlements.plist" \
+        "$timestamp_argument" "$APP_PATH"
     codesign --verify --deep --strict "$APP_PATH"
 }
 
