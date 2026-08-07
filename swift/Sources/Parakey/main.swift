@@ -2277,13 +2277,18 @@ func audioInputDevice(matching preference: String,
 
 // MARK: - Logger
 //
-// All output goes to stderr (line-buffered, so we don't lose lines
-// across an abrupt exit) and to ~/Library/Logs/MyDictate.log.
+// Application diagnostics are serialized onto one queue and retained in a
+// bounded private file. Avoid mirroring routine messages to stderr: launchd
+// already captures that stream and otherwise every line is stored twice.
 
 final class Logger: @unchecked Sendable {
     static let shared = Logger()
     private let url: URL
-    private let q = DispatchQueue(label: "ParakeyLogger")
+    private let q = DispatchQueue(label: "ParakeyLogger", qos: .utility)
+    private lazy var writer = PrivateRotatingLogWriter(
+        url: url,
+        maximumBytes: PRIVATE_LOG_MAX_BYTES
+    )
 
     var fileURL: URL { url }
 
@@ -2294,15 +2299,17 @@ final class Logger: @unchecked Sendable {
     }
 
     func log(_ msg: String) {
-        let stamp = ISO8601DateFormatter.timeOnly.string(from: Date())
-        let line = "[\(stamp)] \(msg)\n"
-        let data = Data(line.utf8)
-        FileHandle.standardError.write(data)
-        q.async { [url] in
+        q.async { [self] in
+            let stamp = ISO8601DateFormatter.timeOnly.string(from: Date())
+            let privacySafeMessage = msg.replacingOccurrences(
+                of: NSHomeDirectory(),
+                with: "<home>"
+            )
+            let line = "[\(stamp)] \(privacySafeMessage)\n"
             do {
-                try appendPrivateLogData(data, to: url)
+                try writer.append(Data(line.utf8))
             } catch {
-                let fallback = "Logger: file write failed: \(error.localizedDescription)\n"
+                let fallback = "Logger: private log unavailable\n"
                 FileHandle.standardError.write(Data(fallback.utf8))
             }
         }
@@ -2613,22 +2620,83 @@ private func notifyQualityRecognitionJobChanged(_ job: QualityRecognitionJob) {
 
 private let PRIVATE_LOG_FILE_MODE = mode_t(S_IRUSR | S_IWUSR)
 private let PRIVATE_HELPER_FILE_MODE = mode_t(S_IRUSR | S_IWUSR)
+private let PRIVATE_LOG_MAX_BYTES = 8 * 1024 * 1024
+private let PRIVATE_LOG_MAX_ENTRY_BYTES = 16 * 1024
 
-private func appendPrivateLogData(_ data: Data, to url: URL) throws {
-    try FileManager.default.createDirectory(at: url.deletingLastPathComponent(),
-                                            withIntermediateDirectories: true)
-    let flags = O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC | O_NOFOLLOW
-    let fd = Darwin.open(url.path, flags, PRIVATE_LOG_FILE_MODE)
-    guard fd >= 0 else { throw currentPOSIXError() }
-    defer { _ = Darwin.close(fd) }
+/// A single-owner writer used from Logger's serial queue. The descriptor stays
+/// open between messages, and the active file is truncated only after reaching
+/// its hard size cap. This avoids per-line open/close work and unbounded growth.
+private final class PrivateRotatingLogWriter {
+    private let url: URL
+    private let maximumBytes: Int64
+    private var descriptor: Int32 = -1
+    private var currentBytes: Int64 = 0
 
-    try validateSingleLinkRegularFileDescriptor(fd)
-
-    guard Darwin.fchmod(fd, PRIVATE_LOG_FILE_MODE) == 0 else {
-        throw currentPOSIXError()
+    init(url: URL, maximumBytes: Int) {
+        self.url = url
+        self.maximumBytes = Int64(max(256, maximumBytes))
     }
 
-    try writeAllData(data, to: fd)
+    deinit {
+        if descriptor >= 0 {
+            _ = Darwin.close(descriptor)
+        }
+    }
+
+    func append(_ data: Data) throws {
+        let boundedData: Data
+        if data.count > PRIVATE_LOG_MAX_ENTRY_BYTES {
+            boundedData = Data(data.prefix(PRIVATE_LOG_MAX_ENTRY_BYTES))
+        } else {
+            boundedData = data
+        }
+        try openIfNeeded()
+
+        if currentBytes + Int64(boundedData.count) > maximumBytes {
+            guard Darwin.ftruncate(descriptor, 0) == 0 else {
+                throw currentPOSIXError()
+            }
+            currentBytes = 0
+            let marker = Data("[log rotated after size limit]\n".utf8)
+            try writeAllData(marker, to: descriptor)
+            currentBytes += Int64(marker.count)
+        }
+
+        try writeAllData(boundedData, to: descriptor)
+        currentBytes += Int64(boundedData.count)
+    }
+
+    private func openIfNeeded() throws {
+        guard descriptor < 0 else { return }
+        try FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(),
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        let flags = O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC | O_NOFOLLOW
+        let fd = Darwin.open(url.path, flags, PRIVATE_LOG_FILE_MODE)
+        guard fd >= 0 else { throw currentPOSIXError() }
+        do {
+            try validateSingleLinkRegularFileDescriptor(fd)
+            guard Darwin.fchmod(fd, PRIVATE_LOG_FILE_MODE) == 0 else {
+                throw currentPOSIXError()
+            }
+            var st = stat()
+            guard Darwin.fstat(fd, &st) == 0 else {
+                throw currentPOSIXError()
+            }
+            descriptor = fd
+            currentBytes = st.st_size
+        } catch {
+            _ = Darwin.close(fd)
+            throw error
+        }
+    }
+}
+
+private func appendPrivateLogData(_ data: Data, to url: URL) throws {
+    let writer = PrivateRotatingLogWriter(url: url, maximumBytes: PRIVATE_LOG_MAX_BYTES)
+    try writer.append(data)
 }
 
 private func validateSingleLinkRegularFileDescriptor(_ fd: Int32) throws {
@@ -7129,12 +7197,121 @@ private func whisperTranscriptQuality(_ text: String,
     )
 }
 
+private func whisperRuntimeLogCallback(_ level: ggml_log_level,
+                                       _ textPointer: UnsafePointer<CChar>?,
+                                       _ userData: UnsafeMutableRawPointer?) {
+    WhisperRuntimeDiagnostics.receiveLog(level: level, textPointer: textPointer)
+}
+
+private enum WhisperRuntimeDiagnostics {
+    private final class State: @unchecked Sendable {
+        let lock = NSLock()
+        var loggingInstalled = false
+        var didReportMissingCoreMLEncoder = false
+        var liveContextCount = 0
+        var peakContextCount = 0
+    }
+
+    private static let state = State()
+
+    static func installLogFilterIfNeeded() {
+        state.lock.lock()
+        defer { state.lock.unlock() }
+        guard !state.loggingInstalled else { return }
+        whisper_log_set(whisperRuntimeLogCallback, nil)
+        state.loggingInstalled = true
+    }
+
+    static func receiveLog(level: ggml_log_level,
+                           textPointer: UnsafePointer<CChar>?) {
+        guard let textPointer else { return }
+        guard level == GGML_LOG_LEVEL_WARN || level == GGML_LOG_LEVEL_ERROR else {
+            return
+        }
+        let rawMessage = String(cString: textPointer)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !rawMessage.isEmpty else { return }
+
+        if rawMessage.localizedCaseInsensitiveContains("failed to load Core ML model") {
+            state.lock.lock()
+            let shouldReport = !state.didReportMissingCoreMLEncoder
+            state.didReportMissingCoreMLEncoder = true
+            state.lock.unlock()
+            if shouldReport {
+                log("ASR warning: optional Whisper Core ML encoder is absent; continuing with the bundled Metal/CPU backend")
+            }
+            return
+        }
+
+        let label = level == GGML_LOG_LEVEL_ERROR ? "error" : "warning"
+        log("ASR \(label): \(privacySafeWhisperMessage(rawMessage))")
+    }
+
+    static func contextLoaded() {
+        state.lock.lock()
+        state.liveContextCount += 1
+        state.peakContextCount = max(state.peakContextCount, state.liveContextCount)
+        let live = state.liveContextCount
+        let peak = state.peakContextCount
+        state.lock.unlock()
+        log("ASR context loaded: live=\(live) peak=\(peak) \(memorySummary())")
+    }
+
+    static func contextWillUnload() {
+        log("ASR context unload begin: \(memorySummary())")
+    }
+
+    static func contextUnloaded() {
+        state.lock.lock()
+        state.liveContextCount = max(0, state.liveContextCount - 1)
+        let live = state.liveContextCount
+        state.lock.unlock()
+        log("ASR context unloaded: live=\(live) \(memorySummary())")
+    }
+
+    static var liveContextCount: Int {
+        state.lock.lock()
+        defer { state.lock.unlock() }
+        return state.liveContextCount
+    }
+
+    static func memoryCheckpoint(_ label: String) {
+        log("ASR memory \(label): \(memorySummary())")
+    }
+
+    private static func memorySummary() -> String {
+        guard let usage = currentAppMemoryUsage() else { return "unavailable" }
+        return "resident=\(formattedByteCount(usage.residentBytes)) footprint=\(formattedByteCount(usage.physicalFootprintBytes))"
+    }
+
+    private static func privacySafeWhisperMessage(_ message: String) -> String {
+        let home = NSHomeDirectory()
+        var result = message.replacingOccurrences(of: home, with: "<home>")
+        let pieces = result.split(separator: "'", omittingEmptySubsequences: false)
+        if pieces.count >= 3 {
+            result = pieces.enumerated().map { index, piece in
+                if index.isMultiple(of: 2) { return String(piece) }
+                return piece.hasPrefix("/") || piece.hasPrefix("<home>/")
+                    ? "<local-path>"
+                    : String(piece)
+            }.joined(separator: "'")
+        }
+        return String(result.prefix(DIAGNOSTICS_LOG_MAX_LINE_CHARACTERS))
+    }
+}
+
 private final class WhisperSpeechEngine: @unchecked Sendable {
     private let context: OpaquePointer
     private let vadModelURL: URL?
 
     init(modelURL: URL, vadModelURL: URL?) throws {
+        WhisperRuntimeDiagnostics.installLogFilterIfNeeded()
         var params = whisper_context_default_params()
+        // The pinned whisper.xcframework exposes no runtime Core ML toggle.
+        // It probes for an optional sibling encoder and safely falls back to
+        // its Metal/CPU backend when that artifact is absent. Suppress that
+        // known one-time probe message above; never substitute an unverified
+        // encoder for the exact model selected by the user.
         params.use_gpu = true
         params.flash_attn = true
 
@@ -7150,10 +7327,13 @@ private final class WhisperSpeechEngine: @unchecked Sendable {
         }
         context = loadedContext
         self.vadModelURL = vadModelURL
+        WhisperRuntimeDiagnostics.contextLoaded()
     }
 
     deinit {
+        WhisperRuntimeDiagnostics.contextWillUnload()
         whisper_free(context)
+        WhisperRuntimeDiagnostics.contextUnloaded()
     }
 
     func transcribe(samples: [Float],
@@ -7420,7 +7600,9 @@ actor TranscriptionWorker {
         }
 
         if engine != nil {
+            WhisperRuntimeDiagnostics.memoryCheckpoint("before unload")
             await unload()
+            WhisperRuntimeDiagnostics.memoryCheckpoint("after unload")
         }
 
         if speechModelCacheExists(for: profile) {
@@ -7439,6 +7621,12 @@ actor TranscriptionWorker {
         }
         loadedProfile = profile
         ready = true
+        if case .whisperLargeV3Turbo = engine,
+           WhisperRuntimeDiagnostics.liveContextCount != 1 {
+            log("ASR error: unexpected live Whisper context count=\(WhisperRuntimeDiagnostics.liveContextCount)")
+            assertionFailure("Only one Whisper context may be live")
+        }
+        WhisperRuntimeDiagnostics.memoryCheckpoint("after loading \(profile.shortName)")
         log("ASR: \(profile.shortName) ready in \(String(format: "%.2f", Date().timeIntervalSince(t0))) s")
     }
 
@@ -7748,9 +7936,19 @@ actor TranscriptionWorker {
     }
 
     func unload() async {
+        let unloadedWhisper: Bool
+        if case .whisperLargeV3Turbo = engine {
+            unloadedWhisper = true
+        } else {
+            unloadedWhisper = false
+        }
         engine = nil
         loadedProfile = nil
         ready = false
+        if unloadedWhisper, WhisperRuntimeDiagnostics.liveContextCount != 0 {
+            log("ASR error: Whisper context remained live after unload count=\(WhisperRuntimeDiagnostics.liveContextCount)")
+            assertionFailure("Whisper context must be released before loading another model")
+        }
         log("ASR: unloaded")
     }
 }
@@ -12905,11 +13103,11 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
                 do {
                     let warmUpTiming = try await asr.warmUp()
-                    log("ASR: CoreML warm-up completed in \(millisecondsLabel(warmUpTiming.totalSeconds))")
+                    log("ASR: Whisper warm-up completed in \(millisecondsLabel(warmUpTiming.totalSeconds))")
                 } catch {
                     // Model loading succeeded, so a failed best-effort warm-up
                     // must not make the dictation service unavailable.
-                    log("ASR: CoreML warm-up skipped: \(error.localizedDescription)")
+                    log("ASR: Whisper warm-up skipped: \(error.localizedDescription)")
                 }
                 guard !Task.isCancelled, !isTerminating else { return }
 
@@ -19256,6 +19454,9 @@ private enum ParakeySelfTest {
         if arguments[1] == "whisper-cancel-file" {
             return runWhisperCancellation(arguments: Array(arguments.dropFirst(2)))
         }
+        if arguments[1] == "whisper-lifecycle" {
+            return runWhisperLifecycle(arguments: Array(arguments.dropFirst(2)))
+        }
         guard arguments.count == 2 else { return fail("usage") }
 
         switch arguments[1] {
@@ -19394,6 +19595,59 @@ private enum ParakeySelfTest {
         } catch {
             return fail("whisper-cancel-file: \(error)")
         }
+    }
+
+    private static func runWhisperLifecycle(arguments: [String]) -> Int32 {
+        guard arguments.count == 3 else {
+            return fail("usage: --self-test whisper-lifecycle <medium-model> <large-model> <vad-model>")
+        }
+        do {
+            let mediumURL = URL(fileURLWithPath: arguments[0])
+            let largeURL = URL(fileURLWithPath: arguments[1])
+            let vadURL = URL(fileURLWithPath: arguments[2])
+            printWhisperMemoryCheckpoint("before-medium")
+
+            var engine: WhisperSpeechEngine? = try WhisperSpeechEngine(
+                modelURL: mediumURL,
+                vadModelURL: vadURL
+            )
+            withExtendedLifetime(engine) {}
+            printWhisperMemoryCheckpoint("after-medium")
+            engine = nil
+            guard WhisperRuntimeDiagnostics.liveContextCount == 0 else {
+                return fail("whisper-lifecycle: medium context remained live after unload")
+            }
+            printWhisperMemoryCheckpoint("after-medium-unload")
+
+            engine = try WhisperSpeechEngine(modelURL: largeURL, vadModelURL: vadURL)
+            withExtendedLifetime(engine) {}
+            printWhisperMemoryCheckpoint("after-large")
+            engine = nil
+            guard WhisperRuntimeDiagnostics.liveContextCount == 0 else {
+                return fail("whisper-lifecycle: large context remained live after unload")
+            }
+            printWhisperMemoryCheckpoint("after-large-unload")
+
+            engine = try WhisperSpeechEngine(modelURL: mediumURL, vadModelURL: vadURL)
+            withExtendedLifetime(engine) {}
+            printWhisperMemoryCheckpoint("after-medium-return")
+            engine = nil
+            guard WhisperRuntimeDiagnostics.liveContextCount == 0 else {
+                return fail("whisper-lifecycle: returned medium context remained live after unload")
+            }
+            printWhisperMemoryCheckpoint("final")
+            return EXIT_SUCCESS
+        } catch {
+            return fail("whisper-lifecycle: \(error)")
+        }
+    }
+
+    private static func printWhisperMemoryCheckpoint(_ label: String) {
+        guard let usage = currentAppMemoryUsage() else {
+            print("MEMORY \(label) unavailable")
+            return
+        }
+        print("MEMORY \(label) resident=\(usage.residentBytes) footprint=\(usage.physicalFootprintBytes) live=\(WhisperRuntimeDiagnostics.liveContextCount)")
     }
 
     private static func testAll() throws {
@@ -19823,6 +20077,23 @@ private enum ParakeySelfTest {
             equals: "one\ntwo\n",
             "log appends should preserve existing content"
         )
+
+        let rotatingLog = root.appendingPathComponent("Rotating.log")
+        do {
+            let writer = PrivateRotatingLogWriter(url: rotatingLog, maximumBytes: 256)
+            for line in 0..<20 {
+                try writer.append(Data("bounded log entry \(line) ................\n".utf8))
+            }
+        }
+        let rotatingAttributes = try fm.attributesOfItem(atPath: rotatingLog.path)
+        let rotatingSize = (rotatingAttributes[.size] as? NSNumber)?.intValue ?? Int.max
+        try expect(rotatingSize <= 256,
+                   equals: true,
+                   "runtime log writer should enforce its hard size cap")
+        let rotatedText = String(data: try Data(contentsOf: rotatingLog), encoding: .utf8) ?? ""
+        try expect(rotatedText.contains("bounded log entry 19"),
+                   equals: true,
+                   "runtime log rotation should retain the newest entry")
 
         let target = root.appendingPathComponent("target.log")
         try Data("target\n".utf8).write(to: target)
