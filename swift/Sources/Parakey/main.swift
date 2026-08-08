@@ -2780,6 +2780,35 @@ enum DictationCompletionSound: String, CaseIterable, Sendable {
     }
 }
 
+private enum DictationSoundEvent: CaseIterable, Sendable {
+    case recordingStarted
+    case paused
+    case resumed
+    case recognitionStarted
+    case completedWithoutEnter
+    case completedWithEnter
+    case clipboardReady
+    case failed
+    case canceled
+    case qualityRecognitionStarted
+    case qualityRecognitionCompleted
+
+    var defaultSound: DictationCompletionSound {
+        switch self {
+        case .recordingStarted: return .tink
+        case .paused: return .pop
+        case .resumed: return .glass
+        case .recognitionStarted: return .purr
+        case .completedWithoutEnter, .completedWithEnter: return .pop
+        case .clipboardReady: return .glass
+        case .failed: return .basso
+        case .canceled: return .blow
+        case .qualityRecognitionStarted: return .purr
+        case .qualityRecognitionCompleted: return .hero
+        }
+    }
+}
+
 enum AudioRetentionPolicy: String, CaseIterable, Sendable {
     case sevenDays = "7_days"
     case thirtyDays = "30_days"
@@ -2862,11 +2891,15 @@ final class Settings: @unchecked Sendable {
     private static let keyMuteWhileRecording = "mute_while_recording"
     private static let keyPlayFeedbackSounds = "play_feedback_sounds"
     private static let keyRecordingStartSound = "recording_start_sound"
+    private static let keyPauseSound = "pause_sound_v1"
+    private static let keyResumeSound = "resume_sound_v1"
+    private static let keyRecognitionStartedSound = "recognition_started_sound_v1"
     private static let keyWithoutEnterCompletionSound = "without_enter_completion_sound"
     private static let keyWithEnterCompletionSound = "with_enter_completion_sound"
     private static let keyClipboardCompletionSound = "clipboard_completion_sound"
     private static let keyRecognitionErrorSound = "recognition_error_sound"
     private static let keyCancellationSound = "cancellation_sound"
+    private static let keyQualityRecognitionStartedSound = "quality_recognition_started_sound_v1"
     private static let keyQualityRecognitionCompletionSound = "quality_recognition_completion_sound"
     private static let keyCompletionSoundVolume = "completion_sound_volume"
     private static let keyClipboardCompletionVisibleSeconds = "clipboard_completion_visible_seconds"
@@ -3312,14 +3345,6 @@ final class Settings: @unchecked Sendable {
         set { defaults.set(newValue, forKey: Self.keyPlayFeedbackSounds) }
     }
 
-    private func completionSound(forKey key: String) -> DictationCompletionSound {
-        if let raw = defaults.string(forKey: key),
-           let sound = DictationCompletionSound(rawValue: raw) {
-            return sound
-        }
-        return .pop
-    }
-
     private func sound(forKey key: String,
                        default defaultSound: DictationCompletionSound) -> DictationCompletionSound {
         if let raw = defaults.string(forKey: key),
@@ -3336,37 +3361,57 @@ final class Settings: @unchecked Sendable {
     }
 
     var recordingStartSound: DictationCompletionSound {
-        get { sound(forKey: Self.keyRecordingStartSound, default: .tink) }
+        get { sound(forKey: Self.keyRecordingStartSound, default: DictationSoundEvent.recordingStarted.defaultSound) }
         set { defaults.set(newValue.rawValue, forKey: Self.keyRecordingStartSound) }
     }
 
+    var pauseSound: DictationCompletionSound {
+        get { sound(forKey: Self.keyPauseSound, default: DictationSoundEvent.paused.defaultSound) }
+        set { defaults.set(newValue.rawValue, forKey: Self.keyPauseSound) }
+    }
+
+    var resumeSound: DictationCompletionSound {
+        get { sound(forKey: Self.keyResumeSound, default: DictationSoundEvent.resumed.defaultSound) }
+        set { defaults.set(newValue.rawValue, forKey: Self.keyResumeSound) }
+    }
+
+    var recognitionStartedSound: DictationCompletionSound {
+        get { sound(forKey: Self.keyRecognitionStartedSound, default: DictationSoundEvent.recognitionStarted.defaultSound) }
+        set { defaults.set(newValue.rawValue, forKey: Self.keyRecognitionStartedSound) }
+    }
+
     var withoutEnterCompletionSound: DictationCompletionSound {
-        get { completionSound(forKey: Self.keyWithoutEnterCompletionSound) }
+        get { sound(forKey: Self.keyWithoutEnterCompletionSound, default: DictationSoundEvent.completedWithoutEnter.defaultSound) }
         set { defaults.set(newValue.rawValue, forKey: Self.keyWithoutEnterCompletionSound) }
     }
 
     var withEnterCompletionSound: DictationCompletionSound {
-        get { completionSound(forKey: Self.keyWithEnterCompletionSound) }
+        get { sound(forKey: Self.keyWithEnterCompletionSound, default: DictationSoundEvent.completedWithEnter.defaultSound) }
         set { defaults.set(newValue.rawValue, forKey: Self.keyWithEnterCompletionSound) }
     }
 
     var clipboardCompletionSound: DictationCompletionSound {
-        get { completionSound(forKey: Self.keyClipboardCompletionSound) }
+        get { sound(forKey: Self.keyClipboardCompletionSound, default: DictationSoundEvent.clipboardReady.defaultSound) }
         set { defaults.set(newValue.rawValue, forKey: Self.keyClipboardCompletionSound) }
     }
 
     var recognitionErrorSound: DictationCompletionSound {
-        get { sound(forKey: Self.keyRecognitionErrorSound, default: .basso) }
+        get { sound(forKey: Self.keyRecognitionErrorSound, default: DictationSoundEvent.failed.defaultSound) }
         set { defaults.set(newValue.rawValue, forKey: Self.keyRecognitionErrorSound) }
     }
 
     var cancellationSound: DictationCompletionSound {
-        get { sound(forKey: Self.keyCancellationSound, default: .none) }
+        get { sound(forKey: Self.keyCancellationSound, default: DictationSoundEvent.canceled.defaultSound) }
         set { defaults.set(newValue.rawValue, forKey: Self.keyCancellationSound) }
     }
 
+    var qualityRecognitionStartedSound: DictationCompletionSound {
+        get { sound(forKey: Self.keyQualityRecognitionStartedSound, default: DictationSoundEvent.qualityRecognitionStarted.defaultSound) }
+        set { defaults.set(newValue.rawValue, forKey: Self.keyQualityRecognitionStartedSound) }
+    }
+
     var qualityRecognitionCompletionSound: DictationCompletionSound {
-        get { sound(forKey: Self.keyQualityRecognitionCompletionSound, default: .pop) }
+        get { sound(forKey: Self.keyQualityRecognitionCompletionSound, default: DictationSoundEvent.qualityRecognitionCompleted.defaultSound) }
         set { defaults.set(newValue.rawValue, forKey: Self.keyQualityRecognitionCompletionSound) }
     }
 
@@ -12353,6 +12398,10 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     /// Set when the recording ends while the probe or mute command is
     /// still in flight; the in-flight completion honours it.
     private var systemAudioUnmuteRequested = false
+    /// A newer lifecycle cue supersedes an older cue that was waiting for the
+    /// asynchronous system-output unmute to finish. This prevents a stale
+    /// "paused" sound from playing after the user has already resumed.
+    private var feedbackSoundRequestID: UInt64 = 0
     private var maxDurationWorkItem: DispatchWorkItem?
     private var maxRecordingActiveStartedAt: TimeInterval?
     private var maxRecordingRemainingSeconds: TimeInterval = MAX_RECORDING_SECONDS
@@ -12860,6 +12909,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         do {
             let samples = try await dictationAudioIO.loadRecordingAudio(from: audioURL)
             guard !samples.isEmpty else { throw posixError(EINVAL) }
+            playFeedbackSound(settings.qualityRecognitionStartedSound)
             DictationArchive.updateQualityRecognitionJob(stem: job.stem) {
                 $0.state = .recognizing
                 $0.progress = 2
@@ -12918,8 +12968,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 $0.progress = 100
                 $0.error = nil
             }
-            Sounds.play(settings.qualityRecognitionCompletionSound,
-                        volume: settings.completionSoundVolume)
+            playFeedbackSound(settings.qualityRecognitionCompletionSound)
             presentQualityRecognitionCompletionNotification()
             log("quality recognition completed: \(job.stem), \(polishedText.count) chars")
         } catch {
@@ -14514,6 +14563,44 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         )
     }
 
+    private func playFeedbackSound(_ choice: DictationCompletionSound,
+                                   afterUnmutingOutput: Bool = false) {
+        feedbackSoundRequestID &+= 1
+        let requestID = feedbackSoundRequestID
+        guard choice != .none else { return }
+
+        guard afterUnmutingOutput, systemAudioMutePhase != .idle else {
+            Sounds.play(choice, volume: settings.completionSoundVolume)
+            return
+        }
+
+        unmuteIfWeMuted()
+        waitForUnmutedOutputThenPlay(choice,
+                                    requestID: requestID,
+                                    attemptsRemaining: 40)
+    }
+
+    private func waitForUnmutedOutputThenPlay(_ choice: DictationCompletionSound,
+                                               requestID: UInt64,
+                                               attemptsRemaining: Int) {
+        guard feedbackSoundRequestID == requestID else { return }
+        if systemAudioMutePhase == .idle {
+            Sounds.play(choice, volume: settings.completionSoundVolume)
+            return
+        }
+        guard attemptsRemaining > 0 else {
+            log("feedback sound skipped because system output could not be unmuted")
+            return
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
+            self?.waitForUnmutedOutputThenPlay(
+                choice,
+                requestID: requestID,
+                attemptsRemaining: attemptsRemaining - 1
+            )
+        }
+    }
+
     // Visible + audible cue that a press produced no pasted text — the
     // transcription threw, or the paste itself failed. Without it the menu
     // bar just slips back to idle and the user can't tell their speech was
@@ -14521,8 +14608,8 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     // the feedback-sounds toggle; the icon flash always fires since it's the
     // only signal for users who run silent.
     private func signalDictationFailure() {
-        Sounds.play(settings.recognitionErrorSound,
-                    volume: settings.completionSoundVolume)
+        playFeedbackSound(settings.recognitionErrorSound,
+                          afterUnmutingOutput: true)
         flashErrorMenuBarIcon()
     }
 
@@ -14660,8 +14747,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             updateSetupChecklist()
         }
         startRecordingLevelMeter(initialContext: initialInsertionContext)
-        Sounds.play(settings.recordingStartSound,
-                    volume: settings.completionSoundVolume)
+        playFeedbackSound(settings.recordingStartSound)
         muteIfNeededForRecording()
         log("press: recording; started in \(recordingStartApplicationDescription ?? "unavailable")")
 
@@ -14680,6 +14766,8 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             }
             isRecordingPaused = false
             resumeMaxDurationAutoRelease()
+            playFeedbackSound(settings.resumeSound,
+                              afterUnmutingOutput: true)
             muteIfNeededForRecording()
             setMenuBarState(.recording)
             if settings.showRecordingWaveform {
@@ -14700,6 +14788,8 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             isRecordingPaused = true
             suspendMaxDurationAutoRelease()
             unmuteIfWeMuted()
+            playFeedbackSound(settings.pauseSound,
+                              afterUnmutingOutput: true)
             recordingVisualLevel = 0
             if settings.showRecordingWaveform {
                 if recordingHUDPanel?.isVisible == true {
@@ -14742,6 +14832,10 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         switch recordingReleaseAction(capturedSampleCount: detached.sampleCount) {
         case .discardTooShort(let duration), .transcribe(let duration):
             dur = duration
+        }
+        if case .transcribe = recordingReleaseAction(capturedSampleCount: detached.sampleCount) {
+            playFeedbackSound(settings.recognitionStartedSound,
+                              afterUnmutingOutput: true)
         }
         let selectedProfile = settings.speechModelProfile.productionProfile
         let showDecoderProgress = dur >= RECORDING_HUD_PROGRESS_MINIMUM_RECORDING_SECONDS
@@ -14921,9 +15015,9 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                                 }
                                 enterDelaySeconds = ProcessInfo.processInfo.systemUptime - enterDelayStartedAt
                             }
-                            Sounds.playCompletion(
+                            playFeedbackSound(
                                 completionSound(for: shortcut, settings: settings),
-                                volume: settings.completionSoundVolume
+                                afterUnmutingOutput: true
                             )
                             shouldShowClipboardCompletion = shortcut == .clipboardOnly
                         } else {
@@ -15208,8 +15302,8 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             settings.interfaceLanguage == .english ? "Canceled" : "Отменено",
             visibleSeconds: RECORDING_HUD_TRANSIENT_STATUS_VISIBLE_SECONDS
         )
-        Sounds.play(settings.cancellationSound,
-                    volume: settings.completionSoundVolume)
+        playFeedbackSound(settings.cancellationSound,
+                          afterUnmutingOutput: true)
         setMenuBarState(.idle)
         rebuildMenu()
         let didRestartAudio = runDeferredAudioRouteRefreshIfNeeded()
@@ -15244,8 +15338,8 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             settings.interfaceLanguage == .english ? "Canceled" : "Отменено",
             visibleSeconds: RECORDING_HUD_TRANSIENT_STATUS_VISIBLE_SECONDS
         )
-        Sounds.play(settings.cancellationSound,
-                    volume: settings.completionSoundVolume)
+        playFeedbackSound(settings.cancellationSound,
+                          afterUnmutingOutput: true)
         log("recording canceled deliberately (\(reason)); \(detached.sampleCount) samples discarded")
 
         Task {
@@ -16845,7 +16939,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 "Text insertion: \(TextInserter.defaultStrategyDescription)",
                 "Recording waveform: \(settings.showRecordingWaveform)",
                 "Mute while recording: \(settings.muteWhileRecording)",
-                "Event sounds: start=\(settings.recordingStartSound.rawValue), standard=\(settings.withoutEnterCompletionSound.rawValue), enter=\(settings.withEnterCompletionSound.rawValue), clipboard=\(settings.clipboardCompletionSound.rawValue), error=\(settings.recognitionErrorSound.rawValue), cancel=\(settings.cancellationSound.rawValue), quality=\(settings.qualityRecognitionCompletionSound.rawValue)",
+                "Event sounds: start=\(settings.recordingStartSound.rawValue), pause=\(settings.pauseSound.rawValue), resume=\(settings.resumeSound.rawValue), recognition-start=\(settings.recognitionStartedSound.rawValue), standard=\(settings.withoutEnterCompletionSound.rawValue), enter=\(settings.withEnterCompletionSound.rawValue), clipboard=\(settings.clipboardCompletionSound.rawValue), error=\(settings.recognitionErrorSound.rawValue), cancel=\(settings.cancellationSound.rawValue), quality-start=\(settings.qualityRecognitionStartedSound.rawValue), quality-complete=\(settings.qualityRecognitionCompletionSound.rawValue)",
                 "Completion sound volume: \(Int((settings.completionSoundVolume * 100).rounded()))%",
                 "Clipboard completion visible: \(Int(settings.clipboardCompletionVisibleSeconds.rounded())) s",
                 "Show in Dock: \(settings.showInDock)",
@@ -19688,6 +19782,26 @@ private enum ParakeySelfTest {
             let path = "/System/Library/Sounds/\(sound.rawValue).aiff"
             try expect(FileManager.default.fileExists(atPath: path), equals: true,
                        "completion sound should exist: \(sound.rawValue)")
+        }
+
+        let defaults: [(DictationSoundEvent, DictationCompletionSound)] = [
+            (.recordingStarted, .tink),
+            (.paused, .pop),
+            (.resumed, .glass),
+            (.recognitionStarted, .purr),
+            (.completedWithoutEnter, .pop),
+            (.completedWithEnter, .pop),
+            (.clipboardReady, .glass),
+            (.failed, .basso),
+            (.canceled, .blow),
+            (.qualityRecognitionStarted, .purr),
+            (.qualityRecognitionCompleted, .hero),
+        ]
+        try expect(defaults.count, equals: DictationSoundEvent.allCases.count,
+                   "every lifecycle sound event should have one tested default")
+        for (event, expectedSound) in defaults {
+            try expect(event.defaultSound, equals: expectedSound,
+                       "lifecycle sound event should keep its stable default: \(event)")
         }
     }
 
@@ -24626,6 +24740,10 @@ private enum ControlPanelCompletionSoundKind: Int {
     case recognitionError = 4
     case cancellation = 5
     case qualityRecognition = 6
+    case pause = 7
+    case resume = 8
+    case recognitionStarted = 9
+    case qualityRecognitionStarted = 10
 }
 
 private enum ControlPanelSettingsSection: Int, CaseIterable {
@@ -24649,11 +24767,15 @@ private struct ControlPanelSettingsDraft: Equatable {
     var backgroundStyle: RecordingHUDBackgroundStyle
     var hudSize: RecordingHUDSize
     var recordingStartSound: DictationCompletionSound
+    var pauseSound: DictationCompletionSound
+    var resumeSound: DictationCompletionSound
+    var recognitionStartedSound: DictationCompletionSound
     var withoutEnterCompletionSound: DictationCompletionSound
     var withEnterCompletionSound: DictationCompletionSound
     var clipboardCompletionSound: DictationCompletionSound
     var recognitionErrorSound: DictationCompletionSound
     var cancellationSound: DictationCompletionSound
+    var qualityRecognitionStartedSound: DictationCompletionSound
     var qualityRecognitionCompletionSound: DictationCompletionSound
     var completionSoundVolume: Double
     var clipboardCompletionVisibleSeconds: TimeInterval
@@ -24672,11 +24794,15 @@ private struct ControlPanelSettingsDraft: Equatable {
         backgroundStyle = settings.recordingHUDBackgroundStyle
         hudSize = settings.recordingHUDSize
         recordingStartSound = settings.recordingStartSound
+        pauseSound = settings.pauseSound
+        resumeSound = settings.resumeSound
+        recognitionStartedSound = settings.recognitionStartedSound
         withoutEnterCompletionSound = settings.withoutEnterCompletionSound
         withEnterCompletionSound = settings.withEnterCompletionSound
         clipboardCompletionSound = settings.clipboardCompletionSound
         recognitionErrorSound = settings.recognitionErrorSound
         cancellationSound = settings.cancellationSound
+        qualityRecognitionStartedSound = settings.qualityRecognitionStartedSound
         qualityRecognitionCompletionSound = settings.qualityRecognitionCompletionSound
         completionSoundVolume = settings.completionSoundVolume
         clipboardCompletionVisibleSeconds = settings.clipboardCompletionVisibleSeconds
@@ -27009,6 +27135,33 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             tag: ControlPanelCompletionSoundKind.recordingStart.rawValue
         ))
         form.addArrangedSubview(popupRow(
+            title: t("Пауза включена", "Recording paused"),
+            detail: t("Звук после приостановки активной записи.",
+                      "Sound after pausing an active recording."),
+            selectedValue: draft.pauseSound.rawValue,
+            options: soundOptions,
+            action: #selector(selectCompletionSound(_:)),
+            tag: ControlPanelCompletionSoundKind.pause.rawValue
+        ))
+        form.addArrangedSubview(popupRow(
+            title: t("Запись продолжена", "Recording resumed"),
+            detail: t("Звук после продолжения записи с паузы.",
+                      "Sound after resuming a paused recording."),
+            selectedValue: draft.resumeSound.rawValue,
+            options: soundOptions,
+            action: #selector(selectCompletionSound(_:)),
+            tag: ControlPanelCompletionSoundKind.resume.rawValue
+        ))
+        form.addArrangedSubview(popupRow(
+            title: t("Распознавание началось", "Recognition starts"),
+            detail: t("Звук сразу после завершения записи и запуска обработки.",
+                      "Sound immediately after recording ends and processing starts."),
+            selectedValue: draft.recognitionStartedSound.rawValue,
+            options: soundOptions,
+            action: #selector(selectCompletionSound(_:)),
+            tag: ControlPanelCompletionSoundKind.recognitionStarted.rawValue
+        ))
+        form.addArrangedSubview(popupRow(
             title: t("Диктовка без Enter", "Dictation without Enter"),
             detail: t("Звук после вставки текста без Enter.",
                       "Sound after inserting text without Enter."),
@@ -27058,6 +27211,15 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             options: soundOptions,
             action: #selector(selectCompletionSound(_:)),
             tag: ControlPanelCompletionSoundKind.cancellation.rawValue
+        ))
+        form.addArrangedSubview(popupRow(
+            title: t("Повторное распознавание началось", "Quality recognition starts"),
+            detail: t("Звук при фактическом запуске повторной обработки сохранённого аудио.",
+                      "Sound when reprocessing of saved audio actually begins."),
+            selectedValue: draft.qualityRecognitionStartedSound.rawValue,
+            options: soundOptions,
+            action: #selector(selectCompletionSound(_:)),
+            tag: ControlPanelCompletionSoundKind.qualityRecognitionStarted.rawValue
         ))
         form.addArrangedSubview(popupRow(
             title: t("Качественное распознавание готово", "Quality recognition complete"),
@@ -29555,6 +29717,12 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         switch kind {
         case .recordingStart:
             draft.recordingStartSound = sound
+        case .pause:
+            draft.pauseSound = sound
+        case .resume:
+            draft.resumeSound = sound
+        case .recognitionStarted:
+            draft.recognitionStartedSound = sound
         case .withoutEnter:
             draft.withoutEnterCompletionSound = sound
         case .withEnter:
@@ -29565,6 +29733,8 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             draft.recognitionErrorSound = sound
         case .cancellation:
             draft.cancellationSound = sound
+        case .qualityRecognitionStarted:
+            draft.qualityRecognitionStartedSound = sound
         case .qualityRecognition:
             draft.qualityRecognitionCompletionSound = sound
         }
@@ -29581,6 +29751,9 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             draft.clipboardCompletionSound,
             draft.withoutEnterCompletionSound,
             draft.recordingStartSound,
+            draft.pauseSound,
+            draft.resumeSound,
+            draft.recognitionStartedSound,
             .pop,
         ].first(where: { $0 != .none }) ?? .pop
         Sounds.play(preview, volume: draft.completionSoundVolume)
@@ -29845,11 +30018,15 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         settings.recordingHUDBackgroundStyle = draft.backgroundStyle
         settings.recordingHUDSize = draft.hudSize
         settings.recordingStartSound = draft.recordingStartSound
+        settings.pauseSound = draft.pauseSound
+        settings.resumeSound = draft.resumeSound
+        settings.recognitionStartedSound = draft.recognitionStartedSound
         settings.withoutEnterCompletionSound = draft.withoutEnterCompletionSound
         settings.withEnterCompletionSound = draft.withEnterCompletionSound
         settings.clipboardCompletionSound = draft.clipboardCompletionSound
         settings.recognitionErrorSound = draft.recognitionErrorSound
         settings.cancellationSound = draft.cancellationSound
+        settings.qualityRecognitionStartedSound = draft.qualityRecognitionStartedSound
         settings.qualityRecognitionCompletionSound = draft.qualityRecognitionCompletionSound
         settings.completionSoundVolume = draft.completionSoundVolume
         settings.clipboardCompletionVisibleSeconds = draft.clipboardCompletionVisibleSeconds
